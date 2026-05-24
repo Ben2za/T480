@@ -20,7 +20,7 @@ Date: 2026-05-04
 - [x] Research and decide VS Code/Codex install path.
 - [x] Install VS Code/Codex on T480 via SSH.
 - [x] Push initial repo bootstrap to GitHub and pull it on T480.
-- [ ] Add T480's own SSH public key to GitHub for independent Git access.
+- [x] Add T480's own SSH public key to GitHub for independent Git access.
 - [x] Log into Codex on T480.
 - [ ] Research and decide secrets management.
 - [ ] Research and decide firewall/DNS/killswitch design.
