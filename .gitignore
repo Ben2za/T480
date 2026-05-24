@@ -1,0 +1,42 @@
+# Local/editor state
+.idea/
+.vscode/
+*.swp
+*~
+
+# Secrets and credentials
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.kdbx
+id_*
+secrets/
+vault/
+
+# Logs and traces
+*.log
+logs/
+transcripts/
+history/
+.codex-log/
+
+# Heavy or sensitive lab artifacts
+*.qcow2
+*.img
+*.iso
+*.ova
+*.ovf
+loot/
+reports/private/
+
+# Build/cache output
+cache/
+tmp/
+dist/
+build/
+node_modules/
+.venv/
+__pycache__/
