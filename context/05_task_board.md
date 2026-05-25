@@ -22,6 +22,8 @@ Date: 2026-05-04
 - [x] Push initial repo bootstrap to GitHub and pull it on T480.
 - [x] Add T480's own SSH public key to GitHub for independent Git access.
 - [x] Log into Codex on T480.
+- [x] Remove temporary passwordless sudo rule from T480.
+- [x] Add repo onboarding for quick Codex handoff.
 - [ ] Research and decide secrets management.
 - [ ] Research and decide firewall/DNS/killswitch design.
 - [ ] Research and decide VM lifecycle model.

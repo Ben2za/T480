@@ -33,8 +33,7 @@ Date: 2026-05-04
 - 2026-05-24: T480 GitHub SSH public key fingerprint is `SHA256:fWhXvZpNecLxn67fy/+KCi1LRa3W5fUa+sNfZ7lldy8`.
 - 2026-05-25: T480 GitHub SSH key added to GitHub and validated with `git fetch origin main` from `/home/operator/T480`.
 - 2026-05-24: Codex CLI on T480 logged in successfully with ChatGPT device auth.
-- This rule must be removed after bootstrap/admin setup with:
-  `sudo rm /etc/sudoers.d/90-codex-operator`.
+- 2026-05-25: temporary sudoers rule removed. `sudo -n` now fails again as expected.
 
 ## Initial Risk Notes
 
