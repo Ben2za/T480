@@ -32,6 +32,32 @@ Open the displayed URL on any browser-capable device, enter the one-time code, t
 codex login status
 ```
 
+## 1.1 Auth Reset If Refresh Token Breaks
+
+Symptom:
+
+```text
+your access token could not be refreshed because your refresh token was already used
+```
+
+Do not reboot first. Reset the local Codex auth state:
+
+```bash
+# Close VS Code first so the OpenAI extension does not run a Codex app-server.
+pkill -u "$USER" -x codex 2>/dev/null || true
+codex logout || true
+mv ~/.codex/auth.json ~/.codex/auth.json.invalid-$(date +%Y%m%d%H%M%S) 2>/dev/null || true
+codex login --device-auth
+codex login status
+codex doctor --summary
+```
+
+Expected final doctor result:
+
+```text
+0 warn · 0 fail
+```
+
 ## 2. Start Codex In This Repo
 
 ```bash
