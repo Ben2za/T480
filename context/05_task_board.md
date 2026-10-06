@@ -2,7 +2,7 @@
 
 Date: 2026-10-06
 
-## Active Repository Preservation Before T480 Repurposing
+## Completed Repository Preservation Before T480 Repurposing
 
 Scope 2026-10-06: the operator requested committing and pushing all outstanding
 project work to the existing GitHub repository before discussing a new role for
@@ -14,8 +14,8 @@ outside Git. This is repository preservation, not a full-machine backup.
 - [x] Check candidate files for credentials and private/generated artifacts.
 - [x] Run the existing tests and relevant static validation.
 - [x] Fetch origin and reconcile any remote divergence without losing work.
-- [ ] Commit the reviewed project checkpoint and push to origin/main.
-- [ ] Verify the remote commit and the final local worktree state.
+- [x] Commit the reviewed project checkpoint and push to origin/main.
+- [x] Verify the remote commit and the local worktree state after publication.
 
 The T480's future role remains open; no reinstall or host conversion is part
 of this checkpoint.
@@ -30,6 +30,14 @@ checks. The existing 126 unittest cases pass. Static validation passes for
 files. PowerShell execution and live host/fleet behavior were not retested.
 The full staged diff exposed one trailing-whitespace-only blank line in
 `waybar/config`; it was removed without changing the configuration values.
+
+Publication verified 2026-10-06: checkpoint
+`65c2d1b59ebdd00d8e4fee8519fccc6100150916` was pushed to
+`git@github.com:Ben2za/T480.git`, branch `main`. A subsequent `git ls-remote`
+returned that exact commit. The checkpoint contains 148 added/modified files
+and the local worktree was clean after publication. This completion note is
+recorded in a separate documentation commit. Repurposing remains a discussion
+to start with the operator; no new OS or machine role has been selected.
 
 ## Active Voice Console Missing-Response Incident
 
