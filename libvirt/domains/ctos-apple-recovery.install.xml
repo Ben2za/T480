@@ -1,0 +1,93 @@
+<domain type="kvm">
+  <name>ctos-apple-recovery</name>
+  <uuid>fae71b6a-3d2e-498f-b1b6-a0f7a5672721</uuid>
+  <metadata>
+    <libosinfo:libosinfo xmlns:libosinfo="http://libosinfo.org/xmlns/libvirt/domain/1.0">
+      <libosinfo:os id="http://microsoft.com/win/11"/>
+    </libosinfo:libosinfo>
+    <ctos:apple-recovery xmlns:ctos="https://ctos.local/xmlns/libvirt/domain/1.0" profile="install"/>
+  </metadata>
+  <memory unit="MiB">8192</memory>
+  <currentMemory unit="MiB">8192</currentMemory>
+  <vcpu placement="static">4</vcpu>
+  <os>
+    <type arch="x86_64" machine="pc-q35-11.0">hvm</type>
+    <loader readonly="yes" secure="yes" type="pflash" format="raw">/usr/share/edk2/x64/OVMF_CODE.secboot.4m.fd</loader>
+    <nvram format="raw">/var/lib/libvirt/ctos/snapshots/ctos-apple-recovery/maintenance_VARS.fd</nvram>
+    <bootmenu enable="yes"/>
+    <boot dev="cdrom"/>
+    <boot dev="hd"/>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+    <smm state="on"/>
+    <vmport state="off"/>
+  </features>
+  <cpu mode="host-model" check="partial">
+    <topology sockets="1" dies="1" clusters="1" cores="2" threads="2"/>
+  </cpu>
+  <clock offset="localtime">
+    <timer name="rtc" tickpolicy="catchup"/>
+    <timer name="pit" tickpolicy="delay"/>
+    <timer name="hpet" present="no"/>
+    <timer name="hypervclock" present="yes"/>
+  </clock>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>preserve</on_crash>
+  <pm>
+    <suspend-to-mem enabled="no"/>
+    <suspend-to-disk enabled="no"/>
+  </pm>
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+    <disk type="file" device="disk">
+      <driver name="qemu" type="qcow2" discard="unmap"/>
+      <source file="/var/lib/libvirt/ctos/images/ctos-apple-recovery.qcow2"/>
+      <target dev="sda" bus="sata"/>
+    </disk>
+    <disk type="file" device="cdrom">
+      <driver name="qemu" type="raw"/>
+      <source file="/var/lib/libvirt/ctos/iso/Win11_25H2_English_x64_v2.iso"/>
+      <target dev="sdb" bus="sata"/>
+      <readonly/>
+    </disk>
+    <controller type="usb" model="qemu-xhci"/>
+    <controller type="sata" index="0"/>
+    <controller type="pci" model="pcie-root"/>
+    <controller type="pci" model="pcie-root-port"/>
+    <controller type="pci" model="pcie-root-port"/>
+    <controller type="pci" model="pcie-root-port"/>
+    <controller type="pci" model="pcie-root-port"/>
+    <interface type="network">
+      <mac address="52:54:00:a5:11:25"/>
+      <source network="ctos-nat"/>
+      <model type="e1000e"/>
+    </interface>
+    <serial type="pty"/>
+    <console type="pty">
+      <target type="serial" port="0"/>
+    </console>
+    <input type="tablet" bus="usb"/>
+    <input type="keyboard" bus="ps2"/>
+    <graphics type="spice" autoport="yes">
+      <listen type="none"/>
+      <image compression="off"/>
+      <clipboard copypaste="no"/>
+      <filetransfer enable="no"/>
+    </graphics>
+    <video>
+      <model type="vga" vram="16384" heads="1" primary="yes"/>
+    </video>
+    <tpm model="tpm-crb">
+      <backend type="emulator" version="2.0" persistent_state="yes">
+        <source type="dir" path="/var/lib/libvirt/ctos/snapshots/ctos-apple-recovery/maintenance-tpm"/>
+        <active_pcr_banks>
+          <sha256/>
+        </active_pcr_banks>
+      </backend>
+    </tpm>
+    <memballoon model="none"/>
+  </devices>
+</domain>

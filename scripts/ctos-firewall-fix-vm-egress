@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "ctos-firewall-fix-vm-egress must run as root" >&2
+  exit 1
+fi
+
+if ! nft list chain inet filter forward >/dev/null 2>&1; then
+  echo "missing nft chain: inet filter forward" >&2
+  exit 1
+fi
+
+if nft list chain inet filter forward | grep -Fq 'ctos vm egress'; then
+  echo "CTOS VM egress runtime rules already present"
+  exit 0
+fi
+
+rules_file="$(mktemp)"
+trap 'rm -f "$rules_file"' EXIT
+
+cat >"$rules_file" <<'NFT'
+add rule inet filter forward iifname "virbr-ctos" oifname "wlan0" counter accept comment "ctos vm egress"
+add rule inet filter forward iifname "wlan0" oifname "virbr-ctos" ct state established,related counter accept comment "ctos vm egress return"
+NFT
+
+nft -f "$rules_file"
+
+echo "CTOS VM egress runtime rules added to inet filter forward"

@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MODE="${1:-plan}"
+ENABLE_AUTOLOGIN="${CTOS_ENABLE_AUTOLOGIN:-0}"
+RESCUE_PORT="${CTOS_RESCUE_SSH_PORT:-2222}"
+RESCUE_BIND="${CTOS_RESCUE_SSH_BIND:-10.42.0.2}"
+RESCUE_SOURCE="${CTOS_RESCUE_SSH_SOURCE:-10.42.0.1/32}"
+RESCUE_SERVICE="/etc/systemd/system/ctos-sshd-rescue.service"
+SDDM_AUTOLOGIN="/etc/sddm.conf.d/10-ctos-autologin.conf"
+
+usage() {
+	cat <<EOF
+usage: sudo $0 [plan|apply] [--enable-autologin]
+
+plan              show the restart-safe ctos-core boot contract
+apply             enable sshd and install restricted rescue SSH on ${RESCUE_BIND}:${RESCUE_PORT}
+--enable-autologin also configure SDDM to autologin user ctos into Plasma X11
+
+Environment:
+  CTOS_RESCUE_SSH_PORT    default: 2222
+  CTOS_RESCUE_SSH_BIND    default: 10.42.0.2
+  CTOS_RESCUE_SSH_SOURCE  default: 10.42.0.1/32
+EOF
+}
+
+for arg in "$@"; do
+	case "$arg" in
+		plan|apply)
+			MODE="$arg"
+			;;
+		--enable-autologin)
+			ENABLE_AUTOLOGIN=1
+			;;
+		-h|--help)
+			usage
+			exit 0
+			;;
+	esac
+done
+
+plan() {
+	cat <<EOF
+CTOS ctos-core boot contract
+
+Always on:
+  - NetworkManager owns network startup.
+  - sshd.service is enabled on the normal OpenSSH port 22.
+  - ctos-sshd-rescue.service listens on ${RESCUE_BIND}:${RESCUE_PORT}.
+  - Rescue SSH disables password auth and is intended for the T480 key path.
+  - If firewalld is active, only ${RESCUE_SOURCE} is allowed to reach ${RESCUE_PORT}.
+
+Optional:
+  - --enable-autologin writes ${SDDM_AUTOLOGIN}.
+  - Autologin is needed for unattended DESK because x0vncserver attaches to an active X11 session.
+  - The selected session is Plasma X11: plasmax11.desktop.
+
+Rejected:
+  - No VNC listener is exposed on the LAN.
+  - x0vncserver remains localhost-only and is started by the T480 over SSH.
+EOF
+}
+
+require_root() {
+	if [ "$(id -u)" -ne 0 ]; then
+		printf 'run with sudo/root\n' >&2
+		exit 1
+	fi
+}
+
+install_rescue_service() {
+	install -d -m 0755 /etc/systemd/system
+	cat >"$RESCUE_SERVICE" <<EOF
+[Unit]
+Description=CTOS restricted rescue SSH for T480 cockpit
+Documentation=man:sshd(8)
+After=network-online.target sshd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/sshd -D -e -p ${RESCUE_PORT} -o ListenAddress=${RESCUE_BIND} -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o PermitRootLogin=no -o LogLevel=VERBOSE
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target
+EOF
+	systemctl daemon-reload
+	systemctl enable --now ctos-sshd-rescue.service
+}
+
+configure_firewall() {
+	if ! command -v firewall-cmd >/dev/null 2>&1 || ! systemctl is-active --quiet firewalld; then
+		printf 'firewalld not active; skipped rescue SSH firewall restriction\n'
+		return 0
+	fi
+	firewall-cmd --remove-port="${RESCUE_PORT}/tcp" >/dev/null 2>&1 || true
+	firewall-cmd --permanent --remove-port="${RESCUE_PORT}/tcp" >/dev/null 2>&1 || true
+	firewall-cmd --permanent --add-rich-rule="rule family=\"ipv4\" source address=\"${RESCUE_SOURCE}\" port port=\"${RESCUE_PORT}\" protocol=\"tcp\" accept"
+	firewall-cmd --reload
+}
+
+configure_autologin() {
+	[ "$ENABLE_AUTOLOGIN" = "1" ] || return 0
+	if [ ! -f /usr/share/xsessions/plasmax11.desktop ]; then
+		printf 'missing /usr/share/xsessions/plasmax11.desktop; refusing SDDM autologin\n' >&2
+		exit 1
+	fi
+	if [ -f /etc/sddm.conf ]; then
+		cp -n /etc/sddm.conf /etc/sddm.conf.ctos-pre-autologin.bak
+		awk '
+			BEGIN { in_autologin = 0 }
+			/^\[/ { in_autologin = ($0 == "[Autologin]") }
+			in_autologin && /^Session=/ { print "# CTOS moved autologin session to " out; print "# " $0; next }
+			{ print }
+		' out="$SDDM_AUTOLOGIN" /etc/sddm.conf > /etc/sddm.conf.ctos-tmp
+		install -m 0644 /etc/sddm.conf.ctos-tmp /etc/sddm.conf
+		rm -f /etc/sddm.conf.ctos-tmp
+	fi
+	install -d -m 0755 /etc/sddm.conf.d
+	cat >"$SDDM_AUTOLOGIN" <<'EOF'
+[Autologin]
+User=ctos
+Session=plasmax11.desktop
+Relogin=true
+EOF
+}
+
+verify() {
+	systemctl is-enabled sshd.service
+	systemctl is-active sshd.service
+	systemctl is-enabled ctos-sshd-rescue.service
+	systemctl is-active ctos-sshd-rescue.service
+	ss -lntp | grep -E ":(${RESCUE_PORT}|22) "
+	if [ "$ENABLE_AUTOLOGIN" = "1" ]; then
+		test -f "$SDDM_AUTOLOGIN"
+		printf 'sddm autologin configured at %s\n' "$SDDM_AUTOLOGIN"
+	fi
+}
+
+case "$MODE" in
+	plan)
+		plan
+		;;
+	apply)
+		require_root
+		plan
+		systemctl enable --now NetworkManager.service
+		systemctl enable --now sshd.service
+		install_rescue_service
+		configure_firewall
+		configure_autologin
+		verify
+		;;
+	*)
+		usage >&2
+		exit 2
+		;;
+esac

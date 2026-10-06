@@ -1,0 +1,3 @@
+# Optional AUR/manual packages for later, not installed by the V1 bootstrap.
+# Keep these out of the fast install path until AUR policy is decided.
+visual-studio-code-bin

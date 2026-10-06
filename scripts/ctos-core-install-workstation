@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VSCODE_URL="${CTOS_VSCODE_URL:-https://update.code.visualstudio.com/latest/linux-x64/stable}"
+CODEX_PACKAGE="${CTOS_CODEX_PACKAGE:-@openai/codex@latest}"
+CODE_EXTENSION="${CTOS_CODE_EXTENSION:-OpenAI.chatgpt}"
+
+HOME_DIR="${HOME:?}"
+LOCAL_DIR="${HOME_DIR}/.local"
+BIN_DIR="${LOCAL_DIR}/bin"
+OPT_DIR="${LOCAL_DIR}/opt"
+APP_DIR="${LOCAL_DIR}/share/applications"
+VSCODE_DIR="${OPT_DIR}/vscode"
+CODE_BIN="${VSCODE_DIR}/bin/code"
+CODE_LINK="${BIN_DIR}/code"
+CODEX_LINK="${BIN_DIR}/codex"
+
+need() {
+	command -v "$1" >/dev/null 2>&1 || {
+		printf 'missing required command: %s\n' "$1" >&2
+		exit 1
+	}
+}
+
+ensure_path_line() {
+	local file="$1"
+	local line='export PATH="$HOME/.local/bin:$PATH"'
+
+	touch "$file"
+	if ! grep -Fxq "$line" "$file"; then
+		{
+			printf '\n# CTOS user-local toolchain\n'
+			printf '%s\n' "$line"
+		} >>"$file"
+	fi
+}
+
+install_vscode() {
+	local tmp extract_root stamp
+
+	need curl
+	need tar
+	need sed
+	need grep
+
+	install -d "$BIN_DIR" "$OPT_DIR" "$APP_DIR"
+	tmp="$(mktemp -d)"
+
+	printf 'downloading VS Code stable tarball...\n'
+	curl --fail --location --show-error --output "${tmp}/vscode.tar.gz" "$VSCODE_URL"
+	tar -xzf "${tmp}/vscode.tar.gz" -C "$tmp"
+	extract_root="$(find "$tmp" -maxdepth 1 -type d -name 'VSCode-linux-x64' | head -n 1)"
+	if [ -z "$extract_root" ]; then
+		printf 'could not find VSCode-linux-x64 in downloaded archive\n' >&2
+		exit 1
+	fi
+
+	if [ -e "$VSCODE_DIR" ]; then
+		stamp="$(date +%Y%m%d%H%M%S)"
+		mv "$VSCODE_DIR" "${VSCODE_DIR}.previous-${stamp}"
+	fi
+	mv "$extract_root" "$VSCODE_DIR"
+	ln -sfn "$CODE_BIN" "$CODE_LINK"
+
+	cat >"${APP_DIR}/code.desktop" <<EOF
+[Desktop Entry]
+Name=Visual Studio Code
+Comment=Code Editing. Redefined.
+GenericName=Text Editor
+Exec=${VSCODE_DIR}/code --unity-launch %F
+Icon=${VSCODE_DIR}/resources/app/resources/linux/code.png
+Type=Application
+StartupNotify=false
+StartupWMClass=Code
+Categories=TextEditor;Development;IDE;
+MimeType=text/plain;inode/directory;application/x-code-workspace;
+Actions=new-empty-window;
+
+[Desktop Action new-empty-window]
+Name=New Empty Window
+Exec=${VSCODE_DIR}/code --new-window %F
+Icon=${VSCODE_DIR}/resources/app/resources/linux/code.png
+EOF
+
+	if command -v update-desktop-database >/dev/null 2>&1; then
+		update-desktop-database "${LOCAL_DIR}/share/applications" >/dev/null 2>&1 || true
+	fi
+	rm -rf "$tmp"
+}
+
+install_codex() {
+	need npm
+	install -d "$BIN_DIR"
+	npm install -g --prefix "$LOCAL_DIR" "$CODEX_PACKAGE"
+}
+
+install_extension() {
+	if [ ! -x "$CODE_BIN" ]; then
+		printf 'VS Code binary not found at %s\n' "$CODE_BIN" >&2
+		exit 1
+	fi
+	"$CODE_BIN" --install-extension "$CODE_EXTENSION" --force
+}
+
+ensure_shell_path() {
+	ensure_path_line "${HOME_DIR}/.bashrc"
+	ensure_path_line "${HOME_DIR}/.profile"
+	ensure_path_line "${HOME_DIR}/.bash_profile"
+}
+
+apply_all() {
+	install_vscode
+	install_codex
+	install_extension
+	ensure_shell_path
+	status
+}
+
+status() {
+	printf 'ctos-core workstation status\n'
+	printf 'code_bin=%s\n' "$CODE_BIN"
+	if [ -x "$CODE_BIN" ]; then
+		"$CODE_BIN" --version | sed -n '1,3p'
+	else
+		printf 'code missing\n'
+	fi
+	printf 'codex_bin=%s\n' "$CODEX_LINK"
+	if [ -x "$CODEX_LINK" ]; then
+		"$CODEX_LINK" --version
+	else
+		printf 'codex missing\n'
+	fi
+	printf 'extension=%s\n' "$CODE_EXTENSION"
+	if [ -x "$CODE_BIN" ]; then
+		"$CODE_BIN" --list-extensions | grep -i '^openai\.chatgpt$' || true
+	fi
+}
+
+plan() {
+	cat <<EOF
+CTOS core workstation install plan
+- Install official VS Code stable Linux x64 tarball under: ${VSCODE_DIR}
+- Link code CLI at: ${CODE_LINK}
+- Install Codex CLI package with npm user prefix: ${CODEX_PACKAGE}
+- Install VS Code extension: ${CODE_EXTENSION}
+- Add ${BIN_DIR} to ~/.bashrc and ~/.profile if missing
+
+This does not require sudo and does not copy Codex auth/secrets.
+EOF
+}
+
+case "${1:-plan}" in
+	plan)
+		plan
+		;;
+	apply)
+		apply_all
+		;;
+	path)
+		ensure_shell_path
+		;;
+	status)
+		status
+		;;
+	*)
+		printf 'usage: %s [plan|apply|path|status]\n' "$0" >&2
+		exit 2
+		;;
+esac

@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+HOST="127.0.0.1"
+PORT="8765"
+URL="http://${HOST}:${PORT}"
+PID_FILE="/tmp/ctos-control.pid"
+LOG_FILE="/tmp/ctos-control.log"
+
+server_pid() {
+	pgrep -f "${ROOT}/control/server.py --host ${HOST} --port ${PORT}" | head -n 1 || true
+}
+
+is_running() {
+	[ -n "$(server_pid)" ]
+}
+
+start_server() {
+	if is_running; then
+		return
+	fi
+	setsid python "$ROOT/control/server.py" --host "$HOST" --port "$PORT" >"$LOG_FILE" 2>&1 &
+	sleep 0.2
+	server_pid >"$PID_FILE"
+}
+
+case "${1:-tui}" in
+	tui)
+		exec python "$ROOT/control/tui.py"
+		;;
+	serve)
+		start_server
+		printf 'CTOS control dashboard: %s\n' "$URL"
+		;;
+	open)
+		start_server
+		if command -v xdg-open >/dev/null 2>&1; then
+			xdg-open "$URL" >/dev/null 2>&1 &
+		else
+			printf '%s\n' "$URL"
+		fi
+		;;
+	status)
+		if is_running; then
+			printf 'running pid=%s url=%s\n' "$(server_pid)" "$URL"
+		else
+			printf 'stopped url=%s\n' "$URL"
+		fi
+		;;
+	stop)
+		if is_running; then
+			kill "$(server_pid)"
+			rm -f "$PID_FILE"
+			printf 'stopped\n'
+		else
+			printf 'already stopped\n'
+		fi
+		;;
+	url)
+		printf '%s\n' "$URL"
+		;;
+	*)
+		printf 'usage: %s [tui|serve|open|status|stop|url]\n' "$0" >&2
+		exit 2
+		;;
+esac

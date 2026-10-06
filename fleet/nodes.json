@@ -1,0 +1,88 @@
+{
+  "version": 1,
+  "nodes": [
+    {
+      "id": "ctos-t480",
+      "role": "godfather",
+      "status": "active",
+      "os": "EndeavourOS",
+      "control": {
+        "mode": "local"
+      },
+      "notes": "Portable admin/cockpit and daily coding machine."
+    },
+    {
+      "id": "ctos-core",
+      "role": "core",
+      "status": "active",
+      "os": "EndeavourOS",
+      "control": {
+        "mode": "ssh",
+        "user": "ctos",
+        "host": "10.42.0.2",
+        "helper": "scripts/ctos-core"
+      },
+      "storage": {
+        "service_root": "/srv/ctos",
+        "service_label": "CTOS_SRV"
+      },
+      "notes": "First tower core node. SATA-backed service root is initialized."
+    },
+    {
+      "id": "ctos-zlitebook",
+      "role": "worker-candidate",
+      "status": "active",
+      "os": "Ubuntu 24.04",
+      "control": {
+        "mode": "ssh",
+        "user": "ben",
+        "host": "192.168.1.24",
+        "hostname": "BXEB"
+      },
+      "services": {
+        "http_8080": "nginx serving Snake Surge"
+      },
+      "notes": "Former EliteBook/ZLiteBook bootstrap laptop. Key-based SSH from T480 validated on 2026-07-18; not yet converted to an EndeavourOS CTOS role."
+    },
+    {
+      "id": "ctos-worker-01",
+      "role": "worker",
+      "status": "planned",
+      "os": "EndeavourOS-target",
+      "control": {
+        "mode": "pending"
+      },
+      "notes": "Template placeholder for future worker nodes."
+    }
+  ],
+  "features": [
+    {
+      "id": "remote-control",
+      "status": "v0",
+      "owner": "ctos-t480",
+      "target": "ctos-core",
+      "summary": "Tunnel-first remote control helper and capability inventory for T480 to ctos-core desktop access."
+    },
+    {
+      "id": "fleet-inventory",
+      "status": "v1",
+      "owner": "ctos-t480",
+      "target": "all nodes",
+      "summary": "Static inventory plus live status aggregation for every archipelago machine."
+    },
+    {
+      "id": "fleet-telemetry",
+      "status": "planned",
+      "owner": "ctos-core",
+      "target": "all nodes",
+      "summary": "Later heartbeats/constants so ctos-core keeps a global view of node health and work state."
+    },
+    {
+      "id": "storage-expansion",
+      "status": "planned",
+      "owner": "ctos-core",
+      "target": "service storage",
+      "summary": "Future multi-SSD expansion strategy for packages, models, worker data, snapshots, and backups."
+    }
+  ]
+}

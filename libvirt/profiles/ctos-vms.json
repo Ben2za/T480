@@ -1,0 +1,77 @@
+{
+  "connection": "qemu:///system",
+  "network": {
+    "name": "ctos-nat",
+    "bridge": "virbr-ctos",
+    "subnet": "192.168.130.0/24",
+    "dhcp_range": "192.168.130.100-192.168.130.254"
+  },
+  "storage": {
+    "images_pool": "ctos-images",
+    "iso_pool": "ctos-iso",
+    "snapshots_pool": "ctos-snapshots",
+    "images_path": "/var/lib/libvirt/ctos/images",
+    "iso_path": "/var/lib/libvirt/ctos/iso",
+    "snapshots_path": "/var/lib/libvirt/ctos/snapshots"
+  },
+  "domains": [
+    {
+      "name": "ctos-kali",
+      "role": "authorized security lab guest",
+      "state": "planned",
+      "vcpus": 2,
+      "memory_mib": 6144,
+      "disk_gib": 40,
+      "disk": "/var/lib/libvirt/ctos/images/ctos-kali.qcow2",
+      "installer_iso_source": "/home/operator/iso/kali-linux-2025.4-installer-amd64.iso",
+      "installer_iso": "/var/lib/libvirt/ctos/iso/kali-linux-2025.4-installer-amd64.iso",
+      "osinfo": "debian13",
+      "machine": "q35",
+      "firmware": "bios",
+      "autostart": false,
+      "network": "ctos-nat"
+    },
+    {
+      "name": "ctos-dev",
+      "role": "isolated development workstation guest",
+      "state": "planned",
+      "vcpus": 2,
+      "memory_mib": 6144,
+      "disk_gib": 60,
+      "autostart": false,
+      "network": "ctos-nat"
+    },
+    {
+      "name": "ctos-apple-recovery",
+      "role": "official Apple recovery workstation guest",
+      "state": "implementation",
+      "vcpus": 4,
+      "memory_mib": 8192,
+      "disk_gib": 96,
+      "disk": "/var/lib/libvirt/ctos/images/ctos-apple-recovery.qcow2",
+      "installer_iso": "/var/lib/libvirt/ctos/iso/Win11_25H2_French_x64_v2.iso",
+      "installer_release": "Windows 11 25H2 x64 French multi-edition",
+      "installer_sha256": "a02693beb8eb166afdfdb7db49176a2b547f81e61030a695fe172277db6a1977",
+      "windows_vm_entitlement_status": "blocked-no-eligible-vm-entitlement",
+      "enterprise_evaluation_status": "not-authorized-disposable-only",
+      "driver_source": "Windows 11 inbox AHCI/e1000e; Microsoft Update Catalog only for optional VEN_1AF4 devices",
+      "driver_media": "none",
+      "osinfo": "win11",
+      "machine": "pc-q35-11.0",
+      "firmware": "uefi-secure",
+      "tpm": "emulated-2.0-private",
+      "autostart": false,
+      "network": "ctos-nat",
+      "apple_store_product": "9NP83LWLPZ9K",
+      "usb_controller": "0000:3c:00.0",
+      "usb_controller_state": "unqualified",
+      "state_root": "/var/lib/libvirt/ctos/snapshots/ctos-apple-recovery"
+    }
+  ],
+  "snapshot_policy": {
+    "first_implementation": "shutoff disk-only snapshots",
+    "live_snapshots": "deferred",
+    "memory_snapshots": "deferred",
+    "automatic_retention": "deferred"
+  }
+}

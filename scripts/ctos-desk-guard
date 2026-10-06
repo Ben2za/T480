@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REMOTE_USER="${CTOS_CORE_USER:-ctos}"
+REMOTE_HOST="${CTOS_CORE_HOST:-10.42.0.2}"
+REMOTE_PORTS="${CTOS_CORE_SSH_PORTS:-22 2222}"
+REMOTE="${REMOTE_USER}@${REMOTE_HOST}"
+PORT="${CTOS_CORE_VNC_PORT:-5902}"
+INTERVAL="${CTOS_DESK_GUARD_INTERVAL:-5}"
+REMOTE_LOG="/tmp/ctos-desk-remote-guard.log"
+SSH_PORT=""
+SSH_OPTS=(-F /dev/null -o BatchMode=yes -o ConnectTimeout=3)
+
+say() {
+	printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*"
+}
+
+remote() {
+	ssh "${SSH_OPTS[@]}" "$REMOTE" "$@"
+}
+
+select_ssh_port_once() {
+	local candidate
+	for candidate in $REMOTE_PORTS; do
+		case "$candidate" in
+			''|*[!0-9]*)
+				continue
+				;;
+		esac
+		SSH_OPTS=(-F /dev/null -p "$candidate" -o BatchMode=yes -o ConnectTimeout=3)
+		if remote true >/dev/null 2>&1; then
+			SSH_PORT="$candidate"
+			return 0
+		fi
+	done
+	return 1
+}
+
+remote_x11_ready() {
+	remote 'pgrep -u "$USER" -x kwin_x11 >/dev/null 2>&1'
+}
+
+remote_vnc_ready() {
+	remote "ss -lntp 2>/dev/null | grep -q '127.0.0.1:${PORT}.*x0vncserver'"
+}
+
+local_tunnel_listener_ready() {
+	ss -lnt 2>/dev/null | grep -q "127.0.0.1:${PORT}"
+}
+
+local_vnc_handshake_ready() {
+	command -v python3 >/dev/null 2>&1 || return 1
+	python3 - "$PORT" <<'PY'
+import socket
+import sys
+
+port = int(sys.argv[1])
+try:
+    with socket.create_connection(("127.0.0.1", port), timeout=1.5) as sock:
+        sock.settimeout(1.5)
+        banner = sock.recv(12)
+except OSError:
+    raise SystemExit(1)
+
+raise SystemExit(0 if banner.startswith(b"RFB ") else 1)
+PY
+}
+
+local_tunnel_ready() {
+	local_tunnel_listener_ready && local_vnc_handshake_ready
+}
+
+kill_local_tunnel() {
+	pkill -u "${USER}" -f "ssh .*127\\.0\\.0\\.1:${PORT}:127\\.0\\.0\\.1:${PORT}" >/dev/null 2>&1 || true
+}
+
+viewer_running() {
+	pgrep -u "$USER" -f "vncviewer .*127\\.0\\.0\\.1:${PORT}" >/dev/null 2>&1
+}
+
+launcher_running() {
+	pgrep -u "$USER" -f "${ROOT}/scripts/ctos-desk-remote" >/dev/null 2>&1
+}
+
+ensure_once() {
+	local viewer=0 tunnel=0 remote_vnc=0 restart_viewer=0
+
+	if ! select_ssh_port_once; then
+		say "DESK guard: ctos-core SSH unavailable; waiting"
+		return 0
+	fi
+
+	if ! remote_x11_ready; then
+		say "DESK guard: ctos-core Plasma X11 unavailable; waiting"
+		return 0
+	fi
+
+	if viewer_running; then
+		viewer=1
+	fi
+	if local_tunnel_ready; then
+		tunnel=1
+	elif local_tunnel_listener_ready; then
+		say "DESK guard: stale localhost:${PORT} listener; rebuilding tunnel"
+		kill_local_tunnel
+	fi
+	if remote_vnc_ready; then
+		remote_vnc=1
+	fi
+
+	if [ "$viewer" -eq 1 ] && [ "$tunnel" -eq 1 ] && [ "$remote_vnc" -eq 1 ]; then
+		say "DESK guard: healthy on SSH ${SSH_PORT}, localhost:${PORT}"
+		return 0
+	fi
+
+	if launcher_running; then
+		say "DESK guard: launcher already running"
+		return 0
+	fi
+
+	if [ "$viewer" -eq 1 ] && { [ "$tunnel" -eq 0 ] || [ "$remote_vnc" -eq 0 ]; }; then
+		restart_viewer=1
+	fi
+
+	say "DESK guard: healing viewer=${viewer} tunnel=${tunnel} remote_vnc=${remote_vnc} via SSH ${SSH_PORT}"
+	CTOS_CORE_SSH_PORT="$SSH_PORT" \
+	CTOS_CORE_WAIT_SECONDS=8 \
+	CTOS_DESK_NONINTERACTIVE=1 \
+	CTOS_DESK_RESTART_VIEWER="$restart_viewer" \
+		"$ROOT/scripts/ctos-desk-remote" >>"$REMOTE_LOG" 2>&1 \
+		|| say "DESK guard: heal attempt failed; see ${REMOTE_LOG}"
+}
+
+status() {
+	if select_ssh_port_once; then
+		printf 'ssh: ready port=%s\n' "$SSH_PORT"
+	else
+		printf 'ssh: unavailable\n'
+	fi
+	if viewer_running; then
+		printf 'viewer: running\n'
+	else
+		printf 'viewer: stopped\n'
+	fi
+	if local_tunnel_ready; then
+		printf 'local_tunnel: listening 127.0.0.1:%s handshake=ok\n' "$PORT"
+	elif local_tunnel_listener_ready; then
+		printf 'local_tunnel: listening 127.0.0.1:%s handshake=failed\n' "$PORT"
+	else
+		printf 'local_tunnel: missing\n'
+	fi
+	if [ -n "$SSH_PORT" ] && remote_x11_ready; then
+		printf 'remote_x11: ready\n'
+	else
+		printf 'remote_x11: unavailable\n'
+	fi
+	if [ -n "$SSH_PORT" ] && remote_vnc_ready; then
+		printf 'remote_vnc: listening 127.0.0.1:%s\n' "$PORT"
+	else
+		printf 'remote_vnc: unavailable\n'
+	fi
+}
+
+case "${1:-loop}" in
+	loop)
+		say "DESK guard: started interval=${INTERVAL}s remote=${REMOTE} ports=${REMOTE_PORTS}"
+		while :; do
+			ensure_once
+			sleep "$INTERVAL"
+		done
+		;;
+	once)
+		ensure_once
+		;;
+	status)
+		status
+		;;
+	*)
+		printf 'usage: %s [loop|once|status]\n' "$0" >&2
+		exit 2
+		;;
+esac

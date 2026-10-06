@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CTOS Control</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topline">
+      <div>
+        <p class="eyebrow">CTOS CONTROL</p>
+        <h1>Host Cockpit</h1>
+      </div>
+      <div class="status-strip">
+        <span id="host">ctos-node</span>
+        <span id="uptime">up --</span>
+        <span id="time">--:--:--</span>
+      </div>
+    </header>
+
+    <section class="layout">
+      <section class="panel hero">
+        <div class="hero-copy">
+          <p class="eyebrow">ACTIVE MODE</p>
+          <h2 id="mode">CTRL</h2>
+          <p id="modeNote">Host-native control plane. Heavy work stays isolated.</p>
+        </div>
+        <canvas id="globe"></canvas>
+      </section>
+
+      <section class="panel meters">
+        <div class="panel-head">
+          <h2>System</h2>
+          <span id="load">load -- -- --</span>
+        </div>
+        <div class="metric">
+          <span>CPU</span>
+          <div class="bar"><i id="cpuBar"></i></div>
+          <strong id="cpuText">--</strong>
+        </div>
+        <div class="metric">
+          <span>RAM</span>
+          <div class="bar"><i id="ramBar"></i></div>
+          <strong id="ramText">--</strong>
+        </div>
+        <div class="metric">
+          <span>Root</span>
+          <div class="bar"><i id="rootBar"></i></div>
+          <strong id="rootText">--</strong>
+        </div>
+        <div class="metric">
+          <span>Home</span>
+          <div class="bar"><i id="homeBar"></i></div>
+          <strong id="homeText">--</strong>
+        </div>
+        <div id="temps" class="chips"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Modes</h2>
+          <span>planned</span>
+        </div>
+        <div id="modes" class="mode-grid"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Virtual Machines</h2>
+          <span id="vmState">checking</span>
+        </div>
+        <div id="vms" class="stack"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Core Node</h2>
+          <span id="coreState">checking</span>
+        </div>
+        <div id="core" class="stack"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Fleet</h2>
+          <span id="fleetState">checking</span>
+        </div>
+        <div id="fleet" class="stack"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Network</h2>
+          <span>interfaces</span>
+        </div>
+        <div id="network" class="stack"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Services</h2>
+          <span>host</span>
+        </div>
+        <div id="services" class="stack compact"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>AI Workers</h2>
+          <span id="aiState">planned</span>
+        </div>
+        <div id="ai" class="stack"></div>
+      </section>
+
+      <section class="panel event-panel">
+        <div class="panel-head">
+          <h2>Events</h2>
+          <span>local</span>
+        </div>
+        <div id="events" class="events"></div>
+      </section>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -36,8 +36,8 @@ This is a proposed shape, not final implementation.
 - `scripts/`: idempotent bootstrap and verification scripts.
 - `systemd/`: user and system service units/timers.
 - `security/`: nftables, DNS, kill-switch, log policy, hardening docs.
-- `hyprland/` and `waybar/`: desktop configuration.
-- `libvirt/`: VM definitions, network definitions, snapshot policy.
+- `hyprland/` and `waybar/`: desktop configuration. First live cockpit configs were imported on 2026-05-27.
+- `libvirt/`: VM definitions, network definitions, storage pool definitions, snapshot policy.
 - `ai/`: local assistant, RAG, vector DB, model manifests.
 - `tests/`: shellcheck, static validation, dry-run checks, VM checks where possible.
 

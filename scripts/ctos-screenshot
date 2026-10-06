@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+mode="${1:-full}"
+dir="${HOME}/Pictures/Screenshots"
+timestamp="$(date +'%Y-%m-%d_%H-%M-%S')"
+
+mkdir -p "$dir"
+
+case "$mode" in
+	full)
+		file="${dir}/screenshot-${timestamp}.png"
+		grim "$file"
+		;;
+	region)
+		file="${dir}/screenshot-region-${timestamp}.png"
+		geometry="$(slurp -d)" || exit 0
+		[ -n "$geometry" ] || exit 0
+		grim -g "$geometry" "$file"
+		;;
+	*)
+		printf 'usage: %s [full|region]\n' "$0" >&2
+		exit 2
+		;;
+esac
+
+if command -v wl-copy >/dev/null 2>&1; then
+	wl-copy --type image/png < "$file"
+fi
+
+printf '%s\n' "$file"

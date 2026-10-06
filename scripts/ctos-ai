@@ -1,0 +1,2233 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import shlex
+import sqlite3
+import subprocess
+import sys
+from dataclasses import dataclass
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
+AGENDA = SCRIPTS / "ctos-agenda"
+RUNTIME_PROFILES = ROOT / "ai" / "runtime_profiles.json"
+AI_HOME = Path(os.environ.get("CTOS_AI_HOME", Path.home() / ".local/share/ctos-ai")).expanduser()
+APPROVAL_DB = Path(os.environ.get("CTOS_AI_APPROVAL_DB", AI_HOME / "approvals.sqlite3")).expanduser()
+DEFAULT_CORE_HOST = os.environ.get("CTOS_CORE_HOST", "10.42.0.2")
+DEFAULT_CORE_USER = os.environ.get("CTOS_CORE_USER", "ctos")
+APPROVAL_STATUSES = {"pending", "rejected", "executed", "failed"}
+AGENDA_PROPOSAL_STATUSES = {"pending", "rejected", "committed", "failed"}
+RUNTIME_REQUIRED_FIELDS = ("id", "label", "kind", "target_node", "interface", "status", "readiness", "ctos_role", "next_probe")
+RUNTIME_INTERFACES = {
+    "responses_api",
+    "ollama_api",
+    "openai_compatible_local_server",
+    "provider_api",
+    "python_library",
+    "cli_coding_assistant",
+    "openai_compatible_proxy",
+    "capability_toolkit",
+}
+
+sys.path.insert(0, str(ROOT))
+from ai.agenda_parser import agenda_command, format_agenda_proposal, parse_natural_agenda  # noqa: E402
+from ai.action_planner import format_plan, plan_text_action  # noqa: E402
+from ai.ctos_prompt import compose_system_prompt, enforce_identity_contract  # noqa: E402
+
+
+REMOTE_OLLAMA_GENERATE = r'''
+from __future__ import annotations
+
+import argparse
+import json
+import urllib.request
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--model", required=True)
+parser.add_argument("--prompt", required=True)
+parser.add_argument("--system", default="")
+parser.add_argument("--temperature", type=float, default=0.0)
+parser.add_argument("--max-tokens", type=int, default=256)
+args = parser.parse_args()
+
+prompt = args.prompt
+if args.system:
+    prompt = f"System:\n{args.system}\n\nUser:\n{args.prompt}"
+
+payload = {
+    "model": args.model,
+    "prompt": prompt,
+    "stream": False,
+    "keep_alive": "2m",
+    "options": {
+        "temperature": args.temperature,
+        "num_predict": args.max_tokens,
+    },
+}
+body = json.dumps(payload).encode("utf-8")
+request = urllib.request.Request(
+    "http://127.0.0.1:11434/api/generate",
+    data=body,
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+with urllib.request.urlopen(request, timeout=180) as response:
+    result = json.loads(response.read().decode("utf-8", errors="replace"))
+
+print(json.dumps({
+    "model": args.model,
+    "response": result.get("response", ""),
+    "done": result.get("done"),
+    "total_duration": result.get("total_duration"),
+    "load_duration": result.get("load_duration"),
+    "prompt_eval_count": result.get("prompt_eval_count"),
+    "prompt_eval_duration": result.get("prompt_eval_duration"),
+    "eval_count": result.get("eval_count"),
+    "eval_duration": result.get("eval_duration"),
+}, sort_keys=True))
+'''
+
+
+class ApprovalStoreError(RuntimeError):
+    pass
+
+
+class RuntimeProfileError(RuntimeError):
+    pass
+
+
+def uptime_text(seconds: int) -> str:
+    minutes, _ = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+    if days:
+        return f"{days}d {hours}h {minutes}m"
+    return f"{hours}h {minutes}m"
+
+
+def one_line(value: object) -> str:
+    return " ".join(str(value).split())
+
+
+def run(args: list[str], timeout: float = 8.0, env: dict[str, str] | None = None) -> dict[str, Any]:
+    try:
+        proc = subprocess.run(
+            args,
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+        return {"rc": proc.returncode, "stdout": proc.stdout.strip(), "stderr": proc.stderr.strip()}
+    except FileNotFoundError:
+        return {"rc": 127, "stdout": "", "stderr": f"{args[0]} not found"}
+    except subprocess.TimeoutExpired:
+        return {"rc": 124, "stdout": "", "stderr": "timeout"}
+
+
+def print_result(label: str, result: dict[str, Any]) -> None:
+    print(f"## {label}")
+    if result["stdout"]:
+        print(result["stdout"])
+    if result["stderr"]:
+        print(result["stderr"], file=sys.stderr)
+    if not result["stdout"] and not result["stderr"]:
+        print(f"rc={result['rc']}")
+    print()
+
+
+def now_iso() -> str:
+    return datetime.now().replace(microsecond=0).isoformat()
+
+
+def shell_join(command: list[str]) -> str:
+    return shlex.join(command)
+
+
+def load_runtime_profiles() -> dict[str, Any]:
+    try:
+        data = json.loads(RUNTIME_PROFILES.read_text(encoding="utf-8"))
+    except OSError as error:
+        raise RuntimeProfileError(f"runtime profile file unavailable at {RUNTIME_PROFILES}: {error}") from error
+    except json.JSONDecodeError as error:
+        raise RuntimeProfileError(f"runtime profile file is invalid JSON: {error}") from error
+
+    if not isinstance(data, dict):
+        raise RuntimeProfileError("runtime profile file must contain a JSON object")
+    profiles = data.get("profiles")
+    if not isinstance(profiles, list):
+        raise RuntimeProfileError("runtime profile file must contain a profiles list")
+
+    seen: set[str] = set()
+    for profile in profiles:
+        if not isinstance(profile, dict):
+            raise RuntimeProfileError("each runtime profile must be a JSON object")
+        profile_id = str(profile.get("id", "")).strip()
+        if not profile_id:
+            raise RuntimeProfileError("each runtime profile needs an id")
+        if profile_id in seen:
+            raise RuntimeProfileError(f"duplicate runtime profile id: {profile_id}")
+        seen.add(profile_id)
+    return data
+
+
+def runtime_profile_index(data: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(profile["id"]): profile
+        for profile in data.get("profiles", [])
+        if isinstance(profile, dict) and profile.get("id")
+    }
+
+
+def runtime_profile_summary(profile: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": profile.get("id"),
+        "label": profile.get("label"),
+        "kind": profile.get("kind"),
+        "target_node": profile.get("target_node"),
+        "interface": profile.get("interface"),
+        "status": profile.get("status"),
+        "readiness": profile.get("readiness"),
+        "endpoint": profile.get("endpoint"),
+        "next_probe": profile.get("next_probe"),
+    }
+
+
+def runtime_recommendation(data: dict[str, Any]) -> dict[str, Any]:
+    profiles = list(runtime_profile_index(data).values())
+    active_profile = data.get("active_profile")
+    local_first = next((profile for profile in profiles if profile.get("id") == "ollama-core-local"), None)
+    external_first = next((profile for profile in profiles if profile.get("id") == "openai-responses-api"), None)
+    policy = data.get("selection_policy", {})
+    if not isinstance(policy, dict):
+        policy = {}
+    requirements = policy.get("requirements_before_activation", [])
+    if not isinstance(requirements, list):
+        requirements = []
+    return {
+        "active_profile": active_profile,
+        "recommended_next": "keep active_profile unset; design the V1 chat/CLI surface and choose the 0.5B/1.5B routing policy",
+        "first_local_probe": runtime_profile_summary(local_first) if isinstance(local_first, dict) else None,
+        "first_external_probe": runtime_profile_summary(external_first) if isinstance(external_first, dict) else None,
+        "blocked_by": requirements,
+        "notes": [
+            "Ollama is the simplest first local probe on ctos-core; the 0.5B path is installed, benchmarked, and reachable through ask-local.",
+            "OpenAI Responses API is the clean first external probe, after secrets and privacy policy.",
+            "GLM-5.2 and AirLLM remain future/experimental profiles, not current installs.",
+        ],
+    }
+
+
+def runtime_check_add(checks: list[dict[str, Any]], name: str, ok: bool, detail: str, severity: str = "error") -> None:
+    checks.append({"name": name, "ok": ok, "severity": "info" if ok else severity, "detail": detail})
+
+
+def runtime_check_profile(profile: dict[str, Any], target_probe: bool = False) -> dict[str, Any]:
+    checks: list[dict[str, Any]] = []
+    blockers: list[str] = []
+    warnings: list[str] = []
+    secret_env: list[dict[str, Any]] = []
+    now = now_iso()
+
+    missing_fields = [field for field in RUNTIME_REQUIRED_FIELDS if profile.get(field) in (None, "")]
+    runtime_check_add(
+        checks,
+        "required_fields",
+        not missing_fields,
+        "all required fields present" if not missing_fields else f"missing: {', '.join(missing_fields)}",
+    )
+    blockers.extend(f"missing required field: {field}" for field in missing_fields)
+
+    interface = str(profile.get("interface") or "")
+    interface_ok = interface in RUNTIME_INTERFACES
+    runtime_check_add(
+        checks,
+        "interface",
+        interface_ok,
+        interface if interface_ok else f"unsupported interface: {interface or 'missing'}",
+    )
+    if not interface_ok:
+        blockers.append(f"unsupported interface: {interface or 'missing'}")
+
+    endpoint = profile.get("endpoint")
+    if endpoint is None:
+        runtime_check_add(checks, "endpoint", True, "no endpoint required for this profile")
+    else:
+        parsed = urlparse(str(endpoint))
+        endpoint_ok = parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+        runtime_check_add(
+            checks,
+            "endpoint",
+            endpoint_ok,
+            str(endpoint) if endpoint_ok else f"invalid endpoint: {endpoint}",
+        )
+        if not endpoint_ok:
+            blockers.append("invalid endpoint")
+
+    env_names = profile.get("secret_env", [])
+    if not isinstance(env_names, list):
+        env_names = []
+        runtime_check_add(checks, "secret_env", False, "secret_env must be a list")
+        blockers.append("secret_env must be a list")
+    else:
+        runtime_check_add(checks, "secret_env", True, f"{len(env_names)} env var(s) declared")
+
+    for name in env_names:
+        env_name = str(name)
+        present = bool(os.environ.get(env_name))
+        secret_env.append({"name": env_name, "present": present})
+        if not present:
+            blockers.append(f"missing secret env: {env_name}")
+
+    readiness = str(profile.get("readiness") or "unknown")
+    if readiness in {"ready", "dry_run_ready"}:
+        runtime_check_add(checks, "readiness", True, readiness)
+    else:
+        runtime_check_add(checks, "readiness", False, readiness, severity="warn")
+        blockers.append(f"profile readiness is {readiness}")
+
+    target_node = str(profile.get("target_node") or "")
+    if target_node == "external":
+        runtime_check_add(checks, "target_node", True, "external provider; no endpoint call made")
+    elif target_node == "ctos-core":
+        helper_ok = (SCRIPTS / "ctos-core").is_file()
+        runtime_check_add(checks, "target_helper", helper_ok, "ctos-core helper available" if helper_ok else "ctos-core helper missing")
+        if not helper_ok:
+            blockers.append("ctos-core helper missing")
+
+        if target_probe:
+            result = run([str(SCRIPTS / "ctos-core"), "status", "--json"], timeout=10)
+            if result["rc"] != 0:
+                detail = one_line(result["stderr"] or result["stdout"] or f"rc={result['rc']}")
+                runtime_check_add(checks, "target_probe", False, detail)
+                blockers.append(f"ctos-core probe failed: {detail}")
+            else:
+                try:
+                    core = json.loads(result["stdout"] or "{}")
+                except json.JSONDecodeError as error:
+                    runtime_check_add(checks, "target_probe", False, f"invalid ctos-core JSON: {error}")
+                    blockers.append("ctos-core returned invalid JSON")
+                else:
+                    available = bool(core.get("available"))
+                    runtime_check_add(checks, "target_probe", available, "ctos-core reachable" if available else str(core.get("error", "ctos-core unavailable")))
+                    if not available:
+                        blockers.append("ctos-core unavailable")
+                    storage = core.get("storage", {}) if isinstance(core, dict) else {}
+                    srv = storage.get("srv", {}) if isinstance(storage, dict) else {}
+                    runtime_check_add(
+                        checks,
+                        "service_root",
+                        bool(srv.get("mounted") and srv.get("writable")),
+                        "/srv/ctos mounted and writable" if srv.get("mounted") and srv.get("writable") else "/srv/ctos not confirmed writable",
+                        severity="warn",
+                    )
+                    if profile.get("id") == "ollama-core-local":
+                        layout = core.get("layout", {}) if isinstance(core, dict) else {}
+                        entries = layout.get("entries", []) if isinstance(layout, dict) else []
+                        model_entry = next(
+                            (item for item in entries if isinstance(item, dict) and item.get("path") == "/srv/ctos/models/ollama"),
+                            None,
+                        )
+                        model_ok = bool(model_entry and model_entry.get("exists"))
+                        runtime_check_add(
+                            checks,
+                            "model_cache",
+                            model_ok,
+                            "/srv/ctos/models/ollama exists; service-owned cache" if model_ok else "/srv/ctos/models/ollama not confirmed",
+                            severity="warn",
+                        )
+        else:
+            runtime_check_add(checks, "target_probe", True, "skipped; pass --target-probe to check owned ctos-core", severity="info")
+            warnings.append("target probe skipped")
+    elif target_node == "t480-local":
+        binary = str(profile.get("binary") or profile.get("id") or "")
+        binary_path = shutil.which(binary) if binary else None
+        runtime_check_add(
+            checks,
+            "local_binary",
+            bool(binary_path),
+            f"{binary_path}" if binary_path else f"{binary or 'binary'} not installed",
+            severity="warn",
+        )
+        if not binary_path:
+            blockers.append(f"local binary missing: {binary or 'unknown'}")
+    else:
+        runtime_check_add(checks, "target_node", False, f"unsupported target node: {target_node or 'missing'}")
+        blockers.append(f"unsupported target node: {target_node or 'missing'}")
+
+    blocked_by = list(dict.fromkeys(blockers))
+    metadata_ok = all(check["ok"] or check["severity"] in {"info", "warn"} for check in checks if check["name"] != "readiness")
+    return {
+        "profile_id": profile.get("id"),
+        "checked_at": now,
+        "dry_run": True,
+        "network_contacted": False,
+        "model_contacted": False,
+        "target_probe": target_probe,
+        "metadata_ok": metadata_ok,
+        "activation_ready": not blocked_by,
+        "secret_env": secret_env,
+        "checks": checks,
+        "warnings": warnings,
+        "blocked_by": blocked_by,
+        "summary": "ready" if not blocked_by else "blocked",
+    }
+
+
+def ssh_core_generate_command(args: argparse.Namespace, prompt: str) -> list[str]:
+    command = "python3 -c " + shlex.quote(REMOTE_OLLAMA_GENERATE)
+    command += " --model " + shlex.quote(args.model)
+    command += " --prompt " + shlex.quote(prompt)
+    system_prompt = compose_system_prompt(args.system, raw_model=getattr(args, "raw_model", False))
+    if system_prompt:
+        command += " --system " + shlex.quote(system_prompt)
+    command += " --temperature " + shlex.quote(str(args.temperature))
+    command += " --max-tokens " + shlex.quote(str(args.max_tokens))
+    return [
+        "ssh",
+        "-F",
+        "/dev/null",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "PasswordAuthentication=no",
+        "-o",
+        "PreferredAuthentications=publickey",
+        "-o",
+        f"ConnectTimeout={args.timeout}",
+        "-o",
+        "LogLevel=ERROR",
+        f"{args.user}@{args.host}",
+        command,
+    ]
+
+
+def local_model_tps(result: dict[str, Any]) -> float:
+    eval_count = int(result.get("eval_count") or 0)
+    eval_duration = int(result.get("eval_duration") or 0)
+    if not eval_count or not eval_duration:
+        return 0.0
+    return round(eval_count / (eval_duration / 1_000_000_000), 2)
+
+
+@dataclass(frozen=True)
+class ActionSpec:
+    name: str
+    title: str
+    tier: int
+    target: str
+    risk: str
+    rollback: str
+    command_help: str
+
+    def command(self, params: dict[str, Any]) -> list[str]:
+        if self.name == "kali-start":
+            return ["virsh", "-c", "qemu:///system", "start", "ctos-kali"]
+        if self.name == "kali-shutdown":
+            return ["virsh", "-c", "qemu:///system", "shutdown", "ctos-kali", "--mode", "agent"]
+        if self.name == "kali-console":
+            return ["virt-manager", "-c", "qemu:///system", "--show-domain-console", "ctos-kali"]
+        if self.name == "kali-checkpoint":
+            return [str(SCRIPTS / "ctos-kali"), "snapshot-checkpoint", str(params["label"])]
+        if self.name == "core-sync-repo":
+            return [str(SCRIPTS / "ctos-core"), "sync-repo"]
+        if self.name == "core-apply-layout":
+            return [str(SCRIPTS / "ctos-core"), "apply-layout"]
+        raise ValueError(f"unknown action: {self.name}")
+
+
+def action_specs() -> dict[str, ActionSpec]:
+    return {
+        "kali-start": ActionSpec(
+            name="kali-start",
+            title="Start ctos-kali",
+            tier=2,
+            target="qemu:///system/ctos-kali",
+            risk="starts the isolated Kali VM and consumes host RAM/CPU",
+            rollback="run `ctos-ai propose kali-shutdown`, then approve it after checking the command",
+            command_help="virsh start ctos-kali",
+        ),
+        "kali-shutdown": ActionSpec(
+            name="kali-shutdown",
+            title="Gracefully shut down ctos-kali",
+            tier=2,
+            target="qemu:///system/ctos-kali",
+            risk="asks the guest agent to shut down Kali; unsaved guest work may be lost",
+            rollback="restart with a new approved `kali-start` action",
+            command_help="virsh shutdown ctos-kali --mode agent",
+        ),
+        "kali-console": ActionSpec(
+            name="kali-console",
+            title="Open ctos-kali console",
+            tier=1,
+            target="qemu:///system/ctos-kali",
+            risk="opens a local console window only; no VM state change expected",
+            rollback="close the console window",
+            command_help="virt-manager --show-domain-console ctos-kali",
+        ),
+        "kali-checkpoint": ActionSpec(
+            name="kali-checkpoint",
+            title="Create a shutoff ctos-kali checkpoint",
+            tier=2,
+            target="qemu:///system/ctos-kali",
+            risk="creates a new disk overlay and changes the active disk chain; refuses if Kali is running",
+            rollback="use libvirt snapshot tooling deliberately; do not delete overlays casually",
+            command_help="ctos-kali snapshot-checkpoint <label>",
+        ),
+        "core-sync-repo": ActionSpec(
+            name="core-sync-repo",
+            title="Sync repo subset to ctos-core",
+            tier=2,
+            target="ctos-core:/srv/ctos/repo/t480",
+            risk="updates the CTOS repo copy on ctos-core; excludes VM disks, ISOs, logs, and private state",
+            rollback="sync again from the desired T480 repo state",
+            command_help="ctos-core sync-repo",
+        ),
+        "core-apply-layout": ActionSpec(
+            name="core-apply-layout",
+            title="Apply ctos-core service directory layout",
+            tier=2,
+            target="ctos-core:/srv/ctos",
+            risk="creates missing service/cache/model/worker directories under /srv/ctos",
+            rollback="directories are intentionally harmless; remove manually only after checking contents",
+            command_help="ctos-core apply-layout",
+        ),
+    }
+
+
+def valid_snapshot_label(label: str) -> bool:
+    if not label or len(label) > 80:
+        return False
+    return label[0].isalnum() and all(ch.isalnum() or ch in "_.-" for ch in label)
+
+
+def default_checkpoint_label() -> str:
+    return f"ai-approved-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+
+
+def approval_connect() -> sqlite3.Connection:
+    try:
+        APPROVAL_DB.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(APPROVAL_DB)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        approval_init_db(conn)
+    except (OSError, sqlite3.Error) as error:
+        raise ApprovalStoreError(f"approval store unavailable at {APPROVAL_DB}: {error}") from error
+    return conn
+
+
+def approval_read_connect() -> sqlite3.Connection | None:
+    if not APPROVAL_DB.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{APPROVAL_DB}?mode=ro", uri=True)
+    except sqlite3.Error as error:
+        raise ApprovalStoreError(f"approval store unavailable at {APPROVAL_DB}: {error}") from error
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def approval_init_db(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS approvals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            action TEXT NOT NULL,
+            title TEXT NOT NULL,
+            tier INTEGER NOT NULL,
+            target TEXT NOT NULL,
+            params_json TEXT NOT NULL,
+            command_json TEXT NOT NULL,
+            risk TEXT NOT NULL,
+            rollback TEXT NOT NULL,
+            note TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            executed_at TEXT,
+            rc INTEGER,
+            result TEXT NOT NULL DEFAULT ''
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agenda_proposals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            input TEXT NOT NULL,
+            normalized TEXT NOT NULL,
+            title TEXT NOT NULL,
+            due_date TEXT,
+            priority INTEGER NOT NULL,
+            estimate_minutes INTEGER NOT NULL,
+            notes TEXT NOT NULL DEFAULT '',
+            warnings_json TEXT NOT NULL DEFAULT '[]',
+            command_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            committed_at TEXT,
+            task_id INTEGER,
+            rc INTEGER,
+            result TEXT NOT NULL DEFAULT ''
+        )
+        """
+    )
+    conn.commit()
+
+
+def approval_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    data = {key: row[key] for key in row.keys()}
+    for key in ("params_json", "command_json"):
+        try:
+            data[key.removesuffix("_json")] = json.loads(str(data.pop(key)))
+        except json.JSONDecodeError:
+                data[key.removesuffix("_json")] = None
+    return data
+
+
+def agenda_proposal_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    data = {key: row[key] for key in row.keys()}
+    for key in ("warnings_json", "command_json"):
+        try:
+            data[key.removesuffix("_json")] = json.loads(str(data.pop(key)))
+        except json.JSONDecodeError:
+            data[key.removesuffix("_json")] = None
+    return data
+
+
+def format_agenda_pending(row: sqlite3.Row) -> str:
+    data = agenda_proposal_row_to_dict(row)
+    command = data.get("command") or []
+    result = f"\nresult    rc={data['rc']} {data['result']}" if data.get("rc") is not None else ""
+    task_id = f"\ntask      #{data['task_id']}" if data.get("task_id") else ""
+    return (
+        f"#{data['id']} {data['status']} agenda proposal\n"
+        f"source    {data['source']}\n"
+        f"input     {data['input']}\n"
+        f"title     {data['title']}\n"
+        f"due       {data['due_date'] or '-'}\n"
+        f"priority  {data['priority']}\n"
+        f"estimate  {data['estimate_minutes']} min\n"
+        f"command   {shell_join(command) if isinstance(command, list) else command}"
+        f"{task_id}{result}"
+    )
+
+
+def store_agenda_proposal(proposal: dict[str, Any], *, source: str) -> sqlite3.Row:
+    command = proposal.get("command") if isinstance(proposal.get("command"), list) else []
+    warnings = proposal.get("warnings") if isinstance(proposal.get("warnings"), list) else []
+    stamp = now_iso()
+    with approval_connect() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO agenda_proposals (
+                source, input, normalized, title, due_date, priority, estimate_minutes,
+                notes, warnings_json, command_json, status, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+            """,
+            (
+                source,
+                str(proposal.get("input") or ""),
+                str(proposal.get("normalized") or ""),
+                str(proposal.get("title") or ""),
+                proposal.get("due_date"),
+                int(proposal.get("priority") or 3),
+                int(proposal.get("estimate_minutes") or 30),
+                str(proposal.get("notes") or ""),
+                json.dumps(warnings, ensure_ascii=False),
+                json.dumps(command, ensure_ascii=False),
+                stamp,
+                stamp,
+            ),
+        )
+        proposal_id = cur.lastrowid
+        row = conn.execute("SELECT * FROM agenda_proposals WHERE id = ?", (proposal_id,)).fetchone()
+    if row is None:
+        raise ApprovalStoreError("agenda proposal insert succeeded but could not be reloaded")
+    return row
+
+
+def load_agenda_proposal(proposal_id: int) -> sqlite3.Row | None:
+    conn = approval_read_connect()
+    if conn is None:
+        return None
+    try:
+        return conn.execute("SELECT * FROM agenda_proposals WHERE id = ?", (proposal_id,)).fetchone()
+    except sqlite3.OperationalError as error:
+        if "no such table" in str(error):
+            return None
+        raise ApprovalStoreError(f"agenda proposal read failed: {error}") from error
+    finally:
+        conn.close()
+
+
+def load_latest_agenda_proposal() -> sqlite3.Row | None:
+    conn = approval_read_connect()
+    if conn is None:
+        return None
+    try:
+        return conn.execute(
+            "SELECT * FROM agenda_proposals WHERE status = 'pending' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    except sqlite3.OperationalError as error:
+        if "no such table" in str(error):
+            return None
+        raise ApprovalStoreError(f"agenda proposal read failed: {error}") from error
+    finally:
+        conn.close()
+
+
+def load_agenda_proposals(*, status: str | None, limit: int) -> list[sqlite3.Row]:
+    limit = max(1, min(limit, 100))
+    conn = approval_read_connect()
+    if conn is None:
+        return []
+    try:
+        if status is None:
+            return list(conn.execute("SELECT * FROM agenda_proposals ORDER BY id DESC LIMIT ?", (limit,)))
+        return list(
+            conn.execute(
+                "SELECT * FROM agenda_proposals WHERE status = ? ORDER BY id DESC LIMIT ?",
+                (status, limit),
+            )
+        )
+    except sqlite3.OperationalError as error:
+        if "no such table" in str(error):
+            return []
+        raise ApprovalStoreError(f"agenda proposal read failed: {error}") from error
+    finally:
+        conn.close()
+
+
+def load_approvals(*, status: str | None, limit: int) -> list[sqlite3.Row]:
+    limit = max(1, min(limit, 100))
+    conn = approval_read_connect()
+    if conn is None:
+        return []
+    try:
+        if status is None:
+            return list(conn.execute("SELECT * FROM approvals ORDER BY id DESC LIMIT ?", (limit,)))
+        return list(
+            conn.execute(
+                "SELECT * FROM approvals WHERE status = ? ORDER BY id DESC LIMIT ?",
+                (status, limit),
+            )
+        )
+    except sqlite3.OperationalError as error:
+        if "no such table" in str(error):
+            return []
+        raise ApprovalStoreError(f"approval read failed: {error}") from error
+    finally:
+        conn.close()
+
+
+def resolve_agenda_proposal_ref(ref: str) -> sqlite3.Row | None:
+    if ref == "latest":
+        return load_latest_agenda_proposal()
+    try:
+        proposal_id = int(ref)
+    except ValueError:
+        return None
+    return load_agenda_proposal(proposal_id)
+
+
+def update_agenda_proposal(
+    proposal_id: int,
+    *,
+    status: str,
+    rc: int | None = None,
+    result: str = "",
+    committed_at: str | None = None,
+    task_id: int | None = None,
+) -> None:
+    if status not in AGENDA_PROPOSAL_STATUSES:
+        raise ApprovalStoreError(f"invalid agenda proposal status: {status}")
+    stamp = now_iso()
+    with approval_connect() as conn:
+        conn.execute(
+            """
+            UPDATE agenda_proposals
+            SET status = ?, updated_at = ?, committed_at = ?, task_id = ?, rc = ?, result = ?
+            WHERE id = ?
+            """,
+            (status, stamp, committed_at, task_id, rc, one_line(result)[:800], proposal_id),
+        )
+
+
+def agenda_proposal_task_id(output: str) -> int | None:
+    match = re.search(r"added #([0-9]+):", output)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def approval_params(action: str, args: argparse.Namespace) -> dict[str, Any]:
+    params: dict[str, Any] = {}
+    if action == "kali-checkpoint":
+        label = args.label or default_checkpoint_label()
+        if not valid_snapshot_label(label):
+            raise ValueError("checkpoint label must start with an alphanumeric character and contain only letters, numbers, dot, dash, or underscore")
+        params["label"] = label
+    return params
+
+
+def format_approval(row: sqlite3.Row) -> str:
+    data = approval_row_to_dict(row)
+    command = data.get("command") or []
+    note = f"\nnote      {data['note']}" if data.get("note") else ""
+    result = f"\nresult    rc={data['rc']} {data['result']}" if data.get("rc") is not None else ""
+    return (
+        f"#{data['id']} {data['status']} T{data['tier']} {data['action']}\n"
+        f"title     {data['title']}\n"
+        f"target    {data['target']}\n"
+        f"command   {shell_join(command) if isinstance(command, list) else command}\n"
+        f"risk      {data['risk']}\n"
+        f"rollback  {data['rollback']}"
+        f"{note}{result}"
+    )
+
+
+def load_approval(approval_id: int) -> sqlite3.Row | None:
+    with approval_connect() as conn:
+        return conn.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,)).fetchone()
+
+
+def load_control_snapshot() -> tuple[dict[str, Any], str]:
+    sys.path.insert(0, str(ROOT))
+    try:
+        from control.status import snapshot
+
+        return snapshot(), ""
+    except Exception as error:  # pragma: no cover - defensive shell boundary
+        return {}, str(error)
+
+
+def load_open_tasks() -> tuple[list[dict[str, Any]], str]:
+    result = run([str(AGENDA), "list", "--json"], timeout=3)
+    if result["rc"] != 0:
+        return [], result["stderr"] or result["stdout"] or f"agenda rc={result['rc']}"
+    try:
+        payload = json.loads(result["stdout"] or "{}")
+    except json.JSONDecodeError as error:
+        return [], f"agenda json error: {error}"
+    tasks = payload.get("tasks", [])
+    if not isinstance(tasks, list):
+        return [], "agenda payload has no task list"
+    return [task for task in tasks if isinstance(task, dict)], ""
+
+
+def brief_recommendation(snapshot_data: dict[str, Any], tasks: list[dict[str, Any]], agenda_error: str) -> str:
+    if agenda_error:
+        return "repair agenda storage before planning work"
+    if not tasks:
+        return "add one concrete agenda task, then run `ctos-ai brief` again"
+
+    today = date.today().isoformat()
+    due_today = [task for task in tasks if task.get("due_date") in (None, today)]
+    if due_today:
+        first = due_today[0]
+        return f"start with agenda #{first.get('id')}: {first.get('title')}"
+
+    core = snapshot_data.get("core", {})
+    if isinstance(core, dict) and not core.get("available", False):
+        return "restore/verify ctos-core link before scheduling worker-heavy work"
+
+    return "run `ctos-ai plan-day` and pick the first planned block"
+
+
+def cmd_brief(args: argparse.Namespace) -> int:
+    snapshot_data, snapshot_error = load_control_snapshot()
+    tasks, agenda_error = load_open_tasks()
+
+    host = snapshot_data.get("host", {}) if isinstance(snapshot_data, dict) else {}
+    core = snapshot_data.get("core", {}) if isinstance(snapshot_data, dict) else {}
+    vms = snapshot_data.get("vms", {}) if isinstance(snapshot_data, dict) else {}
+    kali = vms.get("kali", {}) if isinstance(vms, dict) else {}
+    battery = snapshot_data.get("battery", []) if isinstance(snapshot_data, dict) else []
+    ai = snapshot_data.get("ai", {}) if isinstance(snapshot_data, dict) else {}
+    agenda = ai.get("agenda", {}) if isinstance(ai, dict) else {}
+    runtime_profiles = ai.get("runtime_profiles", {}) if isinstance(ai, dict) else {}
+    counts = agenda.get("counts", {}) if isinstance(agenda, dict) else {}
+    now = datetime.now().replace(microsecond=0).isoformat()
+    recommendation = brief_recommendation(snapshot_data, tasks, agenda_error)
+
+    payload = {
+        "time": now,
+        "snapshot_error": snapshot_error,
+        "host": {
+            "hostname": host.get("hostname"),
+            "uptime": uptime_text(int(host.get("uptime_seconds", 0))) if host else "unknown",
+            "load": host.get("load"),
+            "ram": host.get("memory", {}),
+            "battery": battery,
+        },
+        "core": {
+            "available": core.get("available") if isinstance(core, dict) else False,
+            "hostname": core.get("hostname") if isinstance(core, dict) else None,
+            "role": (core.get("role") or {}).get("role") if isinstance(core.get("role"), dict) else None,
+            "error": core.get("error") if isinstance(core, dict) else "missing",
+        },
+        "kali": {
+            "available": kali.get("available") if isinstance(kali, dict) else False,
+            "state": kali.get("state") if isinstance(kali, dict) else "unknown",
+            "snapshot": kali.get("current_snapshot") if isinstance(kali, dict) else None,
+            "health": kali.get("health") if isinstance(kali, dict) else {},
+        },
+        "agenda": {
+            "error": agenda_error,
+            "counts": counts,
+            "next_tasks": tasks[:5],
+        },
+        "runtime_profiles": runtime_profiles,
+        "recommendation": recommendation,
+    }
+
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0 if not agenda_error and not snapshot_error else 1
+
+    print("CTOS AI brief")
+    print("=============")
+    print(f"time      {now}")
+    if snapshot_error:
+        print(f"snapshot  error: {snapshot_error}")
+    if host:
+        memory = host.get("memory", {})
+        battery_text = " ".join(
+            f"{item.get('name')}={item.get('capacity')}%/{item.get('status')}"
+            for item in battery
+            if isinstance(item, dict)
+        ) or "n/a"
+        print(f"host      {host.get('hostname')} uptime {uptime_text(int(host.get('uptime_seconds', 0)))}")
+        print(f"load      {' '.join(str(item) for item in host.get('load', []))}")
+        print(f"ram       {memory.get('used_text', '?')} / {memory.get('total_text', '?')} ({memory.get('used_percent', '?')}%)")
+        print(f"battery   {battery_text}")
+
+    if isinstance(core, dict) and core.get("available"):
+        role = core.get("role", {})
+        storage = core.get("storage", {})
+        srv = storage.get("srv", {}) if isinstance(storage, dict) else {}
+        print(f"core      {core.get('hostname')} role {(role or {}).get('role', 'unknown')} srv_free {srv.get('free_text', '?')}")
+    else:
+        error = core.get("error", "unknown") if isinstance(core, dict) else "missing"
+        print(f"core      unavailable ({one_line(error)})")
+
+    if isinstance(kali, dict) and kali.get("available"):
+        health = kali.get("health", {})
+        print(f"kali      {kali.get('state')} snapshot {kali.get('current_snapshot') or 'none'}")
+        print(f"kali-h    {(health or {}).get('summary', 'unknown')}")
+    else:
+        print("kali      unavailable")
+
+    if agenda_error:
+        print(f"agenda    error: {agenda_error}")
+    else:
+        print(
+            "agenda    "
+            f"open {counts.get('open', len(tasks))} "
+            f"due {counts.get('due_today', 0)} "
+            f"done {counts.get('done', 0)}"
+        )
+        for task in tasks[:5]:
+            due = task.get("due_date") or "-"
+            print(f"          #{task.get('id')} P{task.get('priority')} {due} {task.get('title')}")
+
+    if isinstance(runtime_profiles, dict) and runtime_profiles:
+        runtime_error = runtime_profiles.get("error")
+        if runtime_error:
+            print(f"runtime  error: {one_line(runtime_error)}")
+        else:
+            print(
+                "runtime  "
+                f"profiles {runtime_profiles.get('count', 0)} "
+                f"active {runtime_profiles.get('active_profile') or 'none'}"
+            )
+
+    print(f"next      {recommendation}")
+    return 0 if not agenda_error and not snapshot_error else 1
+
+
+def cmd_capabilities(args: argparse.Namespace) -> int:
+    capabilities = {
+        "tier_0_read_only": ["brief", "status", "search-context", "route-text", "agenda-review", "ask-local", "cheap-lane", "cheap-plan", "code-draft", "ctos-ai-api", "ctos-ai-chat", "ctos-voice probe/ask/chat", "ctos-voice assistant --no-actions", "ctos-voice-v2 plan/status"],
+        "tier_1_reversible": ["agenda", "agenda-propose", "agenda-proposals", "agenda-confirm", "agenda-reject", "plan-day", "open-desk", "open-vms", "ctos-voice assistant/assistant-once safe CTOS actions"],
+        "tier_2_confirmation_required": ["approval queue", "vm lifecycle", "repo sync", "service layout", "future package installs", "future config edits"],
+        "tier_3_manual": ["sudo", "disk", "firewall", "autologin/security posture", "delete state"],
+        "forbidden": ["secret extraction", "stealth persistence", "unauthorized third-party access"],
+        "approval_db": str(APPROVAL_DB),
+        "allowlisted_actions": sorted(action_specs()),
+        "runtime_profiles": str(RUNTIME_PROFILES),
+        "runtime_commands": ["runtimes", "runtime <id>", "runtime-check <id>", "runtime-recommend", "route-text", "agenda-review", "ask-local", "cheap-lane", "cheap-plan", "code-draft", "ctos-ai-api", "ctos-ai-api-server", "ctos-ai-chat", "ctos-ollama-bench plan", "ctos-voice assistant", "ctos-voice assistant-once", "ctos-voice-v2 plan"],
+    }
+    if args.json:
+        print(json.dumps(capabilities, ensure_ascii=False, indent=2))
+    else:
+        print("CTOS AI V0 capabilities")
+        print("=======================")
+        for tier, items in capabilities.items():
+            print(f"{tier}:")
+            if isinstance(items, list):
+                for item in items:
+                    print(f"  - {item}")
+            else:
+                print(f"  {items}")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    checks = {
+        "control": run([str(SCRIPTS / "ctos-control"), "status"], timeout=3),
+        "desk_guard": run([str(SCRIPTS / "ctos-desk-guard"), "status"], timeout=8),
+        "core": run([str(SCRIPTS / "ctos-core"), "status", "--json"], timeout=8),
+        "kali": run([str(SCRIPTS / "ctos-kali"), "status"], timeout=8),
+        "agenda": run([str(AGENDA), "list", "--json"], timeout=3),
+    }
+    if args.json:
+        print(json.dumps(checks, ensure_ascii=False, indent=2))
+        return 0
+
+    print("CTOS AI status")
+    print("==============")
+    for label, result in checks.items():
+        print_result(label, result)
+    return 0 if all(item["rc"] in (0, 1, 124) for item in checks.values()) else 1
+
+
+def cmd_runtimes(args: argparse.Namespace) -> int:
+    try:
+        data = load_runtime_profiles()
+    except RuntimeProfileError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+
+    profiles = [runtime_profile_summary(profile) for profile in runtime_profile_index(data).values()]
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "path": str(RUNTIME_PROFILES),
+                    "schema_version": data.get("schema_version"),
+                    "updated": data.get("updated"),
+                    "active_profile": data.get("active_profile"),
+                    "profiles": profiles,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+
+    print("CTOS AI runtime/provider profiles")
+    print("=================================")
+    print(f"path     {RUNTIME_PROFILES}")
+    print(f"updated  {data.get('updated')}")
+    print(f"active   {data.get('active_profile') or 'none'}")
+    print()
+    for profile in profiles:
+        print(f"{profile.get('id'):<24} {profile.get('status'):<22} {profile.get('target_node')}")
+        print(f"  {profile.get('label')}")
+        print(f"  readiness: {profile.get('readiness')}")
+        print(f"  next: {profile.get('next_probe')}")
+    return 0
+
+
+def cmd_runtime(args: argparse.Namespace) -> int:
+    try:
+        data = load_runtime_profiles()
+    except RuntimeProfileError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    profiles = runtime_profile_index(data)
+    profile = profiles.get(args.id)
+    if profile is None:
+        print(f"unknown runtime profile: {args.id}", file=sys.stderr)
+        print("available profiles:", file=sys.stderr)
+        for profile_id in sorted(profiles):
+            print(f"  - {profile_id}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(profile, ensure_ascii=False, indent=2))
+        return 0
+
+    print(f"CTOS AI runtime profile: {profile.get('id')}")
+    print("=" * (25 + len(str(profile.get("id")))))
+    for key in ("label", "kind", "target_node", "interface", "status", "readiness", "endpoint", "ctos_role", "next_probe"):
+        print(f"{key:<12} {profile.get(key) if profile.get(key) is not None else 'none'}")
+    for key in ("fit", "constraints", "secret_env", "sources"):
+        values = profile.get(key, [])
+        if not isinstance(values, list):
+            values = [values]
+        print(f"{key}:")
+        for value in values:
+            print(f"  - {value}")
+    return 0
+
+
+def cmd_runtime_recommend(args: argparse.Namespace) -> int:
+    try:
+        data = load_runtime_profiles()
+    except RuntimeProfileError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    recommendation = runtime_recommendation(data)
+    if args.json:
+        print(json.dumps(recommendation, ensure_ascii=False, indent=2))
+        return 0
+
+    print("CTOS AI runtime recommendation")
+    print("==============================")
+    print(f"active          {recommendation.get('active_profile') or 'none'}")
+    print(f"next            {recommendation.get('recommended_next')}")
+    local = recommendation.get("first_local_probe")
+    external = recommendation.get("first_external_probe")
+    if isinstance(local, dict):
+        print(f"local probe     {local.get('id')} / {local.get('readiness')}")
+        print(f"               {local.get('next_probe')}")
+    if isinstance(external, dict):
+        print(f"external probe  {external.get('id')} / {external.get('readiness')}")
+        print(f"               {external.get('next_probe')}")
+    blocked_by = recommendation.get("blocked_by", [])
+    if isinstance(blocked_by, list) and blocked_by:
+        print("blocked by:")
+        for item in blocked_by:
+            print(f"  - {item}")
+    return 0
+
+
+def cmd_runtime_check(args: argparse.Namespace) -> int:
+    try:
+        data = load_runtime_profiles()
+    except RuntimeProfileError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    profiles = runtime_profile_index(data)
+    profile = profiles.get(args.id)
+    if profile is None:
+        print(f"unknown runtime profile: {args.id}", file=sys.stderr)
+        print("available profiles:", file=sys.stderr)
+        for profile_id in sorted(profiles):
+            print(f"  - {profile_id}", file=sys.stderr)
+        return 2
+
+    result = runtime_check_profile(profile, target_probe=args.target_probe)
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result["metadata_ok"] else 1
+
+    print(f"CTOS AI runtime dry-run: {profile.get('id')}")
+    print("=" * (25 + len(str(profile.get("id")))))
+    print(f"summary          {result['summary']}")
+    print(f"metadata_ok      {result['metadata_ok']}")
+    print(f"activation_ready {result['activation_ready']}")
+    print(f"network          {'contacted' if result['network_contacted'] else 'not contacted'}")
+    print(f"model            {'contacted' if result['model_contacted'] else 'not contacted'}")
+    print(f"target_probe     {result['target_probe']}")
+    print()
+    print("checks:")
+    for check in result["checks"]:
+        mark = "ok" if check["ok"] else check["severity"]
+        print(f"  {mark:<5} {check['name']:<16} {check['detail']}")
+    if result["secret_env"]:
+        print("secret_env:")
+        for item in result["secret_env"]:
+            state = "present" if item["present"] else "missing"
+            print(f"  {item['name']:<24} {state}")
+    if result["blocked_by"]:
+        print("blocked_by:")
+        for item in result["blocked_by"]:
+            print(f"  - {item}")
+    return 0 if result["metadata_ok"] else 1
+
+
+def cmd_ask_local(args: argparse.Namespace) -> int:
+    prompt = " ".join(args.prompt).strip()
+    if prompt == "-":
+        prompt = sys.stdin.read().strip()
+    if not prompt:
+        print("prompt is required", file=sys.stderr)
+        return 2
+    if args.max_tokens < 1 or args.max_tokens > 2048:
+        print("--max-tokens must be between 1 and 2048", file=sys.stderr)
+        return 2
+
+    result = run(ssh_core_generate_command(args, prompt), timeout=float(args.remote_timeout))
+    if result["rc"] != 0:
+        if result["stdout"]:
+            print(result["stdout"])
+        if result["stderr"]:
+            print(result["stderr"], file=sys.stderr)
+        return int(result["rc"])
+
+    try:
+        payload = json.loads(result["stdout"] or "{}")
+    except json.JSONDecodeError as error:
+        print(f"invalid Ollama response JSON: {error}", file=sys.stderr)
+        if result["stdout"]:
+            print(result["stdout"])
+        return 1
+
+    if args.json:
+        payload["response"], payload["identity_guarded"] = enforce_identity_contract(
+            str(payload.get("response") or ""),
+            raw_model=getattr(args, "raw_model", False),
+        )
+        payload["tokens_per_second"] = local_model_tps(payload)
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+
+    response, _ = enforce_identity_contract(str(payload.get("response") or ""), raw_model=getattr(args, "raw_model", False))
+    print(response)
+    if args.stats:
+        print()
+        print(f"model              {payload.get('model')}")
+        print(f"eval_tokens        {payload.get('eval_count')}")
+        print(f"tokens_per_second  {local_model_tps(payload)}")
+    return 0
+
+
+def local_tool_status(command: str) -> dict[str, Any]:
+    path = shutil.which(command)
+    return {"command": command, "available": bool(path), "path": path}
+
+
+def cheap_lane_status(*, probe_local: bool = False) -> dict[str, Any]:
+    tools = {
+        "aider": local_tool_status("aider"),
+        "9router": local_tool_status("9router"),
+        "agent-reach": local_tool_status("agent-reach"),
+    }
+    profiles_error = ""
+    profiles: dict[str, Any] = {}
+    try:
+        data = load_runtime_profiles()
+        indexed = runtime_profile_index(data)
+        for profile_id in ("ollama-core-local", "aider-cli-local", "9router-local-proxy", "agent-reach-local-tools"):
+            profile = indexed.get(profile_id)
+            if isinstance(profile, dict):
+                profiles[profile_id] = runtime_profile_summary(profile)
+    except RuntimeProfileError as error:
+        profiles_error = str(error)
+
+    local_api = {"probed": False, "ok": None, "detail": "skipped"}
+    if probe_local:
+        result = run([str(SCRIPTS / "ctos-ai-api"), "health", "--json"], timeout=15)
+        detail = one_line(result["stderr"] or result["stdout"] or f"rc={result['rc']}")
+        local_api = {"probed": True, "ok": result["rc"] == 0, "rc": result["rc"], "detail": detail[:500]}
+
+    return {
+        "mode": "ctos-cheap-lane",
+        "profiles_error": profiles_error,
+        "profiles": profiles,
+        "tools": tools,
+        "local_api": local_api,
+        "policy": [
+            "local Ollama first for private/small drafts",
+            "Aider only after isolated install and explicit file scope",
+            "9Router only after privacy/secrets review; synthetic prompts first",
+            "Agent-Reach only as read/search capability; no cookies at first",
+            "Codex remains final reviewer/editor for risky changes",
+        ],
+        "next": [
+            'ctos-ai code-draft "resume le plan en 5 lignes"',
+            "ctos-ai cheap-plan --tool aider",
+            "ctos-ai runtime-check aider-cli-local",
+        ],
+    }
+
+
+def cmd_cheap_lane(args: argparse.Namespace) -> int:
+    payload = cheap_lane_status(probe_local=args.probe_local)
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    print("CTOS cheap/free AI lane")
+    print("=======================")
+    if payload["profiles_error"]:
+        print(f"profiles error: {payload['profiles_error']}")
+    print("tools:")
+    for name, status in payload["tools"].items():
+        state = status["path"] if status["available"] else "missing"
+        print(f"  {name:<12} {state}")
+    local_api = payload["local_api"]
+    if local_api["probed"]:
+        state = "ok" if local_api["ok"] else "failed"
+        print(f"local api    {state} rc={local_api.get('rc')}")
+    else:
+        print("local api    not probed; use --probe-local")
+    print()
+    print("policy:")
+    for item in payload["policy"]:
+        print(f"  - {item}")
+    print()
+    print("next:")
+    for item in payload["next"]:
+        print(f"  {item}")
+    return 0
+
+
+def cheap_plan_lines(tool: str) -> list[str]:
+    lines: list[str] = []
+    if tool in {"all", "aider"}:
+        lines.extend(
+            [
+                "AIDER / coding client",
+                "purpose: cheap coding drafts with explicit file scope",
+                "current install state: " + ("installed" if shutil.which("aider") else "missing"),
+                "safe first probe:",
+                '  ctos-ai code-draft "propose une petite refactorisation sans editer les fichiers"',
+                "manual install decision still needed:",
+                "  use an isolated user venv or uvx path; avoid global Python installs",
+                "future local-model run shape, after install:",
+                "  ctos-ai-tunnel ensure",
+                "  OLLAMA_API_BASE=http://127.0.0.1:11435 aider --model ollama_chat/qwen2.5-coder:1.5b",
+                "",
+            ]
+        )
+    if tool in {"all", "9router"}:
+        lines.extend(
+            [
+                "9ROUTER / external router proxy",
+                "purpose: optional free/cheap provider routing for OpenAI-compatible clients",
+                "current install state: " + ("installed" if shutil.which("9router") else "missing"),
+                "hard gate:",
+                "  synthetic prompts only until privacy/secrets policy is written",
+                "do not route:",
+                "  private keys, browser state, full repo, logs, VM material, personal notes",
+                "",
+            ]
+        )
+    if tool in {"all", "agent-reach"}:
+        lines.extend(
+            [
+                "AGENT-REACH / read capability toolkit",
+                "purpose: research/source gathering, not coding model and not execution authority",
+                "current install state: " + ("installed" if shutil.which("agent-reach") else "missing"),
+                "hard gate:",
+                "  doctor/dry-run first, no cookies/browser session import at first",
+                "",
+            ]
+        )
+    return lines
+
+
+def cmd_cheap_plan(args: argparse.Namespace) -> int:
+    lines = cheap_plan_lines(args.tool)
+    payload = {
+        "mode": "ctos-cheap-plan",
+        "tool": args.tool,
+        "lines": lines,
+        "mutates_system": False,
+        "installs_packages": False,
+        "contacts_external_provider": False,
+    }
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    print("CTOS cheap lane plan")
+    print("====================")
+    print("\n".join(lines).rstrip())
+    return 0
+
+
+def cmd_code_draft(args: argparse.Namespace) -> int:
+    request = " ".join(args.prompt).strip()
+    if request == "-":
+        request = sys.stdin.read().strip()
+    if not request:
+        print("prompt is required", file=sys.stderr)
+        return 2
+    if args.max_tokens < 1 or args.max_tokens > 2048:
+        print("--max-tokens must be between 1 and 2048", file=sys.stderr)
+        return 2
+
+    prefix = (
+        "Mode CTOS cheap lane. Reponds en francais simple. "
+        "Tu ne peux pas lire les fichiers, executer des commandes, ni modifier le repo. "
+        "Produit un brouillon court et utile pour economiser les appels Codex. "
+        "Si une action est risquee ou manque de contexte, propose une verification explicite."
+    )
+    if args.kind == "code":
+        prefix += " Donne du pseudo-code ou un patch conceptuel, pas une promesse d'edition."
+    elif args.kind == "research":
+        prefix += " Donne les questions/source checks a faire, sans inventer de source."
+    else:
+        prefix += " Donne un plan d'action minimal."
+    prompt = f"{prefix}\n\nDemande operateur:\n{request}"
+
+    if args.print_prompt:
+        print(prompt)
+        return 0
+
+    local_args = argparse.Namespace(
+        model=args.model,
+        system="",
+        raw_model=False,
+        temperature=args.temperature,
+        max_tokens=args.max_tokens,
+        host=args.host,
+        user=args.user,
+        timeout=args.timeout,
+    )
+    result = run(ssh_core_generate_command(local_args, prompt), timeout=float(args.remote_timeout))
+    if result["rc"] != 0:
+        if result["stdout"]:
+            print(result["stdout"])
+        if result["stderr"]:
+            print(result["stderr"], file=sys.stderr)
+        return int(result["rc"])
+    try:
+        payload = json.loads(result["stdout"] or "{}")
+    except json.JSONDecodeError as error:
+        print(f"invalid local model response: {error}", file=sys.stderr)
+        print(result["stdout"])
+        return 1
+
+    response, _ = enforce_identity_contract(str(payload.get("response") or ""))
+    payload["response"] = response.strip()
+    payload["tokens_per_second"] = local_model_tps(payload)
+    payload["mode"] = "ctos-code-draft"
+    payload["authority"] = "read-only draft; no files read; no commands executed"
+
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(payload["response"])
+        if args.stats:
+            print()
+            print(f"model {payload.get('model')} tokens/s {payload.get('tokens_per_second')}")
+    return 0
+
+
+def cmd_search_context(args: argparse.Namespace) -> int:
+    query = " ".join(args.query).strip()
+    if not query:
+        print("query is required", file=sys.stderr)
+        return 2
+    paths = ["context", "docs", "README.md", "AGENTS.md"]
+    result = run(["rg", "-n", "--glob", "*.md", query, *paths], timeout=8)
+    if result["rc"] == 127:
+        result = run(["grep", "-RIn", query, *paths], timeout=8)
+    if result["stdout"]:
+        print(result["stdout"])
+    if result["stderr"]:
+        print(result["stderr"], file=sys.stderr)
+    return 0 if result["rc"] in (0, 1) else int(result["rc"])
+
+
+def cmd_route_text(args: argparse.Namespace) -> int:
+    text = " ".join(args.text).strip()
+    if text == "-":
+        text = sys.stdin.read().strip()
+    if not text:
+        print("text is required", file=sys.stderr)
+        return 2
+
+    plan = plan_text_action(text, source=args.source, threshold=args.threshold)
+    command = plan.get("command") if isinstance(plan.get("command"), list) else []
+    result: dict[str, Any] | None = None
+
+    if args.execute_safe:
+        if not plan.get("safe_to_execute"):
+            plan["execution"] = {
+                "attempted": False,
+                "rc": 2,
+                "reason": "plan is not safe for direct execution",
+            }
+            if args.json:
+                print(json.dumps(plan, ensure_ascii=False, indent=2))
+            else:
+                print(format_plan(plan))
+                print()
+                print("execution refused: plan is not safe for direct execution", file=sys.stderr)
+            return 2
+        timeout = 35.0 if command[1:2] == ["open-desk"] else 30.0
+        result = run([str(SCRIPTS / "ctos-ai"), *command[1:]], timeout=timeout)
+        plan["execution"] = {
+            "attempted": True,
+            "rc": result["rc"],
+            "stdout": result["stdout"],
+            "stderr": result["stderr"],
+        }
+
+    if args.json:
+        print(json.dumps(plan, ensure_ascii=False, indent=2))
+    else:
+        print(format_plan(plan))
+        if args.execute_safe and result is not None:
+            print()
+            print("execution")
+            print("=========")
+            if result["stdout"]:
+                print(result["stdout"])
+            if result["stderr"]:
+                print(result["stderr"], file=sys.stderr)
+
+    if args.execute_safe and result is not None:
+        return int(result["rc"])
+    return 0
+
+
+def cmd_agenda_propose(args: argparse.Namespace) -> int:
+    text = " ".join(args.text).strip()
+    if text == "-":
+        text = sys.stdin.read().strip()
+    if not text:
+        print("agenda request text is required", file=sys.stderr)
+        return 2
+
+    proposal = parse_natural_agenda(text)
+    if args.title:
+        proposal["title"] = " ".join(args.title.split())
+        proposal["recognized"] = bool(proposal["title"])
+    if args.due:
+        try:
+            proposal["due_date"] = date.fromisoformat(args.due).isoformat()
+        except ValueError:
+            print("--due must be YYYY-MM-DD", file=sys.stderr)
+            return 2
+    if args.priority is not None:
+        if args.priority < 1 or args.priority > 5:
+            print("--priority must be from 1 to 5", file=sys.stderr)
+            return 2
+        proposal["priority"] = args.priority
+    if args.estimate is not None:
+        if args.estimate < 5:
+            print("--estimate must be at least 5 minutes", file=sys.stderr)
+            return 2
+        proposal["estimate_minutes"] = args.estimate
+    if args.notes:
+        proposal["notes"] = args.notes
+
+    proposal["command"] = agenda_command(proposal, agenda_bin=str(AGENDA))
+    proposal["command_text"] = shell_join(proposal["command"])
+
+    if not proposal.get("recognized"):
+        if args.json:
+            print(json.dumps(proposal, ensure_ascii=False, indent=2))
+        else:
+            print(format_agenda_proposal(proposal))
+        return 2
+
+    if args.save and args.commit:
+        print("choose --save or --commit, not both", file=sys.stderr)
+        return 2
+
+    if args.save:
+        try:
+            row = store_agenda_proposal(proposal, source=args.source)
+        except ApprovalStoreError as error:
+            print(str(error), file=sys.stderr)
+            return 1
+        if args.json:
+            payload = dict(proposal)
+            payload["pending"] = agenda_proposal_row_to_dict(row)
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print(format_agenda_proposal(proposal))
+            print()
+            print("saved pending proposal")
+            print("======================")
+            print(format_agenda_pending(row))
+            print()
+            print(f"next      ctos-ai agenda-confirm {row['id']} --yes")
+        return 0
+
+    if args.commit:
+        if not args.yes:
+            proposal["commit_refused"] = "missing --yes"
+            if args.json:
+                print(json.dumps(proposal, ensure_ascii=False, indent=2))
+            else:
+                print(format_agenda_proposal(proposal))
+                print()
+                print("refused: pass --commit --yes after reviewing the proposal", file=sys.stderr)
+            return 2
+        result = run(proposal["command"], timeout=5)
+        proposal["commit"] = {
+            "attempted": True,
+            "rc": result["rc"],
+            "stdout": result["stdout"],
+            "stderr": result["stderr"],
+        }
+        if args.json:
+            print(json.dumps(proposal, ensure_ascii=False, indent=2))
+        else:
+            print(format_agenda_proposal(proposal))
+            print()
+            if result["stdout"]:
+                print(result["stdout"])
+            if result["stderr"]:
+                print(result["stderr"], file=sys.stderr)
+        return int(result["rc"])
+
+    if args.json:
+        print(json.dumps(proposal, ensure_ascii=False, indent=2))
+    else:
+        print(format_agenda_proposal(proposal))
+    return 0
+
+
+def cmd_agenda_proposals(args: argparse.Namespace) -> int:
+    status = None if args.all else args.status
+    if status is not None and status not in AGENDA_PROPOSAL_STATUSES:
+        print(f"invalid status: {status}", file=sys.stderr)
+        return 2
+    try:
+        rows = load_agenda_proposals(status=status, limit=args.limit)
+    except ApprovalStoreError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps([agenda_proposal_row_to_dict(row) for row in rows], ensure_ascii=False, indent=2))
+        return 0
+    if not rows:
+        print("no agenda proposals")
+        return 0
+    for index, row in enumerate(rows):
+        if index:
+            print()
+        print(format_agenda_pending(row))
+    return 0
+
+
+def cmd_agenda_review(args: argparse.Namespace) -> int:
+    try:
+        rows = load_agenda_proposals(status="pending", limit=args.limit)
+    except ApprovalStoreError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    if args.json:
+        payload = {
+            "pending_count": len(rows),
+            "proposals": [agenda_proposal_row_to_dict(row) for row in rows],
+            "next": "ctos-ai agenda-confirm latest --yes" if rows else "no pending agenda proposal",
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    print("CTOS agenda review")
+    print("==================")
+    if not rows:
+        print("pending   0")
+        print("next      no pending agenda proposal")
+        return 0
+    print(f"pending   {len(rows)}")
+    print("latest")
+    print("------")
+    print(format_agenda_pending(rows[0]))
+    if len(rows) > 1:
+        print()
+        print("other pending")
+        print("-------------")
+        for row in rows[1:]:
+            print(f"#{row['id']:<3} P{row['priority']} {row['due_date'] or '-':<10} {row['title']}")
+    print()
+    print("confirm   ctos-ai agenda-confirm latest --yes")
+    print("reject    ctos-ai agenda-reject latest")
+    return 0
+
+
+def cmd_agenda_show(args: argparse.Namespace) -> int:
+    try:
+        row = resolve_agenda_proposal_ref(args.ref)
+    except ApprovalStoreError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    if row is None:
+        print(f"agenda proposal not found: {args.ref}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(agenda_proposal_row_to_dict(row), ensure_ascii=False, indent=2))
+    else:
+        print(format_agenda_pending(row))
+    return 0
+
+
+def cmd_agenda_confirm(args: argparse.Namespace) -> int:
+    try:
+        row = resolve_agenda_proposal_ref(args.ref)
+    except ApprovalStoreError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    if row is None:
+        print(f"agenda proposal not found: {args.ref}", file=sys.stderr)
+        return 1
+    data = agenda_proposal_row_to_dict(row)
+    if data.get("status") != "pending":
+        print(f"agenda proposal #{data.get('id')} is {data.get('status')}, not pending", file=sys.stderr)
+        return 2
+    command = data.get("command")
+    if not isinstance(command, list) or not command or str(command[0]) != str(AGENDA):
+        print(f"agenda proposal #{data.get('id')} has an invalid command payload", file=sys.stderr)
+        return 2
+    if not args.yes:
+        if args.json:
+            payload = dict(data)
+            payload["confirm_refused"] = "missing --yes"
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print(format_agenda_pending(row))
+            print()
+            print("refused: pass --yes after reviewing this proposal", file=sys.stderr)
+        return 2
+
+    result = run([str(item) for item in command], timeout=5)
+    output = result["stdout"] or result["stderr"] or f"rc={result['rc']}"
+    task_id = agenda_proposal_task_id(result["stdout"])
+    status = "committed" if result["rc"] == 0 else "failed"
+    try:
+        update_agenda_proposal(
+            int(data["id"]),
+            status=status,
+            rc=int(result["rc"]),
+            result=output,
+            committed_at=now_iso() if status == "committed" else None,
+            task_id=task_id,
+        )
+    except ApprovalStoreError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    if args.json:
+        payload = dict(data)
+        payload["commit"] = result
+        payload["status"] = status
+        payload["task_id"] = task_id
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        if result["stdout"]:
+            print(result["stdout"])
+        if result["stderr"]:
+            print(result["stderr"], file=sys.stderr)
+        print(f"agenda proposal #{data['id']} {status}")
+    return int(result["rc"])
+
+
+def cmd_agenda_reject(args: argparse.Namespace) -> int:
+    try:
+        row = resolve_agenda_proposal_ref(args.ref)
+    except ApprovalStoreError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    if row is None:
+        print(f"agenda proposal not found: {args.ref}", file=sys.stderr)
+        return 1
+    data = agenda_proposal_row_to_dict(row)
+    if data.get("status") != "pending":
+        message = f"agenda proposal #{data.get('id')} is {data.get('status')}, not pending"
+        if args.json:
+            payload = dict(data)
+            payload["reject_refused"] = message
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print(message, file=sys.stderr)
+        return 2
+    try:
+        update_agenda_proposal(int(data["id"]), status="rejected", result=args.reason or "rejected by operator")
+    except ApprovalStoreError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    if args.json:
+        payload = dict(data)
+        payload["status"] = "rejected"
+        payload["result"] = args.reason or "rejected by operator"
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(f"agenda proposal #{data['id']} rejected")
+    return 0
+
+
+def cmd_agenda(args: argparse.Namespace) -> int:
+    result = subprocess.run([str(AGENDA), *args.agenda_args], check=False)
+    return int(result.returncode)
+
+
+def cmd_plan_day(args: argparse.Namespace) -> int:
+    forwarded = ["plan-day"]
+    if args.date:
+        forwarded.extend(["--date", args.date])
+    if args.start:
+        forwarded.extend(["--start", args.start])
+    if args.end:
+        forwarded.extend(["--end", args.end])
+    if args.json:
+        forwarded.append("--json")
+    result = subprocess.run([str(AGENDA), *forwarded], check=False)
+    return int(result.returncode)
+
+
+def cmd_open_desk(args: argparse.Namespace) -> int:
+    env = os.environ.copy()
+    env.setdefault("CTOS_DESK_NONINTERACTIVE", "1")
+    env.setdefault("CTOS_CORE_WAIT_SECONDS", str(args.wait))
+    command = [str(SCRIPTS / "ctos-desk-remote"), "tiger"]
+    if args.print_only:
+        print(" ".join(command))
+        return 0
+    result = subprocess.run(command, check=False, env=env)
+    return int(result.returncode)
+
+
+def cmd_open_vms(args: argparse.Namespace) -> int:
+    panel = SCRIPTS / "ctos-vms-panel"
+    command = ["kitty", "--class", "CTOS_VMS", "--title", "CTOS_VMS", str(panel)]
+    command_text = shell_join(command)
+    if args.print_only:
+        print(command_text)
+        return 0
+    if shutil.which("hyprctl") is None:
+        print("hyprctl not found; run manually:", file=sys.stderr)
+        print(command_text)
+        return 127
+    if shutil.which("kitty") is None:
+        print("kitty not found; cannot open the VMS panel", file=sys.stderr)
+        return 127
+
+    launch = ["hyprctl", "dispatch", "exec", f"[workspace 4 silent] {command_text}"]
+    result = run(launch, timeout=5)
+    if result["rc"] != 0:
+        print("failed to open CTOS VMS panel", file=sys.stderr)
+        print(f"launch: {shell_join(launch)}", file=sys.stderr)
+        print(f"manual: {command_text}")
+        if result["stdout"]:
+            print(result["stdout"])
+        if result["stderr"]:
+            print(result["stderr"], file=sys.stderr)
+        return int(result["rc"])
+    print("CTOS VMS panel opening on workspace 4")
+    return 0
+
+
+def cmd_actions(args: argparse.Namespace) -> int:
+    specs = action_specs()
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    name: {
+                        "title": spec.title,
+                        "tier": spec.tier,
+                        "target": spec.target,
+                        "risk": spec.risk,
+                        "rollback": spec.rollback,
+                        "command": spec.command_help,
+                    }
+                    for name, spec in specs.items()
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+
+    print("CTOS AI approved action registry")
+    print("================================")
+    for name, spec in specs.items():
+        print(f"{name:<18} T{spec.tier}  {spec.title}")
+        print(f"  target:  {spec.target}")
+        print(f"  command: {spec.command_help}")
+    return 0
+
+
+def cmd_propose(args: argparse.Namespace) -> int:
+    specs = action_specs()
+    spec = specs.get(args.action)
+    if spec is None:
+        print(f"unknown action: {args.action}", file=sys.stderr)
+        print("run `ctos-ai actions` to see the allowlist", file=sys.stderr)
+        return 2
+    try:
+        params = approval_params(args.action, args)
+        command = spec.command(params)
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+
+    stamp = now_iso()
+    try:
+        with approval_connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO approvals (
+                    action, title, tier, target, params_json, command_json,
+                    risk, rollback, note, status, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                """,
+                (
+                    spec.name,
+                    spec.title,
+                    spec.tier,
+                    spec.target,
+                    json.dumps(params, sort_keys=True),
+                    json.dumps(command),
+                    spec.risk,
+                    spec.rollback,
+                    args.note or "",
+                    stamp,
+                    stamp,
+                ),
+            )
+            approval_id = cur.lastrowid
+            row = conn.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,)).fetchone()
+    except ApprovalStoreError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(approval_row_to_dict(row), ensure_ascii=False, indent=2))
+    else:
+        print("approval proposed")
+        print("=================")
+        print(format_approval(row))
+        print()
+        print(f"approve with: ctos-ai approve {approval_id}")
+    return 0
+
+
+def cmd_approvals(args: argparse.Namespace) -> int:
+    try:
+        rows = load_approvals(status=None if args.all else args.status, limit=args.limit)
+    except ApprovalStoreError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps([approval_row_to_dict(row) for row in rows], ensure_ascii=False, indent=2))
+        return 0
+
+    if not rows:
+        print("no approvals")
+        return 0
+    for row in rows:
+        print(f"#{row['id']:<3} {row['status']:<8} T{row['tier']} {row['action']:<18} {row['title']}")
+    return 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    try:
+        row = load_approval(args.id)
+    except ApprovalStoreError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    if row is None:
+        print(f"approval #{args.id} not found", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(approval_row_to_dict(row), ensure_ascii=False, indent=2))
+    else:
+        print(format_approval(row))
+    return 0
+
+
+def validate_stored_action(row: sqlite3.Row) -> tuple[ActionSpec, dict[str, Any], list[str]]:
+    specs = action_specs()
+    spec = specs.get(str(row["action"]))
+    if spec is None:
+        raise ValueError(f"approval action is no longer allowlisted: {row['action']}")
+    try:
+        params = json.loads(str(row["params_json"]))
+        stored_command = json.loads(str(row["command_json"]))
+    except json.JSONDecodeError as error:
+        raise ValueError(f"approval payload is corrupt: {error}") from error
+    if not isinstance(params, dict):
+        raise ValueError("approval params are corrupt")
+    if spec.name == "kali-checkpoint" and not valid_snapshot_label(str(params.get("label", ""))):
+        raise ValueError("stored checkpoint label is invalid")
+    command = spec.command(params)
+    if stored_command != command:
+        raise ValueError("stored command differs from the current allowlist command; reject and re-propose")
+    return spec, params, command
+
+
+def cmd_approve(args: argparse.Namespace) -> int:
+    try:
+        row = load_approval(args.id)
+    except ApprovalStoreError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    if row is None:
+        print(f"approval #{args.id} not found", file=sys.stderr)
+        return 1
+    if row["status"] != "pending":
+        print(f"approval #{args.id} is {row['status']}, not pending", file=sys.stderr)
+        return 1
+    try:
+        _, _, command = validate_stored_action(row)
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+
+    if args.dry_run:
+        print(format_approval(row))
+        print()
+        print(f"dry-run: would execute {shell_join(command)}")
+        return 0
+
+    result = run(command, timeout=args.timeout)
+    status = "executed" if result["rc"] == 0 else "failed"
+    summary = one_line(result["stderr"] or result["stdout"] or f"rc={result['rc']}")[:800]
+    stamp = now_iso()
+    try:
+        with approval_connect() as conn:
+            conn.execute(
+                """
+                UPDATE approvals
+                SET status = ?, updated_at = ?, executed_at = ?, rc = ?, result = ?
+                WHERE id = ?
+                """,
+                (status, stamp, stamp, int(result["rc"]), summary, args.id),
+            )
+    except ApprovalStoreError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    print(f"approval #{args.id} {status}: rc={result['rc']}")
+    if result["stdout"]:
+        print(result["stdout"])
+    if result["stderr"]:
+        print(result["stderr"], file=sys.stderr)
+    return int(result["rc"])
+
+
+def cmd_reject(args: argparse.Namespace) -> int:
+    try:
+        row = load_approval(args.id)
+    except ApprovalStoreError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    if row is None:
+        print(f"approval #{args.id} not found", file=sys.stderr)
+        return 1
+    if row["status"] != "pending":
+        print(f"approval #{args.id} is {row['status']}, not pending", file=sys.stderr)
+        return 1
+    note = args.reason or "rejected by operator"
+    stamp = now_iso()
+    try:
+        with approval_connect() as conn:
+            conn.execute(
+                """
+                UPDATE approvals
+                SET status = 'rejected', updated_at = ?, result = ?
+                WHERE id = ?
+                """,
+                (stamp, one_line(note)[:800], args.id),
+            )
+    except ApprovalStoreError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    print(f"approval #{args.id} rejected")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="CTOS AI V0 deterministic tool router")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    caps = sub.add_parser("capabilities", help="show the current CTOS AI permission contract")
+    caps.add_argument("--json", action="store_true")
+    caps.set_defaults(func=cmd_capabilities)
+
+    status = sub.add_parser("status", help="summarize CTOS control state")
+    status.add_argument("--json", action="store_true")
+    status.set_defaults(func=cmd_status)
+
+    runtimes = sub.add_parser("runtimes", help="list model provider/runtime profiles")
+    runtimes.add_argument("--json", action="store_true")
+    runtimes.set_defaults(func=cmd_runtimes)
+
+    runtime = sub.add_parser("runtime", help="show one model provider/runtime profile")
+    runtime.add_argument("id")
+    runtime.add_argument("--json", action="store_true")
+    runtime.set_defaults(func=cmd_runtime)
+
+    runtime_recommend = sub.add_parser("runtime-recommend", help="show the current model runtime recommendation")
+    runtime_recommend.add_argument("--json", action="store_true")
+    runtime_recommend.set_defaults(func=cmd_runtime_recommend)
+
+    runtime_check = sub.add_parser("runtime-check", help="dry-run one runtime profile without contacting the model")
+    runtime_check.add_argument("id")
+    runtime_check.add_argument("--target-probe", action="store_true", help="probe owned target node status when applicable")
+    runtime_check.add_argument("--json", action="store_true")
+    runtime_check.set_defaults(func=cmd_runtime_check)
+
+    ask_local = sub.add_parser("ask-local", help="ask the bounded local Ollama model on ctos-core")
+    ask_local.add_argument("prompt", nargs="+", help="prompt text, or '-' to read stdin")
+    ask_local.add_argument("--model", default="qwen2.5-coder:0.5b")
+    ask_local.add_argument("--system", default="", help="optional per-call instruction appended to the CTOS identity contract")
+    ask_local.add_argument("--raw-model", action="store_true", help="send no default CTOS identity contract; diagnostic use only")
+    ask_local.add_argument("--temperature", type=float, default=0.0)
+    ask_local.add_argument("--max-tokens", type=int, default=256)
+    ask_local.add_argument("--host", default=DEFAULT_CORE_HOST)
+    ask_local.add_argument("--user", default=DEFAULT_CORE_USER)
+    ask_local.add_argument("--timeout", default=os.environ.get("CTOS_CORE_TIMEOUT", "10"))
+    ask_local.add_argument("--remote-timeout", type=float, default=210.0)
+    ask_local.add_argument("--stats", action="store_true")
+    ask_local.add_argument("--json", action="store_true")
+    ask_local.set_defaults(func=cmd_ask_local)
+
+    cheap_lane = sub.add_parser("cheap-lane", help="show the local/free/cheap AI lane status")
+    cheap_lane.add_argument("--probe-local", action="store_true", help="also probe the localhost CTOS AI API")
+    cheap_lane.add_argument("--json", action="store_true")
+    cheap_lane.set_defaults(func=cmd_cheap_lane)
+
+    cheap_plan = sub.add_parser("cheap-plan", help="show the non-destructive cheap AI lane plan")
+    cheap_plan.add_argument("--tool", choices=["all", "aider", "9router", "agent-reach"], default="all")
+    cheap_plan.add_argument("--json", action="store_true")
+    cheap_plan.set_defaults(func=cmd_cheap_plan)
+
+    code_draft = sub.add_parser("code-draft", help="make a bounded cheap local draft without reading files")
+    code_draft.add_argument("prompt", nargs="+", help="draft request, or '-' to read stdin")
+    code_draft.add_argument("--kind", choices=["plan", "code", "research"], default="plan")
+    code_draft.add_argument("--model", default="qwen2.5-coder:1.5b")
+    code_draft.add_argument("--temperature", type=float, default=0.0)
+    code_draft.add_argument("--max-tokens", type=int, default=384)
+    code_draft.add_argument("--host", default=DEFAULT_CORE_HOST)
+    code_draft.add_argument("--user", default=DEFAULT_CORE_USER)
+    code_draft.add_argument("--timeout", default=os.environ.get("CTOS_CORE_TIMEOUT", "10"))
+    code_draft.add_argument("--remote-timeout", type=float, default=210.0)
+    code_draft.add_argument("--print-prompt", action="store_true", help="print the exact prompt without contacting the model")
+    code_draft.add_argument("--stats", action="store_true")
+    code_draft.add_argument("--json", action="store_true")
+    code_draft.set_defaults(func=cmd_code_draft)
+
+    brief = sub.add_parser("brief", help="operator brief: cockpit, agenda, and next suggested step")
+    brief.add_argument("--json", action="store_true")
+    brief.set_defaults(func=cmd_brief)
+
+    search = sub.add_parser("search-context", help="search CTOS context/docs")
+    search.add_argument("query", nargs="+")
+    search.set_defaults(func=cmd_search_context)
+
+    route = sub.add_parser("route-text", help="route typed or transcribed text through the CTOS action planner")
+    route.add_argument("text", nargs="+", help="text to route, or '-' to read stdin")
+    route.add_argument("--source", default="typed", choices=["typed", "voice", "stt", "assistant"])
+    route.add_argument("--threshold", type=float, default=0.72)
+    route.add_argument("--execute-safe", action="store_true", help="execute only Tier 0/1 ctos-ai commands")
+    route.add_argument("--json", action="store_true")
+    route.set_defaults(func=cmd_route_text)
+
+    agenda_propose = sub.add_parser("agenda-propose", help="parse a natural agenda request and optionally save or commit after explicit confirmation")
+    agenda_propose.add_argument("text", nargs="+", help="natural agenda request, or '-' to read stdin")
+    agenda_propose.add_argument("--title", help="override parsed title")
+    agenda_propose.add_argument("--due", help="override parsed due date, YYYY-MM-DD")
+    agenda_propose.add_argument("--priority", type=int, help="override priority from 1 to 5")
+    agenda_propose.add_argument("--estimate", type=int, help="override estimate in minutes")
+    agenda_propose.add_argument("--notes", default="")
+    agenda_propose.add_argument("--save", action="store_true", help="store a pending proposal without writing agenda state")
+    agenda_propose.add_argument("--source", default="typed", choices=["typed", "voice", "stt", "assistant"], help="origin label for saved proposals")
+    agenda_propose.add_argument("--commit", action="store_true", help="write the parsed task only with --yes")
+    agenda_propose.add_argument("--yes", action="store_true", help="confirm the proposed agenda write")
+    agenda_propose.add_argument("--json", action="store_true")
+    agenda_propose.set_defaults(func=cmd_agenda_propose)
+
+    agenda_proposals = sub.add_parser("agenda-proposals", help="list saved agenda proposals")
+    agenda_proposals.add_argument("--status", default="pending", choices=sorted(AGENDA_PROPOSAL_STATUSES))
+    agenda_proposals.add_argument("--all", action="store_true")
+    agenda_proposals.add_argument("--limit", type=int, default=20)
+    agenda_proposals.add_argument("--json", action="store_true")
+    agenda_proposals.set_defaults(func=cmd_agenda_proposals)
+
+    agenda_review = sub.add_parser("agenda-review", help="show pending agenda proposals with explicit next commands")
+    agenda_review.add_argument("--limit", type=int, default=5)
+    agenda_review.add_argument("--json", action="store_true")
+    agenda_review.set_defaults(func=cmd_agenda_review)
+
+    agenda_show = sub.add_parser("agenda-show", help="show one saved agenda proposal by id or latest")
+    agenda_show.add_argument("ref", help="proposal id or latest")
+    agenda_show.add_argument("--json", action="store_true")
+    agenda_show.set_defaults(func=cmd_agenda_show)
+
+    agenda_confirm = sub.add_parser("agenda-confirm", help="commit one pending agenda proposal by id or latest")
+    agenda_confirm.add_argument("ref", help="proposal id or latest")
+    agenda_confirm.add_argument("--yes", action="store_true", help="confirm the reviewed proposal")
+    agenda_confirm.add_argument("--json", action="store_true")
+    agenda_confirm.set_defaults(func=cmd_agenda_confirm)
+
+    agenda_reject = sub.add_parser("agenda-reject", help="reject one pending agenda proposal by id or latest")
+    agenda_reject.add_argument("ref", help="proposal id or latest")
+    agenda_reject.add_argument("--reason")
+    agenda_reject.add_argument("--json", action="store_true")
+    agenda_reject.set_defaults(func=cmd_agenda_reject)
+
+    agenda = sub.add_parser("agenda", help="pass through to ctos-agenda")
+    agenda.add_argument("agenda_args", nargs=argparse.REMAINDER)
+    agenda.set_defaults(func=cmd_agenda)
+
+    plan = sub.add_parser("plan-day", help="shortcut for ctos-agenda plan-day")
+    plan.add_argument("--date")
+    plan.add_argument("--start")
+    plan.add_argument("--end")
+    plan.add_argument("--json", action="store_true")
+    plan.set_defaults(func=cmd_plan_day)
+
+    desk = sub.add_parser("open-desk", help="open or repair the tower DESK stream")
+    desk.add_argument("--wait", type=int, default=30)
+    desk.add_argument("--print-only", action="store_true")
+    desk.set_defaults(func=cmd_open_desk)
+
+    vms = sub.add_parser("open-vms", help="open the VMS panel")
+    vms.add_argument("--print-only", action="store_true")
+    vms.set_defaults(func=cmd_open_vms)
+
+    actions = sub.add_parser("actions", help="list CTOS actions that can be proposed for approval")
+    actions.add_argument("--json", action="store_true")
+    actions.set_defaults(func=cmd_actions)
+
+    propose = sub.add_parser("propose", help="create a pending approval from the CTOS action allowlist")
+    propose.add_argument("action", help="allowlisted action name; run `ctos-ai actions`")
+    propose.add_argument("--label", help="checkpoint label for kali-checkpoint")
+    propose.add_argument("--note", help="operator note for the approval record")
+    propose.add_argument("--json", action="store_true")
+    propose.set_defaults(func=cmd_propose)
+
+    approvals = sub.add_parser("approvals", help="list pending approval records")
+    approvals.add_argument("--status", default="pending", choices=sorted(APPROVAL_STATUSES))
+    approvals.add_argument("--all", action="store_true")
+    approvals.add_argument("--limit", type=int, default=20)
+    approvals.add_argument("--json", action="store_true")
+    approvals.set_defaults(func=cmd_approvals)
+
+    show = sub.add_parser("show", help="show one approval record")
+    show.add_argument("id", type=int)
+    show.add_argument("--json", action="store_true")
+    show.set_defaults(func=cmd_show)
+
+    approve = sub.add_parser("approve", help="execute one pending approval")
+    approve.add_argument("id", type=int)
+    approve.add_argument("--dry-run", action="store_true")
+    approve.add_argument("--timeout", type=float, default=120.0)
+    approve.set_defaults(func=cmd_approve)
+
+    reject = sub.add_parser("reject", help="reject one pending approval")
+    reject.add_argument("id", type=int)
+    reject.add_argument("--reason")
+    reject.set_defaults(func=cmd_reject)
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args(sys.argv[1:] or ["brief"])
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+ROOT="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
+HOST="${CTOS_VOICE_CONSOLE_HOST:-127.0.0.1}"
+PORT="${CTOS_VOICE_CONSOLE_PORT:-8770}"
+PID_FILE="${CTOS_VOICE_CONSOLE_PID:-/tmp/ctos-voice-console.pid}"
+LOG_FILE="${CTOS_VOICE_CONSOLE_LOG:-/tmp/ctos-voice-console.log}"
+URL="http://${HOST}:${PORT}"
+
+select_tts_engine() {
+  if [[ -n "${CTOS_VOICE_ENGINE:-}" ]]; then
+    return 0
+  fi
+  if "$ROOT/scripts/ctos-voice" tts-probe --json 2>/dev/null | grep -q '"ready": true'; then
+    export CTOS_VOICE_ENGINE=piper
+  fi
+}
+
+usage() {
+  cat <<'USAGE'
+Usage: ctos-voice-console COMMAND
+
+Commands:
+  serve     Start the localhost voice console if needed
+  open      Start the console, then open it with xdg-open
+  status    Print service status and backend probe
+  stop      Stop the console process
+  restart   Stop, then start
+  url       Print the local URL
+USAGE
+}
+
+read_pid() {
+  [[ -f "$PID_FILE" ]] || return 1
+  local pid
+  pid="$(<"$PID_FILE")"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$pid"
+}
+
+discover_pid() {
+  pgrep -f "control/voice_console.py --host ${HOST} --port ${PORT}" 2>/dev/null | head -n 1
+}
+
+running_pid() {
+  local pid
+  pid="$(read_pid 2>/dev/null || true)"
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    printf '%s\n' "$pid"
+    return 0
+  fi
+  pid="$(discover_pid || true)"
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    printf '%s\n' "$pid"
+    return 0
+  fi
+  return 1
+}
+
+is_running() {
+  running_pid >/dev/null
+}
+
+serve() {
+  if is_running; then
+    echo "already running: $URL"
+    return 0
+  fi
+  mkdir -p "$(dirname "$PID_FILE")" "$(dirname "$LOG_FILE")"
+  select_tts_engine
+  if command -v setsid >/dev/null 2>&1; then
+    setsid python3 "$ROOT/control/voice_console.py" --host "$HOST" --port "$PORT" </dev/null >"$LOG_FILE" 2>&1 &
+  else
+    nohup python3 "$ROOT/control/voice_console.py" --host "$HOST" --port "$PORT" </dev/null >"$LOG_FILE" 2>&1 &
+  fi
+  echo "$!" >"$PID_FILE"
+  sleep 0.4
+  if ! is_running; then
+    echo "failed to start; log follows:" >&2
+    sed -n '1,120p' "$LOG_FILE" >&2 || true
+    return 1
+  fi
+  echo "started: $URL"
+}
+
+stop_console() {
+  local pid
+  pid="$(running_pid 2>/dev/null || true)"
+  if [[ -z "$pid" ]]; then
+    rm -f "$PID_FILE"
+    echo "not running"
+    return 0
+  fi
+  kill "$pid" 2>/dev/null || true
+  for _ in 1 2 3 4 5; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      rm -f "$PID_FILE"
+      echo "stopped"
+      return 0
+    fi
+    sleep 0.2
+  done
+  kill -9 "$pid" 2>/dev/null || true
+  rm -f "$PID_FILE"
+  echo "stopped"
+}
+
+status() {
+  if is_running; then
+    echo "running: $URL"
+  else
+    echo "stopped: $URL"
+    return 1
+  fi
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS "${URL}/api/voice/status" || true
+    echo
+  fi
+}
+
+command="${1:-}"
+case "$command" in
+  serve)
+    serve
+    ;;
+  open)
+    serve
+    xdg-open "$URL" >/dev/null 2>&1 &
+    ;;
+  status)
+    status
+    ;;
+  stop)
+    stop_console
+    ;;
+  restart)
+    stop_console
+    serve
+    ;;
+  url)
+    echo "$URL"
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  "")
+    usage
+    exit 2
+    ;;
+  *)
+    echo "unknown command: $command" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

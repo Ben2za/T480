@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+IMAGE="$ROOT/Assets/BackGround/4.webp"
+LOG="/tmp/ctos-wallpaper.log"
+
+if [ ! -f "$IMAGE" ]; then
+	printf 'missing wallpaper: %s\n' "$IMAGE" >&2
+	exit 1
+fi
+
+if ! command -v swaybg >/dev/null 2>&1; then
+	printf 'swaybg not found\n' >&2
+	exit 1
+fi
+
+pkill -x swaybg >/dev/null 2>&1 || true
+setsid -f swaybg -i "$IMAGE" -m fill >"$LOG" 2>&1
+printf 'wallpaper active: %s\n' "$IMAGE"

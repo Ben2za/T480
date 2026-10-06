@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+	cat >&2 <<'USAGE'
+usage:
+  sudo bootstrap/ctos-init-core-storage plan --device /dev/disk/by-id/...
+  sudo bootstrap/ctos-init-core-storage apply --device /dev/disk/by-id/... --yes-i-understand-this-wipes
+  sudo bootstrap/ctos-init-core-storage fix-perms
+
+Initializes the ctos-core secondary service disk as Btrfs mounted at /srv/ctos.
+This is destructive. It refuses mounted disks and the current root disk.
+USAGE
+}
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+	usage
+	exit 0
+fi
+
+action="${1:-}"
+shift || true
+
+device=""
+confirmed=0
+
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		--device)
+			device="${2:-}"
+			shift 2
+			;;
+		--yes-i-understand-this-wipes)
+			confirmed=1
+			shift
+			;;
+		-h|--help)
+			usage
+			exit 0
+			;;
+		*)
+			printf 'unknown option: %s\n' "$1" >&2
+			usage
+			exit 2
+			;;
+	esac
+done
+
+if [ "$action" != "plan" ] && [ "$action" != "apply" ] && [ "$action" != "fix-perms" ]; then
+	usage
+	exit 2
+fi
+
+if [ "$action" != "fix-perms" ] && [ "$device" = "" ]; then
+	printf '%s\n' '--device is required.' >&2
+	exit 2
+fi
+
+if [ "$action" != "fix-perms" ] && [ ! -b "$device" ]; then
+	printf 'not a block device: %s\n' "$device" >&2
+	exit 1
+fi
+
+if [ "$action" != "fix-perms" ]; then
+	dev="$(readlink -f "$device")"
+	root_source="$(findmnt -no SOURCE /)"
+	root_block="${root_source%%[*}"
+	root_pkname="$(lsblk -no PKNAME "$root_block" 2>/dev/null | head -n 1 || true)"
+	root_disk=""
+	if [ "$root_pkname" != "" ]; then
+		root_disk="/dev/$root_pkname"
+	fi
+
+	if [ "$root_disk" != "" ] && [ "$dev" = "$(readlink -f "$root_disk")" ]; then
+		printf 'refusing to operate on current root disk: %s\n' "$dev" >&2
+		exit 1
+	fi
+
+	if lsblk -nr -o MOUNTPOINT "$dev" | awk 'NF { found=1 } END { exit found ? 0 : 1 }'; then
+		printf 'refusing mounted disk or disk with mounted partitions: %s\n' "$dev" >&2
+		lsblk "$dev" >&2
+		exit 1
+	fi
+fi
+
+print_plan() {
+	cat <<EOF
+CTOS secondary disk initialization plan
+
+Target disk: $dev
+Mountpoint:  /srv/ctos
+Filesystem:  Btrfs
+Label:       CTOS_SRV
+Fstab opts:  noatime,compress=zstd:3
+
+This will wipe all partition/filesystem signatures on $dev and create one Btrfs partition.
+
+Current disk view:
+EOF
+	lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINTS "$dev"
+}
+
+apply_storage() {
+	if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+		printf 'apply must run as root; use sudo.\n' >&2
+		exit 1
+	fi
+	if [ "$confirmed" -ne 1 ]; then
+		printf 'missing --yes-i-understand-this-wipes.\n' >&2
+		exit 1
+	fi
+
+	print_plan
+	printf 'Type CTOS_SRV_WIPE to destroy and initialize %s: ' "$dev" >&2
+	read -r reply
+	if [ "$reply" != "CTOS_SRV_WIPE" ]; then
+		printf 'aborted.\n' >&2
+		exit 1
+	fi
+
+	wipefs -a "$dev"
+	sgdisk --zap-all "$dev"
+	sgdisk -n 1:0:0 -t 1:8300 -c 1:CTOS_SRV "$dev"
+	partprobe "$dev" || true
+	sleep 2
+
+	part="$(lsblk -nrpo NAME,TYPE "$dev" | awk '$2 == "part" { print $1; exit }')"
+	if [ "$part" = "" ] || [ ! -b "$part" ]; then
+		printf 'failed to discover new partition on %s\n' "$dev" >&2
+		exit 1
+	fi
+
+	mkfs.btrfs -f -L CTOS_SRV "$part"
+	uuid="$(blkid -s UUID -o value "$part")"
+
+	groupadd -f ctos
+	install -d -m 2775 -g ctos /srv/ctos
+
+	if ! grep -Eq '[[:space:]]/srv/ctos[[:space:]]' /etc/fstab; then
+		printf 'UUID=%s /srv/ctos btrfs noatime,compress=zstd:3 0 0\n' "$uuid" >>/etc/fstab
+	fi
+
+	mount /srv/ctos
+	chgrp ctos /srv/ctos
+	chmod 2775 /srv/ctos
+	install -d -m 2775 -g ctos /srv/ctos/cache /srv/ctos/models /srv/ctos/workers /srv/ctos/snapshots /srv/ctos/packages
+
+	cat <<EOF
+CTOS service disk initialized.
+
+Partition: $part
+UUID:      $uuid
+Mount:     /srv/ctos
+EOF
+}
+
+fix_perms() {
+	if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+		printf 'fix-perms must run as root; use sudo.\n' >&2
+		exit 1
+	fi
+
+	source="$(findmnt -no SOURCE /srv/ctos 2>/dev/null || true)"
+	fstype="$(findmnt -no FSTYPE /srv/ctos 2>/dev/null || true)"
+	if [ "$source" = "" ] || [ "$fstype" != "btrfs" ]; then
+		printf 'refusing: /srv/ctos is not a mounted Btrfs filesystem.\n' >&2
+		exit 1
+	fi
+
+	label="$(blkid -s LABEL -o value "$source" 2>/dev/null || true)"
+	if [ "$label" != "CTOS_SRV" ]; then
+		printf 'refusing: /srv/ctos source %s has label %s, expected CTOS_SRV.\n' "$source" "${label:-<none>}" >&2
+		exit 1
+	fi
+
+	groupadd -f ctos
+	chgrp ctos /srv/ctos
+	chmod 2775 /srv/ctos
+	install -d -m 2775 -g ctos /srv/ctos/cache /srv/ctos/models /srv/ctos/workers /srv/ctos/snapshots /srv/ctos/packages
+
+	cat <<EOF
+CTOS service disk permissions repaired.
+
+Source:     $source
+Mount:      /srv/ctos
+Label:      $label
+EOF
+}
+
+case "$action" in
+	plan)
+		print_plan
+		;;
+	apply)
+		apply_storage
+		;;
+	fix-perms)
+		fix_perms
+		;;
+esac

@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+case "${1:-}" in
+  ""|-h|--help)
+    CTOS_AI_SKIP_TUNNEL=1
+    ;;
+esac
+
+if [[ "${CTOS_AI_SKIP_TUNNEL:-0}" != "1" ]]; then
+  "$ROOT/scripts/ctos-ai-tunnel" ensure >/dev/null
+fi
+
+exec python3 "$ROOT/ai/local_api.py" "$@"

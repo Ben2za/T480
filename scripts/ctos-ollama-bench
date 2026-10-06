@@ -1,0 +1,546 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+PLAN_PATH = ROOT / "ai" / "benchmarks" / "ollama_core_local_v0.json"
+DEFAULT_HOST = "10.42.0.2"
+DEFAULT_USER = "ctos"
+DEFAULT_TIMEOUT = "10"
+API_BASE = "http://127.0.0.1:11434"
+
+
+REMOTE_PREFLIGHT = r'''
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+
+def run(args, timeout=2.0):
+    try:
+        proc = subprocess.run(args, capture_output=True, check=False, text=True, timeout=timeout)
+        return {"rc": proc.returncode, "stdout": proc.stdout.strip(), "stderr": proc.stderr.strip()}
+    except FileNotFoundError:
+        return {"rc": 127, "stdout": "", "stderr": f"{args[0]} not found"}
+    except subprocess.TimeoutExpired:
+        return {"rc": 124, "stdout": "", "stderr": "timeout"}
+
+
+def read(path, default=""):
+    try:
+        return Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return default
+
+
+def api_get(path):
+    url = "http://127.0.0.1:11434" + path
+    try:
+        with urllib.request.urlopen(url, timeout=2.0) as response:
+            body = response.read().decode("utf-8", errors="replace")
+        try:
+            return {"ok": True, "json": json.loads(body)}
+        except json.JSONDecodeError:
+            return {"ok": True, "text": body[:200]}
+    except (OSError, urllib.error.URLError) as error:
+        return {"ok": False, "error": str(error)}
+
+
+def dir_state(path):
+    p = Path(path)
+    return {
+        "path": path,
+        "exists": p.exists(),
+        "is_dir": p.is_dir(),
+        "writable": os.access(path, os.W_OK),
+    }
+
+
+mem = {}
+for line in read("/proc/meminfo").splitlines():
+    if ":" not in line:
+        continue
+    key, value = line.split(":", 1)
+    parts = value.strip().split()
+    if parts and parts[0].isdigit():
+        mem[key] = int(parts[0]) * 1024
+
+data = {
+    "hostname": read("/proc/sys/kernel/hostname", "unknown"),
+    "kernel": os.uname().release,
+    "memory": {
+        "total": mem.get("MemTotal", 0),
+        "available": mem.get("MemAvailable", 0),
+    },
+    "cpu": run(["lscpu"], timeout=2.0)["stdout"],
+    "gpu": run(["sh", "-lc", "lspci | grep -Ei 'vga|3d|display' || true"], timeout=2.0)["stdout"],
+    "ollama": {
+        "command": run(["sh", "-lc", "command -v ollama || true"], timeout=1.0)["stdout"],
+        "package": run(["pacman", "-Q", "ollama"], timeout=2.0),
+        "package_info": run(["pacman", "-Qi", "ollama"], timeout=2.0),
+        "service_active": run(["systemctl", "is-active", "ollama.service"], timeout=1.0),
+        "service_enabled": run(["systemctl", "is-enabled", "ollama.service"], timeout=1.0),
+        "service_cat": run(["systemctl", "cat", "ollama.service"], timeout=2.0),
+        "listeners": run(["sh", "-lc", "ss -lntp 2>/dev/null | grep ':11434' || true"], timeout=1.0)["stdout"],
+    },
+    "storage": {
+        "srv": run(["findmnt", "-no", "SOURCE,FSTYPE,OPTIONS", "/srv/ctos"], timeout=1.0),
+        "models_dir": dir_state("/srv/ctos/models/ollama"),
+        "models_du": run(["sh", "-lc", "du -sh /srv/ctos/models/ollama 2>/dev/null || true"], timeout=2.0)["stdout"],
+    },
+    "api": {
+        "version": api_get("/api/version"),
+        "tags": api_get("/api/tags"),
+        "ps": api_get("/api/ps"),
+    },
+    "sudo_password_required": run(["sudo", "-n", "true"], timeout=1.0)["rc"] != 0,
+}
+
+print(json.dumps(data, sort_keys=True))
+'''
+
+
+REMOTE_INSTALL_CONFIG = r'''
+from __future__ import annotations
+
+import grp
+import os
+import pwd
+from pathlib import Path
+
+models = Path("/srv/ctos/models/ollama")
+models.mkdir(parents=True, exist_ok=True)
+try:
+    user = pwd.getpwnam("ollama")
+    group = grp.getgrnam("ollama")
+    os.chown(models, user.pw_uid, group.gr_gid)
+except KeyError:
+    pass
+models.chmod(0o750)
+
+dropin = Path("/etc/systemd/system/ollama.service.d")
+dropin.mkdir(parents=True, exist_ok=True)
+conf = dropin / "ctos.conf"
+conf.write_text(
+    "[Service]\n"
+    "Environment=\"OLLAMA_HOST=127.0.0.1:11434\"\n"
+    "Environment=\"OLLAMA_MODELS=/srv/ctos/models/ollama\"\n",
+    encoding="utf-8",
+)
+conf.chmod(0o644)
+print(conf)
+'''
+
+
+REMOTE_BENCH = r'''
+from __future__ import annotations
+
+import argparse
+import json
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+
+def post_json(path, payload, timeout=180):
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        "http://127.0.0.1:11434" + path,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        text = response.read().decode("utf-8", errors="replace")
+    return json.loads(text)
+
+
+def tps(item):
+    eval_count = item.get("eval_count") or 0
+    eval_duration = item.get("eval_duration") or 0
+    if not eval_count or not eval_duration:
+        return 0.0
+    return round(eval_count / (eval_duration / 1_000_000_000), 2)
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--model", required=True)
+parser.add_argument("--plan-json", required=True)
+args = parser.parse_args()
+
+plan = json.loads(args.plan_json)
+results = []
+for prompt in plan.get("prompts", []):
+    started = time.time()
+    payload = {
+        "model": args.model,
+        "prompt": prompt["prompt"],
+        "stream": False,
+        "keep_alive": "2m",
+        "options": {
+            "temperature": 0,
+            "num_predict": int(prompt.get("max_tokens", 128)),
+        },
+    }
+    try:
+        response = post_json("/api/generate", payload)
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
+        results.append({
+            "id": prompt.get("id"),
+            "ok": False,
+            "error": str(error),
+        })
+        continue
+
+    finished = time.time()
+    results.append({
+        "id": prompt.get("id"),
+        "ok": True,
+        "elapsed_seconds": round(finished - started, 3),
+        "response_preview": " ".join(str(response.get("response", "")).split())[:240],
+        "total_duration": response.get("total_duration"),
+        "load_duration": response.get("load_duration"),
+        "prompt_eval_count": response.get("prompt_eval_count"),
+        "prompt_eval_duration": response.get("prompt_eval_duration"),
+        "eval_count": response.get("eval_count"),
+        "eval_duration": response.get("eval_duration"),
+        "tokens_per_second": tps(response),
+    })
+
+try:
+    post_json("/api/generate", {"model": args.model, "prompt": "", "stream": False, "keep_alive": 0}, timeout=30)
+except Exception:
+    pass
+
+stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+out_dir = Path("/srv/ctos/state/ai/benchmarks")
+out_dir.mkdir(parents=True, exist_ok=True)
+out_path = out_dir / f"ollama-{args.model.replace(':', '-')}-{stamp}.json"
+payload = {
+    "created_at": datetime.now().replace(microsecond=0).isoformat(),
+    "model": args.model,
+    "profile_id": plan.get("profile_id"),
+    "results": results,
+}
+out_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+print(json.dumps({"ok": all(item.get("ok") for item in results), "path": str(out_path), "results": results}, indent=2, sort_keys=True))
+'''
+
+
+def load_plan() -> dict[str, Any]:
+    return json.loads(PLAN_PATH.read_text(encoding="utf-8"))
+
+
+def ssh_base(args: argparse.Namespace) -> list[str]:
+    return [
+        "ssh",
+        "-F",
+        "/dev/null",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "PasswordAuthentication=no",
+        "-o",
+        "PreferredAuthentications=publickey",
+        "-o",
+        f"ConnectTimeout={args.timeout}",
+        "-o",
+        "LogLevel=ERROR",
+        f"{args.user}@{args.host}",
+    ]
+
+
+def ssh_interactive_base(args: argparse.Namespace) -> list[str]:
+    return [
+        "ssh",
+        "-tt",
+        "-F",
+        "/dev/null",
+        "-o",
+        f"ConnectTimeout={args.timeout}",
+        f"{args.user}@{args.host}",
+    ]
+
+
+def run_remote(args: argparse.Namespace, command: str, timeout_extra: float = 8.0) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [*ssh_base(args), command],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=float(args.timeout) + timeout_extra,
+    )
+
+
+def remote_python(script: str, *script_args: str) -> str:
+    command = "python3 -c " + shlex.quote(script)
+    if script_args:
+        command += " " + " ".join(shlex.quote(item) for item in script_args)
+    return command
+
+
+def print_json(data: dict[str, Any]) -> None:
+    print(json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False))
+
+
+def model_ids(plan: dict[str, Any]) -> list[str]:
+    return [str(item["id"]) for item in plan.get("models", []) if isinstance(item, dict) and item.get("id")]
+
+
+def choose_model(plan: dict[str, Any], requested: str | None) -> str:
+    models = model_ids(plan)
+    if requested:
+        if requested not in models:
+            raise SystemExit(f"unknown model for this plan: {requested}; available: {', '.join(models)}")
+        return requested
+    return models[0]
+
+
+def cmd_plan(args: argparse.Namespace) -> int:
+    plan = load_plan()
+    if args.json:
+        print_json(plan)
+        return 0
+
+    print("CTOS Ollama benchmark plan")
+    print("==========================")
+    print(f"path       {PLAN_PATH}")
+    print(f"profile    {plan.get('profile_id')}")
+    print(f"status     {plan.get('status')}")
+    service = plan.get("service_plan", {})
+    print(f"bind       {service.get('bind')}")
+    print(f"models dir {service.get('models_dir')}")
+    print(f"LAN        {'exposed' if service.get('lan_exposure') else 'not exposed'}")
+    print("packages:")
+    for item in plan.get("package_plan", {}).get("packages", []):
+        print(f"  - {item}")
+    print("models:")
+    for item in plan.get("models", []):
+        print(f"  - {item['id']} ({item['role']}, {item['download_size']})")
+    print("commands:")
+    print("  ctos-ollama-bench preflight")
+    print("  ctos-ollama-bench install-interactive --yes")
+    print("  ctos-ollama-bench pull --model qwen2.5-coder:0.5b --yes")
+    print("  ctos-ollama-bench bench --model qwen2.5-coder:0.5b --yes")
+    return 0
+
+
+def cmd_preflight(args: argparse.Namespace) -> int:
+    proc = run_remote(args, remote_python(REMOTE_PREFLIGHT), timeout_extra=8.0)
+    if proc.returncode != 0:
+        if proc.stdout:
+            print(proc.stdout.rstrip())
+        if proc.stderr:
+            print(proc.stderr.rstrip(), file=sys.stderr)
+        return proc.returncode
+    data = json.loads(proc.stdout or "{}")
+    if args.json:
+        print_json(data)
+        return 0
+
+    package = data.get("ollama", {}).get("package", {})
+    service_active = data.get("ollama", {}).get("service_active", {})
+    service_enabled = data.get("ollama", {}).get("service_enabled", {})
+    api_version = data.get("api", {}).get("version", {})
+    models_dir = data.get("storage", {}).get("models_dir", {})
+    print("CTOS Ollama preflight")
+    print("=====================")
+    print(f"target        {args.user}@{args.host}")
+    print(f"host          {data.get('hostname')} kernel {data.get('kernel')}")
+    print(f"memory        {round((data.get('memory', {}).get('available', 0) or 0) / 1024 / 1024 / 1024, 2)} GiB available")
+    print(f"gpu           {data.get('gpu') or 'none detected by lspci'}")
+    print(f"package       {package.get('stdout') or 'not installed'}")
+    print(f"service       active={service_active.get('stdout') or service_active.get('stderr') or 'unknown'} enabled={service_enabled.get('stdout') or service_enabled.get('stderr') or 'unknown'}")
+    print(f"listener      {data.get('ollama', {}).get('listeners') or 'none'}")
+    print(f"api           {'ok' if api_version.get('ok') else 'offline'} {api_version.get('json') or api_version.get('error') or ''}")
+    print(f"models dir    exists={models_dir.get('exists')} writable={models_dir.get('writable')} {data.get('storage', {}).get('models_du') or ''}")
+    print(f"sudo          {'password required' if data.get('sudo_password_required') else 'passwordless available'}")
+    return 0
+
+
+def cmd_install_commands(args: argparse.Namespace) -> int:
+    print("From T480, when you want one interactive sudo prompt on ctos-core:")
+    print()
+    print("ctos-ollama-bench install-interactive --yes")
+    print()
+    print("Run on ctos-core when ready:")
+    print()
+    print("sudo pacman -S --needed ollama")
+    print("sudo python3 - <<'PY'")
+    print(REMOTE_INSTALL_CONFIG.rstrip())
+    print("PY")
+    print("sudo systemctl daemon-reload")
+    print("sudo systemctl enable --now ollama.service")
+    print("systemctl status ollama.service --no-pager")
+    return 0
+
+
+def install_shell_script() -> str:
+    return "\n".join(
+        [
+            "set -euo pipefail",
+            'echo "CTOS Ollama install on $(hostname)"',
+            "sudo pacman -S --needed ollama",
+            "sudo python3 - <<'PY'",
+            REMOTE_INSTALL_CONFIG.rstrip(),
+            "PY",
+            "sudo systemctl daemon-reload",
+            "sudo systemctl enable --now ollama.service",
+            "systemctl is-active ollama.service",
+            "ss -lntp 2>/dev/null | grep ':11434' || true",
+            "python3 - <<'PY'",
+            "import urllib.request",
+            "with urllib.request.urlopen('http://127.0.0.1:11434/api/version', timeout=5) as response:",
+            "    print(response.read().decode('utf-8', errors='replace'))",
+            "PY",
+        ]
+    )
+
+
+def cmd_install_interactive(args: argparse.Namespace) -> int:
+    if not args.yes:
+        print("refusing interactive install without --yes; this mutates ctos-core", file=sys.stderr)
+        return 2
+    command = "bash -lc " + shlex.quote(install_shell_script())
+    return subprocess.run([*ssh_interactive_base(args), command], check=False).returncode
+
+
+def cmd_install(args: argparse.Namespace) -> int:
+    if not args.yes:
+        print("refusing install without --yes; run `ctos-ollama-bench install-commands` first", file=sys.stderr)
+        return 2
+    commands = [
+        "sudo -n pacman -S --needed --noconfirm ollama",
+        "sudo -n " + remote_python(REMOTE_INSTALL_CONFIG),
+        "sudo -n systemctl daemon-reload",
+        "sudo -n systemctl enable --now ollama.service",
+        "systemctl is-active ollama.service",
+    ]
+    for command in commands:
+        proc = run_remote(args, command, timeout_extra=120.0)
+        if proc.stdout:
+            print(proc.stdout.rstrip())
+        if proc.stderr:
+            print(proc.stderr.rstrip(), file=sys.stderr)
+        if proc.returncode != 0:
+            print(f"failed: {command}", file=sys.stderr)
+            return proc.returncode
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    proc = run_remote(args, "python3 - <<'PY'\nimport json, urllib.request, urllib.error\nbase='http://127.0.0.1:11434'\nfor path in ('/api/version','/api/tags','/api/ps'):\n    try:\n        with urllib.request.urlopen(base+path, timeout=3) as r:\n            print(path, r.read().decode('utf-8', errors='replace'))\n    except Exception as e:\n        print(path, 'ERROR', e)\nPY", timeout_extra=8.0)
+    if proc.stdout:
+        print(proc.stdout.rstrip())
+    if proc.stderr:
+        print(proc.stderr.rstrip(), file=sys.stderr)
+    return proc.returncode
+
+
+def cmd_pull(args: argparse.Namespace) -> int:
+    if not args.yes:
+        print("refusing model download without --yes", file=sys.stderr)
+        return 2
+    plan = load_plan()
+    model = choose_model(plan, args.model)
+    payload = json.dumps({"model": model, "stream": False})
+    command = (
+        "python3 - <<'PY'\n"
+        "import json, urllib.request\n"
+        f"payload={payload!r}.encode('utf-8')\n"
+        "req=urllib.request.Request('http://127.0.0.1:11434/api/pull', data=payload, headers={'Content-Type':'application/json'}, method='POST')\n"
+        "with urllib.request.urlopen(req, timeout=1800) as r:\n"
+        "    print(r.read().decode('utf-8', errors='replace'))\n"
+        "PY"
+    )
+    proc = run_remote(args, command, timeout_extra=1800.0)
+    if proc.stdout:
+        print(proc.stdout.rstrip())
+    if proc.stderr:
+        print(proc.stderr.rstrip(), file=sys.stderr)
+    return proc.returncode
+
+
+def cmd_bench(args: argparse.Namespace) -> int:
+    if not args.yes:
+        print("refusing model benchmark without --yes", file=sys.stderr)
+        return 2
+    plan = load_plan()
+    model = choose_model(plan, args.model)
+    plan_json = json.dumps(plan, separators=(",", ":"))
+    proc = run_remote(args, remote_python(REMOTE_BENCH, "--model", model, "--plan-json", plan_json), timeout_extra=420.0)
+    if proc.stdout:
+        print(proc.stdout.rstrip())
+    if proc.stderr:
+        print(proc.stderr.rstrip(), file=sys.stderr)
+    return proc.returncode
+
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Prepare and run the CTOS Ollama local-runtime benchmark on ctos-core.")
+    p.add_argument("--host", default=os.environ.get("CTOS_CORE_HOST", DEFAULT_HOST))
+    p.add_argument("--user", default=os.environ.get("CTOS_CORE_USER", DEFAULT_USER))
+    p.add_argument("--timeout", default=os.environ.get("CTOS_CORE_TIMEOUT", DEFAULT_TIMEOUT))
+
+    sub = p.add_subparsers(dest="command", required=True)
+
+    plan = sub.add_parser("plan", help="show the benchmark plan")
+    plan.add_argument("--json", action="store_true")
+    plan.set_defaults(func=cmd_plan)
+
+    preflight = sub.add_parser("preflight", help="read-only ctos-core Ollama readiness check")
+    preflight.add_argument("--json", action="store_true")
+    preflight.set_defaults(func=cmd_preflight)
+
+    install_commands = sub.add_parser("install-commands", help="print manual tower install commands")
+    install_commands.set_defaults(func=cmd_install_commands)
+
+    install = sub.add_parser("install", help="install/configure Ollama on ctos-core; requires passwordless sudo")
+    install.add_argument("--yes", action="store_true")
+    install.set_defaults(func=cmd_install)
+
+    install_interactive = sub.add_parser("install-interactive", help="install/configure Ollama on ctos-core with an interactive sudo prompt")
+    install_interactive.add_argument("--yes", action="store_true")
+    install_interactive.set_defaults(func=cmd_install_interactive)
+
+    status = sub.add_parser("status", help="query the localhost Ollama API on ctos-core")
+    status.set_defaults(func=cmd_status)
+
+    pull = sub.add_parser("pull", help="download a benchmark model through ctos-core's Ollama API")
+    pull.add_argument("--model")
+    pull.add_argument("--yes", action="store_true")
+    pull.set_defaults(func=cmd_pull)
+
+    bench = sub.add_parser("bench", help="run synthetic benchmark prompts against a local model")
+    bench.add_argument("--model")
+    bench.add_argument("--yes", action="store_true")
+    bench.set_defaults(func=cmd_bench)
+
+    return p
+
+
+def main() -> int:
+    args = parser().parse_args()
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

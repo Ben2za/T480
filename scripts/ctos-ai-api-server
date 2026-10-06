@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+HOST="${CTOS_AI_API_HOST:-127.0.0.1}"
+PORT="${CTOS_AI_API_PORT:-8767}"
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+if [[ ! -d "$RUNTIME_DIR" || ! -w "$RUNTIME_DIR" ]]; then
+  RUNTIME_DIR="/tmp"
+fi
+PIDFILE="${CTOS_AI_API_PIDFILE:-${RUNTIME_DIR}/ctos-ai-api.pid}"
+LOGFILE="${CTOS_AI_API_LOG:-/tmp/ctos-ai-api.log}"
+
+usage() {
+  cat <<'USAGE'
+Usage: ctos-ai-api-server {start|stop|restart|status}
+
+Manages the local CTOS AI HTTP API:
+  http://127.0.0.1:8767/health
+  http://127.0.0.1:8767/ask
+  http://127.0.0.1:8767/chat
+USAGE
+}
+
+pid_alive() {
+  [[ -f "$PIDFILE" ]] || return 1
+  local pid
+  pid="$(cat "$PIDFILE" 2>/dev/null || true)"
+  [[ -n "$pid" ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+api_alive() {
+  curl -fsS "http://${HOST}:${PORT}/health" >/dev/null 2>&1
+}
+
+status() {
+  if api_alive; then
+    printf 'ready http://%s:%s\n' "$HOST" "$PORT"
+    return 0
+  fi
+  if pid_alive; then
+    echo "pid running but API not reachable; see $LOGFILE"
+    return 1
+  fi
+  echo "stopped"
+  return 1
+}
+
+start() {
+  if api_alive; then
+    status
+    return 0
+  fi
+  if pid_alive; then
+    kill "$(cat "$PIDFILE")" 2>/dev/null || true
+    rm -f "$PIDFILE"
+  fi
+  "$ROOT/scripts/ctos-ai-tunnel" ensure >/dev/null
+  : >"$LOGFILE"
+  local cmd=(env CTOS_AI_SKIP_TUNNEL=1 "$ROOT/scripts/ctos-ai-api" serve --host "$HOST" --port "$PORT")
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "${cmd[@]}" >>"$LOGFILE" 2>&1 &
+  else
+    nohup "${cmd[@]}" >>"$LOGFILE" 2>&1 &
+  fi
+  echo "$!" >"$PIDFILE"
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if api_alive; then
+      status
+      return 0
+    fi
+    sleep 0.3
+  done
+  echo "failed to start CTOS AI API; see $LOGFILE" >&2
+  return 1
+}
+
+stop() {
+  if pid_alive; then
+    kill "$(cat "$PIDFILE")" 2>/dev/null || true
+  fi
+  rm -f "$PIDFILE"
+  echo "stopped"
+}
+
+case "${1:-}" in
+  start|ensure) start ;;
+  stop) stop ;;
+  restart) stop >/dev/null; start ;;
+  status) status ;;
+  -h|--help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac

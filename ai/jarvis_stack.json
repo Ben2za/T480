@@ -1,0 +1,180 @@
+{
+  "schema": 1,
+  "updated": "2026-07-18",
+  "decision": "hybrid_mature_local_voice_stack_behind_ctos",
+  "summary": "Use mature local/open-source voice infrastructure for speech I/O while CTOS remains the only action and approval boundary.",
+  "current_poc": {
+    "name": "open_stt_to_ctos_agenda_proposal",
+    "operator_command": "ctos-jarvis calibrate --save-agenda",
+    "status": "blocked_on_real_operator_voice_corpus",
+    "success_condition": "A human push-to-talk French agenda request is measured, transcribed, guarded, routed, staged as a pending CTOS agenda proposal, and confirmed later with typed approval."
+  },
+  "selected_layers": [
+    {
+      "layer": "operator_facade",
+      "choice": "ctos-jarvis",
+      "status": "active",
+      "why": "One operator entrypoint for status, voice tests, corpus capture, agenda review, and safe CTOS actions."
+    },
+    {
+      "layer": "voice_bus",
+      "choice": "Home Assistant Assist plus Wyoming",
+      "status": "primary_ecosystem_target",
+      "why": "Mature local voice bus with reusable Wyoming speech services and a clean path to future satellites."
+    },
+    {
+      "layer": "fixed_commands",
+      "choice": "Speech-to-Phrase through Wyoming",
+      "status": "token_gated_test_context",
+      "why": "Deterministic command rail for known CTOS intents without granting direct system authority."
+    },
+    {
+      "layer": "open_ended_stt",
+      "choice": "Wyoming Whisper / faster-whisper",
+      "status": "smoke_candidate_selected",
+      "why": "Better fit for natural French requests than phrase-by-phrase Vosk tuning."
+    },
+    {
+      "layer": "tts",
+      "choice": "Piper / Wyoming Piper",
+      "status": "installed_ready",
+      "why": "Piper 1.4.2 with the local French fr_FR-siwis-medium model is ready on the T480; upstream 1.5.0 needs review before any upgrade."
+    },
+    {
+      "layer": "model_runtime",
+      "choice": "Ollama on ctos-core first",
+      "status": "installed_smoke_runtime",
+      "why": "Simple local model host before larger RAM/GPU upgrades."
+    },
+    {
+      "layer": "computer_control",
+      "choice": "CTOS proposals and approvals",
+      "status": "mandatory",
+      "why": "No voice stack or model output executes shell, VM, package, firewall, or agenda writes directly."
+    }
+  ],
+  "research_candidates": [
+    {
+      "id": "home_assistant_assist_wyoming",
+      "ctos_position": "adopt_now",
+      "notes": "Voice bus and service protocol target."
+    },
+    {
+      "id": "speech_to_phrase",
+      "ctos_position": "adopt_now_fixed_commands",
+      "notes": "Deterministic known-command recognizer behind CTOS action routing."
+    },
+    {
+      "id": "wyoming_whisper_faster_whisper",
+      "ctos_position": "adopt_now_open_stt",
+      "notes": "Natural French transcript rail for agenda and conversation-shaped requests."
+    },
+    {
+      "id": "piper_wyoming_piper",
+      "ctos_position": "active_local_tts",
+      "notes": "Current local French TTS default; keep Kokoro as a measured quality challenger only."
+    },
+    {
+      "id": "ollama_core_local",
+      "ctos_position": "current_model_probe",
+      "notes": "Small local model runtime on ctos-core."
+    },
+    {
+      "id": "openvoiceos",
+      "ctos_position": "reference_only",
+      "notes": "Useful full-assistant reference, too broad for current CTOS runtime."
+    },
+    {
+      "id": "open_interpreter_01",
+      "ctos_position": "sandbox_only",
+      "notes": "Useful computer-control UX reference, too powerful for unattended CTOS authority."
+    },
+    {
+      "id": "glm_family",
+      "ctos_position": "future_model_research",
+      "notes": "No GLM 5.x runtime selected for this hardware pass."
+    },
+    {
+      "id": "airllm_style_offload",
+      "ctos_position": "future_constrained_inference_research",
+      "notes": "Interesting offload experiment, not the first Jarvis runtime."
+    }
+  ],
+  "mature_adoption": {
+    "thesis": "Adopt mature local voice infrastructure behind CTOS instead of tuning isolated missed words one by one.",
+    "adopt_now": [
+      {
+        "component": "Home Assistant Assist / Wyoming",
+        "role": "Local voice bus and service ecosystem target.",
+        "ctos_boundary": "Voice I/O only; CTOS still owns intent routing and action approvals."
+      },
+      {
+        "component": "Speech-to-Phrase",
+        "role": "Deterministic fixed-command rail for known CTOS phrases.",
+        "ctos_boundary": "May produce an intent transcript; may not execute system mutations directly."
+      },
+      {
+        "component": "Wyoming Whisper / faster-whisper",
+        "role": "Open-ended local STT rail for natural French requests.",
+        "ctos_boundary": "Returns text only; CTOS parses proposals and safe actions."
+      },
+      {
+        "component": "Piper",
+        "role": "Current local French TTS output.",
+        "ctos_boundary": "Speaks reviewed/compact output only and receives no action authority."
+      },
+      {
+        "component": "Ollama on ctos-core",
+        "role": "First local model runtime for bounded assistant answers and later routing support.",
+        "ctos_boundary": "Model output can advise or propose; typed approval remains required for mutation."
+      }
+    ],
+    "sandbox_or_reference": [
+      {
+        "component": "OpenVoiceOS",
+        "reason": "Good assistant reference, too broad as the immediate CTOS runtime."
+      },
+      {
+        "component": "Open Interpreter / 01-style agents",
+        "reason": "Useful UX reference, but direct computer control needs stronger CTOS schemas first."
+      },
+      {
+        "component": "GLM-family models",
+        "reason": "Future model research after speech/action boundaries and hardware headroom improve."
+      },
+      {
+        "component": "AirLLM-style offload",
+        "reason": "Future constrained-inference experiment, not the first practical Jarvis path."
+      }
+    ],
+    "operator_path": [
+      "ctos-jarvis status",
+      "ctos-jarvis bootstrap",
+      "ctos-jarvis collect-next",
+      "ctos-jarvis collect-next --run",
+      "ctos-jarvis corpus",
+      "ctos-jarvis evaluate --backend both",
+      "ctos-jarvis run"
+    ]
+  },
+  "next_steps": [
+    "Define and validate a transcript-free voice task specification before adding any direct Codex execution.",
+    "Capture the missing core voice samples with `ctos-jarvis collect-next --run` from the live desktop session.",
+    "Run `ctos-jarvis corpus` until the core preset is ready.",
+    "Run `ctos-jarvis evaluate --backend both` once the corpus exists.",
+    "Use `ctos-jarvis run` only after transcripts are readable enough to stage proposals."
+  ],
+  "authority_boundary": {
+    "voice_and_models": "may transcribe, speak, summarize, and propose",
+    "codex_input": "must be an operator-reviewable validated task spec; never a raw voice transcript",
+    "ctos": "owns intent classification, agenda proposal storage, action allowlists, typed confirmations, and system mutation boundaries",
+    "forbidden_directly_from_voice_or_model": [
+      "shell execution",
+      "package installation",
+      "firewall changes",
+      "VM lifecycle mutation",
+      "agenda writes",
+      "persistent service installation"
+    ]
+  }
+}

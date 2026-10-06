@@ -1,0 +1,441 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SINK="${CTOS_AUDIO_SINK:-@DEFAULT_AUDIO_SINK@}"
+SOURCE="${CTOS_AUDIO_SOURCE:-@DEFAULT_AUDIO_SOURCE@}"
+STEP="${CTOS_AUDIO_STEP:-5}"
+MAX_VOLUME="${CTOS_AUDIO_MAX:-1.50}"
+MAX_SOURCE_VOLUME="${CTOS_AUDIO_SOURCE_MAX:-1.00}"
+
+usage() {
+	cat <<'USAGE'
+usage: ctos-audio <status|waybar|doctor|report|panel|up|down|mute|set|mic-status|mic-up|mic-down|mic-mute|mic-set|mixer|test-voice>
+
+Commands:
+  status              print current default sink volume
+  waybar              print Waybar JSON for the volume module
+  doctor [--json]     inspect output/input readability without changing audio
+  report              print output/input status plus permanent controls
+  panel               open a small live audio control panel
+  up [step]           increase volume by step percent, default 5
+  down [step]         decrease volume by step percent, default 5
+  mute                toggle default sink mute
+  set <percent>       set default sink volume, for example 70
+  mic-status          print current default source volume
+  mic-up [step]       increase microphone volume by step percent, default 5
+  mic-down [step]     decrease microphone volume by step percent, default 5
+  mic-mute            toggle default source mute
+  mic-set <percent>   set microphone volume, capped at 100 to avoid clipping
+  mixer               open pavucontrol, or alsamixer fallback
+  test-voice [percent] speak a short CTOS voice test, optionally after setting volume
+USAGE
+}
+
+need_wpctl() {
+	if ! command -v wpctl >/dev/null 2>&1; then
+		printf 'wpctl not found; PipeWire/WirePlumber volume control unavailable\n' >&2
+		return 127
+	fi
+}
+
+raw_volume() {
+	need_wpctl
+	wpctl get-volume "${1:-$SINK}"
+}
+
+volume_fields() {
+	local node="${1:-$SINK}" raw
+	raw="$(raw_volume "$node" 2>/dev/null || true)"
+	if [ -z "$raw" ]; then
+		return 1
+	fi
+	python3 - "$raw" <<'PY'
+import re
+import sys
+
+line = sys.argv[1]
+match = re.search(r"Volume:\s+([0-9.]+)", line)
+if not match:
+    raise SystemExit(1)
+percent = int(round(float(match.group(1)) * 100))
+state = "muted" if "MUTED" in line.upper() else "active"
+print(percent, state)
+PY
+}
+
+audio_node_json() {
+	local name="$1" node="$2" raw rc
+	if ! command -v wpctl >/dev/null 2>&1; then
+		raw="wpctl not found"
+		rc=127
+	else
+		raw="$(wpctl get-volume "$node" 2>&1)"
+		rc=$?
+	fi
+	python3 - "$name" "$node" "$rc" "$raw" <<'PY'
+import json
+import re
+import sys
+
+name, node, rc_text, raw = sys.argv[1:5]
+rc = int(rc_text)
+match = re.search(r"Volume:\s+([0-9.]+)", raw)
+percent = int(round(float(match.group(1)) * 100)) if match else None
+state = "muted" if "MUTED" in raw.upper() else ("active" if rc == 0 else "unknown")
+lower = raw.lower()
+
+if rc == 0 and percent is not None:
+    reason = "ok"
+elif "wpctl not found" in lower:
+    reason = "missing_wpctl"
+elif "operation not permitted" in lower:
+    reason = "pipewire_context_denied"
+elif "could not connect to pipewire" in lower or "connection refused" in lower:
+    reason = "pipewire_unreachable"
+elif not raw.strip():
+    reason = "empty_wpctl_output"
+else:
+    reason = "unparsed_wpctl_output"
+
+print(json.dumps({
+    "name": name,
+    "node": node,
+    "ok": rc == 0 and percent is not None,
+    "rc": rc,
+    "reason": reason,
+    "percent": percent,
+    "state": state,
+    "raw": raw.strip()[-500:],
+}, ensure_ascii=True))
+PY
+}
+
+cmd_doctor() {
+	local format="${1:-}" sink_json source_json
+	sink_json="$(audio_node_json output "$SINK")"
+	source_json="$(audio_node_json microphone "$SOURCE")"
+	python3 - "$format" "$sink_json" "$source_json" <<'PY'
+import json
+import sys
+
+fmt, sink_raw, source_raw = sys.argv[1:4]
+sink = json.loads(sink_raw)
+source = json.loads(source_raw)
+ok = bool(sink.get("ok")) and bool(source.get("ok"))
+payload = {
+    "schema": 1,
+    "mode": "ctos-audio-doctor",
+    "ok": ok,
+    "output": sink,
+    "microphone": source,
+}
+
+if fmt == "--json":
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+else:
+    print("CTOS AUDIO doctor")
+    print("=================")
+    for item in (sink, source):
+        mark = "OK" if item.get("ok") else "WARN"
+        pct = item.get("percent")
+        pct_text = f"{pct}%" if pct is not None else "?"
+        print(f"{mark:4} {item.get('name'):<10} {pct_text:<5} {item.get('state')} {item.get('reason')}")
+    if not ok:
+        print()
+        print("next")
+        print("  ctos-audio panel")
+        print("  ctos-audio mixer")
+        print("  run from live desktop session if current context denies PipeWire/DBus")
+raise SystemExit(0 if ok else 1)
+PY
+}
+
+cmd_status() {
+	local percent state suffix
+	if ! read -r percent state < <(volume_fields "$SINK"); then
+		printf 'VOL unavailable\n'
+		return 1
+	fi
+	suffix=""
+	if [ "$state" = "muted" ]; then
+		suffix=" muted"
+	fi
+	printf 'VOL %s%%%s\n' "$percent" "$suffix"
+}
+
+cmd_waybar() {
+	local percent state text tooltip klass
+	if ! read -r percent state < <(volume_fields "$SINK"); then
+		python3 - <<'PY'
+import json
+print(json.dumps({"text": "VOL ?", "class": "offline", "tooltip": "PipeWire volume unavailable"}))
+PY
+		return 0
+	fi
+	text="VOL ${percent}%"
+	tooltip="Scroll: volume | Left click: audio panel | Middle click: mixer | Right click: mute | Super+PageUp/PageDown"
+	klass="active"
+	if [ "$state" = "muted" ]; then
+		text="MUTE"
+		tooltip="Muted | Scroll: volume | Left click: audio panel | Middle click: mixer | Right click: unmute | Super+BackSpace"
+		klass="muted"
+	fi
+	python3 - "$text" "$klass" "$tooltip" <<'PY'
+import json
+import sys
+
+print(json.dumps({"text": sys.argv[1], "class": sys.argv[2], "tooltip": sys.argv[3]}))
+PY
+}
+
+valid_percent() {
+	case "$1" in
+		''|*[!0-9]*)
+			return 1
+			;;
+	esac
+	[ "$1" -le 150 ]
+}
+
+valid_source_percent() {
+	case "$1" in
+		''|*[!0-9]*)
+			return 1
+			;;
+	esac
+	[ "$1" -le 100 ]
+}
+
+cmd_up() {
+	local step="${1:-$STEP}"
+	need_wpctl
+	valid_percent "$step" || {
+		printf 'invalid volume step: %s\n' "$step" >&2
+		return 2
+	}
+	wpctl set-mute "$SINK" 0
+	wpctl set-volume -l "$MAX_VOLUME" "$SINK" "${step}%+"
+}
+
+cmd_down() {
+	local step="${1:-$STEP}"
+	need_wpctl
+	valid_percent "$step" || {
+		printf 'invalid volume step: %s\n' "$step" >&2
+		return 2
+	}
+	wpctl set-volume -l "$MAX_VOLUME" "$SINK" "${step}%-"
+}
+
+cmd_mute() {
+	need_wpctl
+	wpctl set-mute "$SINK" toggle
+}
+
+cmd_set() {
+	local percent="${1:-}"
+	need_wpctl
+	valid_percent "$percent" || {
+		printf 'usage: ctos-audio set <0-150>\n' >&2
+		return 2
+	}
+	wpctl set-mute "$SINK" 0
+	wpctl set-volume -l "$MAX_VOLUME" "$SINK" "${percent}%"
+}
+
+cmd_mic_status() {
+	local percent state suffix
+	if ! read -r percent state < <(volume_fields "$SOURCE"); then
+		printf 'MIC unavailable\n'
+		return 1
+	fi
+	suffix=""
+	if [ "$state" = "muted" ]; then
+		suffix=" muted"
+	fi
+	printf 'MIC %s%%%s\n' "$percent" "$suffix"
+}
+
+cmd_mic_up() {
+	local step="${1:-$STEP}"
+	need_wpctl
+	valid_percent "$step" || {
+		printf 'invalid microphone step: %s\n' "$step" >&2
+		return 2
+	}
+	wpctl set-mute "$SOURCE" 0
+	wpctl set-volume -l "$MAX_SOURCE_VOLUME" "$SOURCE" "${step}%+"
+}
+
+cmd_mic_down() {
+	local step="${1:-$STEP}"
+	need_wpctl
+	valid_percent "$step" || {
+		printf 'invalid microphone step: %s\n' "$step" >&2
+		return 2
+	}
+	wpctl set-volume -l "$MAX_SOURCE_VOLUME" "$SOURCE" "${step}%-"
+}
+
+cmd_mic_mute() {
+	need_wpctl
+	wpctl set-mute "$SOURCE" toggle
+}
+
+cmd_mic_set() {
+	local percent="${1:-}"
+	need_wpctl
+	valid_source_percent "$percent" || {
+		printf 'usage: ctos-audio mic-set <0-100>\n' >&2
+		return 2
+	}
+	wpctl set-mute "$SOURCE" 0
+	wpctl set-volume -l "$MAX_SOURCE_VOLUME" "$SOURCE" "${percent}%"
+}
+
+cmd_report() {
+	local out mic
+	if out="$(cmd_status 2>&1)"; then
+		:
+	else
+		out="VOL unavailable"
+	fi
+	if mic="$(cmd_mic_status 2>&1)"; then
+		:
+	else
+		mic="MIC unavailable"
+	fi
+	cat <<REPORT
+CTOS AUDIO // CONTROL
+====================
+$out
+$mic
+
+Output:
+  ctos-audio up [5|10]       raise speakers
+  ctos-audio down [5|10]     lower speakers
+  ctos-audio set 80          set speakers to 80%
+  ctos-audio mute            toggle speaker mute
+
+Microphone:
+  ctos-audio mic-up 5        raise microphone gain
+  ctos-audio mic-down 5      lower microphone gain
+  ctos-audio mic-set 30      set microphone to 30%
+  ctos-audio mic-mute        toggle microphone mute
+
+Desktop:
+  Waybar VOL scroll          speaker volume
+  Waybar VOL left click      this panel
+  Waybar VOL middle click    pavucontrol mixer
+  SUPER+PageUp/PageDown      speaker +/-10%
+  SUPER+Shift+PageUp/Down    microphone +/-5%
+  SUPER+BackSpace            speaker mute
+  SUPER+Shift+BackSpace      microphone mute
+  SUPER+Shift+A              pavucontrol mixer
+REPORT
+}
+
+cmd_panel() {
+	if command -v kitty >/dev/null 2>&1; then
+		setsid kitty --class CTOS_AUDIO --title CTOS_AUDIO bash -lc 'while :; do clear; /home/operator/T480/scripts/ctos-audio report; printf "\nCtrl+C closes. Refreshing every 2s.\n"; sleep 2; done' >/tmp/ctos-audio-panel.log 2>&1 &
+		return 0
+	fi
+	cmd_report
+}
+
+cmd_mixer() {
+	if command -v pavucontrol >/dev/null 2>&1; then
+		setsid pavucontrol >/tmp/ctos-pavucontrol.log 2>&1 &
+		return 0
+	fi
+	if command -v kitty >/dev/null 2>&1 && command -v alsamixer >/dev/null 2>&1; then
+		setsid kitty --class CTOS_AUDIO --title CTOS_AUDIO alsamixer >/tmp/ctos-alsamixer.log 2>&1 &
+		return 0
+	fi
+	printf 'no mixer UI found; install or expose pavucontrol/alsamixer\n' >&2
+	return 3
+}
+
+cmd_test_voice() {
+	local percent="${1:-}"
+	if [ -n "$percent" ]; then
+		cmd_set "$percent"
+	fi
+	if [ -x /home/operator/T480/scripts/ctos-voice ]; then
+		/home/operator/T480/scripts/ctos-voice say "Test audio CTOS. Ajuste le volume depuis Waybar ou Super Page haut et Super Page bas."
+		return $?
+	fi
+	if command -v espeak-ng >/dev/null 2>&1; then
+		espeak-ng -v fr-fr -s "${CTOS_VOICE_ESPEAK_SPEED:-130}" -a "${CTOS_VOICE_ESPEAK_AMPLITUDE:-200}" \
+			"Test audio CTOS. Ajuste le volume depuis Waybar."
+		return $?
+	fi
+	printf 'no CTOS voice or espeak-ng command found\n' >&2
+	return 3
+}
+
+case "${1:-status}" in
+	status)
+		cmd_status
+		;;
+	waybar)
+		cmd_waybar
+		;;
+	doctor)
+		shift
+		cmd_doctor "${1:-}"
+		;;
+	report)
+		cmd_report
+		;;
+	panel)
+		cmd_panel
+		;;
+	up)
+		shift
+		cmd_up "${1:-}"
+		;;
+	down)
+		shift
+		cmd_down "${1:-}"
+		;;
+	mute)
+		cmd_mute
+		;;
+	set)
+		shift
+		cmd_set "${1:-}"
+		;;
+	mic-status)
+		cmd_mic_status
+		;;
+	mic-up)
+		shift
+		cmd_mic_up "${1:-}"
+		;;
+	mic-down)
+		shift
+		cmd_mic_down "${1:-}"
+		;;
+	mic-mute)
+		cmd_mic_mute
+		;;
+	mic-set)
+		shift
+		cmd_mic_set "${1:-}"
+		;;
+	mixer)
+		cmd_mixer
+		;;
+	test-voice)
+		shift
+		cmd_test_voice "${1:-}"
+		;;
+	-h|--help|help)
+		usage
+		;;
+	*)
+		usage >&2
+		exit 2
+		;;
+esac

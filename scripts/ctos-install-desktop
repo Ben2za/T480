@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+dry_run=0
+
+if [ "${1:-}" = "--dry-run" ]; then
+	dry_run=1
+fi
+
+install_file() {
+	local src="$1"
+	local dest="$2"
+	local mode="${3:-0644}"
+
+	if [ ! -f "$src" ]; then
+		printf 'missing source: %s\n' "$src" >&2
+		exit 1
+	fi
+
+	if [ -f "$dest" ] && cmp -s "$src" "$dest"; then
+		printf 'unchanged %s\n' "$dest"
+		return
+	fi
+
+	if [ "$dry_run" -eq 1 ]; then
+		printf 'would install %s -> %s\n' "$src" "$dest"
+		return
+	fi
+
+	mkdir -p "$(dirname "$dest")"
+
+	if [ -f "$dest" ]; then
+		local backup="${dest}.bak-$(date +'%Y%m%d%H%M%S')"
+		cp -p "$dest" "$backup"
+		printf 'backup %s\n' "$backup"
+	fi
+
+	local tmp="${dest}.tmp.$$"
+	install -m "$mode" "$src" "$tmp"
+	mv -f "$tmp" "$dest"
+	printf 'installed %s\n' "$dest"
+}
+
+install_file "$ROOT/hyprland/hyprland.conf" "$HOME/.config/hypr/hyprland.conf"
+install_file "$ROOT/waybar/config" "$HOME/.config/waybar/config"
+install_file "$ROOT/waybar/style.css" "$HOME/.config/waybar/style.css"
+
+printf 'desktop config installed. Reload Hyprland with: hyprctl reload\n'

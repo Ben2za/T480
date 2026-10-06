@@ -1,0 +1,26 @@
+{
+  "schema_version": "ctos.voice_task.v1",
+  "goal": "Inspect the implemented voice-to-Codex boundary and report whether its schemas, validator, runner, and focused tests are present and remain read-only.",
+  "workspace": "/home/operator/T480",
+  "allowed_scope": [
+    "ai/voice_task_spec.py",
+    "ai/voice_task_spec.schema.json",
+    "ai/codex_readonly_result.schema.json",
+    "scripts/ctos-codex-voice",
+    "tests/test_voice_task_spec.py",
+    "tests/test_ctos_codex_voice.py"
+  ],
+  "constraints": [
+    "Do not modify files, services, configuration, repositories, or external state.",
+    "Do not inspect secrets, credentials, raw audio, or speech transcripts.",
+    "Base findings only on the allowed repository paths."
+  ],
+  "deliverable": "A bounded structured result summarizing the boundary and its verification evidence.",
+  "acceptance_checks": [
+    "Confirm that only read-only Codex execution is exposed.",
+    "Confirm that task input is schema-validated and canonicalized before execution.",
+    "Confirm that focused negative tests cover forbidden raw transcript fields and missing confirmation."
+  ],
+  "approval_class": "read_only",
+  "clarification_state": "resolved"
+}

@@ -1,0 +1,4629 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
+JARVIS_STACK = ROOT / "ai" / "jarvis_stack.json"
+VOICE_INTENTS = ROOT / "ai" / "voice_intents_fr.json"
+
+COLLECT_PRESETS = {
+    "core": [
+        "agenda",
+        "brief",
+        "ouvre desk",
+        "ouvre vms",
+        "ajoute acheter du pain demain trente minutes priorite trois",
+    ],
+    "commands": [
+        "agenda",
+        "brief",
+        "propositions agenda",
+        "ouvre desk",
+        "ouvre vms",
+        "que peux tu faire",
+    ],
+    "agenda": [
+        "agenda",
+        "mon agenda",
+        "plan du jour",
+        "ajoute acheter du pain demain trente minutes priorite trois",
+        "ajoute coder le jarvis demain une heure priorite deux",
+    ],
+}
+
+COLLECT_INTENT_IDS = {
+    "agenda": "ctos_agenda",
+    "brief": "ctos_brief",
+    "propositions agenda": "ctos_agenda_review",
+    "ouvre desk": "ctos_open_desk",
+    "ouvre vms": "ctos_open_vms",
+    "que peux tu faire": "ctos_capabilities",
+}
+
+
+def default_state_dir() -> Path:
+    xdg_state = os.environ.get("XDG_STATE_HOME")
+    if xdg_state:
+        return Path(xdg_state).expanduser()
+    return Path.home() / ".local" / "state"
+
+
+def default_sample_dir() -> Path:
+    return default_state_dir() / "ctos" / "jarvis-samples"
+
+
+def safe_slug(text: str, fallback: str = "sample") -> str:
+    lowered = text.lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", lowered).strip("-")
+    return slug[:60] or fallback
+
+
+def script(name: str) -> str:
+    return str(SCRIPTS / name)
+
+
+def run(cmd: list[str]) -> int:
+    return subprocess.run(cmd, check=False).returncode
+
+
+def run_capture(cmd: list[str], *, env: dict[str, str] | None = None, timeout: float = 60) -> dict[str, object]:
+    try:
+        proc = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+        return {
+            "command": cmd,
+            "rc": proc.returncode,
+            "ok": proc.returncode == 0,
+            "stdout": proc.stdout.strip(),
+            "stderr": proc.stderr.strip(),
+        }
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "command": cmd,
+            "rc": 124,
+            "ok": False,
+            "stdout": (exc.stdout or "").strip() if isinstance(exc.stdout, str) else "",
+            "stderr": "timeout",
+        }
+
+
+def preview(text: str, limit: int = 220) -> str:
+    one_line = " ".join(text.split())
+    if len(one_line) <= limit:
+        return one_line
+    return one_line[: limit - 3] + "..."
+
+
+def parse_json_result(result: dict[str, object]) -> dict[str, object]:
+    stdout = str(result.get("stdout") or "")
+    if not stdout:
+        return {}
+    try:
+        parsed = json.loads(stdout)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def parse_json_value(result: dict[str, object]) -> object:
+    stdout = str(result.get("stdout") or "")
+    if not stdout:
+        return None
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def nested(payload: object, *path: str) -> object:
+    current = payload
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def compact(value: object, fallback: str = "-") -> str:
+    if value is None:
+        return fallback
+    text = " ".join(str(value).split())
+    return text or fallback
+
+
+def ctos_route(payload: object) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        return {}
+    nested_route = payload.get("route")
+    if isinstance(nested_route, dict):
+        return nested_route
+    if any(key in payload for key in ("matched", "mode", "category", "agenda_proposal", "agenda_save", "top_candidates")):
+        return payload
+    return {}
+
+
+def route_agenda_proposal(route: dict[str, object]) -> dict[str, object]:
+    proposal = route.get("agenda_proposal")
+    return proposal if isinstance(proposal, dict) else {}
+
+
+def route_execution(route_payload: object, route: dict[str, object]) -> dict[str, object]:
+    if isinstance(route_payload, dict) and isinstance(route_payload.get("execution"), dict):
+        return route_payload["execution"]  # type: ignore[return-value]
+    if isinstance(route_payload, dict) and isinstance(route_payload.get("agenda_save"), dict):
+        agenda_save = route_payload["agenda_save"]  # type: ignore[index]
+        return {
+            "kind": "agenda_save",
+            "rc": 0 if route_payload.get("state") == "saved_pending" else agenda_save.get("rc"),
+            "reason": route_payload.get("save_reason"),
+        }
+    if isinstance(route.get("execution"), dict):
+        return route["execution"]  # type: ignore[return-value]
+    if isinstance(route.get("agenda_save"), dict):
+        agenda_save = route["agenda_save"]  # type: ignore[index]
+        if agenda_save.get("attempted") or agenda_save.get("rc") == 0:
+            return {
+                "kind": "agenda_save",
+                "rc": agenda_save.get("rc"),
+                "reason": agenda_save.get("reason"),
+            }
+    return {}
+
+
+def route_top_candidate(route: dict[str, object]) -> dict[str, object]:
+    candidates = route.get("top_candidates")
+    if isinstance(candidates, list):
+        for item in candidates:
+            if isinstance(item, dict):
+                return item
+    return {}
+
+
+def load_json_object(path: Path, label: str) -> dict[str, object]:
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"cannot read {label} at {path}: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise SystemExit(f"{label} at {path} must contain a JSON object")
+    return parsed
+
+
+def load_jarvis_stack() -> dict[str, object]:
+    return load_json_object(JARVIS_STACK, "Jarvis stack manifest")
+
+
+def load_voice_intents_catalog() -> dict[str, object]:
+    return load_json_object(VOICE_INTENTS, "voice intent catalog")
+
+
+def jarvis_stack_integrity_errors(payload: dict[str, object]) -> list[str]:
+    errors: list[str] = []
+    if isinstance(payload.get("intents"), list):
+        errors.append(f"{JARVIS_STACK} looks like a voice intent catalog; voice intents belong in {VOICE_INTENTS}")
+    mature = payload.get("mature_adoption")
+    if not isinstance(mature, dict):
+        errors.append("jarvis_stack.json is missing object: mature_adoption")
+    else:
+        for field in ("adopt_now", "sandbox_or_reference", "operator_path"):
+            if not isinstance(mature.get(field), list):
+                errors.append(f"mature_adoption.{field} must be a list")
+    for field in ("decision", "summary"):
+        if not str(payload.get(field) or "").strip():
+            errors.append(f"jarvis_stack.json is missing text field: {field}")
+    if not isinstance(payload.get("selected_layers"), list) or not payload.get("selected_layers"):
+        errors.append("jarvis_stack.json needs a non-empty selected_layers list")
+    if not isinstance(payload.get("authority_boundary"), dict):
+        errors.append("jarvis_stack.json is missing object: authority_boundary")
+    return errors
+
+
+def voice_intents_integrity_errors(payload: dict[str, object]) -> list[str]:
+    errors: list[str] = []
+    if isinstance(payload.get("mature_adoption"), dict):
+        errors.append(f"{VOICE_INTENTS} looks like the Jarvis stack manifest; stack selection belongs in {JARVIS_STACK}")
+    intents = payload.get("intents")
+    if not isinstance(intents, list) or not intents:
+        errors.append("voice_intents_fr.json needs a non-empty intents list")
+        return errors
+    seen: set[str] = set()
+    for index, item in enumerate(intents, start=1):
+        if not isinstance(item, dict):
+            errors.append(f"intent #{index} must be an object")
+            continue
+        intent_id = str(item.get("id") or "").strip()
+        if not intent_id:
+            errors.append(f"intent #{index} is missing id")
+        elif intent_id in seen:
+            errors.append(f"duplicate intent id: {intent_id}")
+        seen.add(intent_id)
+        if not isinstance(item.get("command"), list) or not item.get("command"):
+            errors.append(f"intent {intent_id or index} needs a non-empty command list")
+        if not isinstance(item.get("phrases"), list) or not item.get("phrases"):
+            errors.append(f"intent {intent_id or index} needs a non-empty phrases list")
+    return errors
+
+
+def stack_integrity_payload() -> dict[str, object]:
+    stack = load_jarvis_stack()
+    intents = load_voice_intents_catalog()
+    stack_errors = jarvis_stack_integrity_errors(stack)
+    intent_errors = voice_intents_integrity_errors(intents)
+    errors = [*stack_errors, *intent_errors]
+    return {
+        "schema": 1,
+        "mode": "ctos-jarvis-stack-check",
+        "ok": not errors,
+        "stack": {
+            "path": str(JARVIS_STACK),
+            "decision": stack.get("decision"),
+            "mature_adoption": isinstance(stack.get("mature_adoption"), dict),
+            "selected_layers": len(stack.get("selected_layers") or []) if isinstance(stack.get("selected_layers"), list) else 0,
+            "errors": stack_errors,
+        },
+        "voice_intents": {
+            "path": str(VOICE_INTENTS),
+            "intents": len(intents.get("intents") or []) if isinstance(intents.get("intents"), list) else 0,
+            "errors": intent_errors,
+        },
+        "errors": errors,
+    }
+
+
+def open_stt_running(payload: dict[str, object]) -> bool:
+    stdout = str(payload.get("stdout") or "")
+    return "running=true" in stdout
+
+
+def calibration_next_steps(payload: dict[str, object], *, saved_requested: bool) -> list[str]:
+    state = compact(payload.get("state"), "")
+    transcribe = payload.get("transcribe") if isinstance(payload.get("transcribe"), dict) else {}
+    audio_state = compact(nested(transcribe, "audio_analysis", "state"))
+    transcript = compact(nested(transcribe, "recognition", "transcript"), "")
+    guard_state = compact(nested(transcribe, "transcript_guard", "state"))
+    guard_ok = bool(nested(transcribe, "transcript_guard", "ok"))
+    route_payload = nested(transcribe, "route_payload")
+    route = ctos_route(route_payload)
+    proposal = route_agenda_proposal(route)
+    execution = route_execution(route_payload, route)
+
+    steps: list[str] = []
+    if state == "backend_not_running":
+        steps.append("relance sans --no-start: ctos-jarvis calibrate")
+        steps.append("si ca bloque, lance ctos-jarvis doctor pour verifier ctos-core/open-STT")
+    elif state == "backend_start_failed":
+        steps.append("ctos-jarvis doctor")
+        steps.append("ctos-voice-v2 open-stt logs")
+    elif audio_state == "too_quiet":
+        steps.append("ctos-audio mic-up 5, puis relance ctos-jarvis calibrate")
+    elif audio_state in {"hot", "clipping"}:
+        steps.append("ctos-audio mic-down 5, puis relance ctos-jarvis calibrate")
+    elif not transcript:
+        steps.append("rapproche-toi du micro ou augmente legerement le gain; relance ctos-jarvis calibrate")
+    elif not guard_ok:
+        steps.append(f"transcription bloquee par la garde ({guard_state}); garde le WAV et reteste plus clairement")
+    elif execution.get("kind") == "agenda_save" and execution.get("rc") == 0:
+        steps.append("ctos-jarvis review")
+        steps.append("ctos-jarvis confirm latest --yes")
+    elif saved_requested and execution.get("kind") == "agenda_save":
+        steps.append(f"sauvegarde agenda refusee: {compact(execution.get('reason'), 'proposition non reconnue')}")
+        steps.append("reteste avec une phrase plus directe: ajoute [tache] demain 30 minutes priorite 3")
+    elif proposal.get("recognized") and not saved_requested:
+        steps.append("ctos-jarvis calibrate --save-agenda pour creer une proposition persistante")
+    elif route.get("matched"):
+        steps.append("ctos-jarvis listen --seconds 5 --execute-safe --keep-backend pour tester une action sure")
+    elif route:
+        category = compact(route.get("category"), "unclassified")
+        steps.append(f"transcription comprise comme texte ({category}), mais aucune action/proposition fiable")
+        steps.append("reteste avec une phrase plus directe: ajoute [tache] demain 30 minutes priorite 3")
+    else:
+        steps.append("route CTOS absente; relance ctos-jarvis calibrate ou ctos-jarvis doctor")
+    return steps
+
+
+def add_common_assistant_args(parser: argparse.ArgumentParser, *, typed: bool) -> None:
+    parser.add_argument("--model", default="qwen2.5-coder:0.5b")
+    parser.add_argument("--max-tokens", type=int, default=180)
+    parser.add_argument("--threshold", type=float, default=0.72)
+    parser.add_argument("--save-agenda", action="store_true", help="save recognized agenda proposal without writing the agenda")
+    parser.add_argument("--no-actions", action="store_true", help="do not execute even safe CTOS action intents")
+    parser.add_argument("--json", action="store_true")
+    if typed:
+        parser.add_argument("--speak", action="store_true", help="speak the reply; typed mode is silent by default")
+    else:
+        parser.add_argument("--no-speak", action="store_true", help="disable spoken feedback")
+
+
+def cmd_brief(args: argparse.Namespace) -> int:
+    return run([script("ctos-ai"), "brief"])
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    return run([script("ctos-voice-v2"), "doctor"])
+
+
+def cmd_next(args: argparse.Namespace) -> int:
+    print("CTOS Jarvis next")
+    print("================")
+    print("Direction:")
+    print("  - stop tuning one-word phrase misses as the main path")
+    print("  - use a mature open STT rail for natural French requests")
+    print("  - keep CTOS as the action/permission boundary")
+    print()
+    print("Usable bridge:")
+    print("  ctos-jarvis stack")
+    print("  ctos-jarvis stack-check")
+    print("  ctos-jarvis status")
+    print("  ctos-jarvis daily")
+    print("  ctos-jarvis inbox")
+    print("  ctos-jarvis request \"ajoute une tache demain 30 minutes priorite 3\"")
+    print("  ctos-jarvis chat --brief \"resume la situation et propose une prochaine action\"")
+    print("  ctos-jarvis draft \"ajoute une tache demain 30 minutes priorite 3\"")
+    print("  ctos-jarvis draft \"ajoute une tache demain 30 minutes priorite 3\" --save")
+    print("  ctos-jarvis bootstrap")
+    print("  ctos-jarvis bootstrap --run")
+    print("  ctos-jarvis mature-plan")
+    print("  ctos-jarvis mature-check")
+    print("  ctos-jarvis mature-check --full")
+    print("  ctos-jarvis smoke")
+    print("  ctos-jarvis calibrate")
+    print("  ctos-jarvis calibrate --save-agenda")
+    print("  ctos-jarvis run")
+    print("  ctos-jarvis improve")
+    print("  ctos-jarvis collect-next")
+    print("  ctos-jarvis collect")
+    print("  ctos-jarvis corpus")
+    print("  ctos-jarvis triage")
+    print("  ctos-jarvis sample \"ajoute acheter du pain demain\"")
+    print("  ctos-jarvis samples")
+    print("  ctos-jarvis evaluate")
+    print("  ctos-jarvis evaluate --backend both")
+    print("  ctos-jarvis regression")
+    print("  ctos-jarvis regression --backend open-stt --target-tunnel")
+    print("  ctos-jarvis session")
+    print("  ctos-jarvis session --save-agenda")
+    print("  ctos-jarvis session --strict-preflight")
+    print("  ctos-jarvis text \"agenda\"")
+    print("  ctos-jarvis voice --seconds 4")
+    print("  ctos-jarvis voice --seconds 4 --save-agenda")
+    print("  ctos-jarvis listen --seconds 5")
+    print("  ctos-jarvis listen --seconds 5 --save-agenda --keep-backend")
+    print()
+    print("Review loop:")
+    print("  ctos-jarvis inbox")
+    print("  ctos-jarvis review")
+    print("  ctos-jarvis confirm latest --yes")
+    print("  ctos-jarvis reject latest")
+    print()
+    print("Backend rail:")
+    print("  ctos-jarvis doctor")
+    print("  ctos-audio mic-status")
+    print("  ctos-voice-v2 mic-check --record-seconds 3 --keep-wav /tmp/ctos-mic-check.wav")
+    print("  ctos-voice-v2 open-stt-plan")
+    print("  ctos-voice-v2 open-stt-candidates")
+    print("  ctos-voice-v2 open-stt-plan --target-probe")
+    print("  ctos-jarvis unlock-voice")
+    print("  ctos-jarvis unlock-voice --interactive")
+    print("  ctos-jarvis setup-voice --plan")
+    print("  ctos-jarvis setup-voice")
+    print()
+    print("Current backend detail:")
+    sys.stdout.flush()
+    return run([script("ctos-voice-v2"), "next-commands"])
+
+
+def cmd_stack(args: argparse.Namespace) -> int:
+    payload = load_jarvis_stack()
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    current_poc = payload.get("current_poc")
+    selected_layers = payload.get("selected_layers")
+    candidates = payload.get("research_candidates")
+    next_steps = payload.get("next_steps")
+
+    print("CTOS Jarvis stack")
+    print("=================")
+    print(f"decision  {payload.get('decision', '-')}")
+    print(f"updated   {payload.get('updated', '-')}")
+    summary = payload.get("summary")
+    if summary:
+        print(f"summary   {summary}")
+    if isinstance(current_poc, dict):
+        print()
+        print("Current POC")
+        print(f"  name     {current_poc.get('name', '-')}")
+        print(f"  command  {current_poc.get('operator_command', '-')}")
+        print(f"  status   {current_poc.get('status', '-')}")
+    if isinstance(selected_layers, list):
+        print()
+        print("Selected layers")
+        for item in selected_layers:
+            if not isinstance(item, dict):
+                continue
+            print(f"  {item.get('layer', '-'):<28} {item.get('choice', '-')}")
+            print(f"    status {item.get('status', '-')}")
+    if args.verbose and isinstance(candidates, list):
+        print()
+        print("Research candidates")
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            print(f"  {item.get('id', '-'):<22} {item.get('ctos_position', '-')}")
+    if isinstance(next_steps, list):
+        print()
+        print("Next")
+        for step in next_steps[:5]:
+            print(f"  - {step}")
+    return 0
+
+
+def cmd_stack_check(args: argparse.Namespace) -> int:
+    payload = stack_integrity_payload()
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0 if payload["ok"] else 1
+
+    stack = payload.get("stack") if isinstance(payload.get("stack"), dict) else {}
+    intents = payload.get("voice_intents") if isinstance(payload.get("voice_intents"), dict) else {}
+    print("CTOS Jarvis stack check")
+    print("=======================")
+    print(f"stack        {'ok' if not stack.get('errors') else 'error'}")
+    print(f"intents      {'ok' if not intents.get('errors') else 'error'}")
+    print(f"decision     {stack.get('decision', '-')}")
+    print(f"intent count {intents.get('intents', 0)}")
+    errors = payload.get("errors")
+    if isinstance(errors, list) and errors:
+        print()
+        print("errors")
+        for error in errors:
+            print(f"  - {error}")
+    return 0 if payload["ok"] else 1
+
+
+def cmd_mature_plan(args: argparse.Namespace) -> int:
+    payload = load_jarvis_stack()
+    mature = payload.get("mature_adoption")
+    if not isinstance(mature, dict):
+        print("mature_adoption is missing from ai/jarvis_stack.json", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(mature, ensure_ascii=False, indent=2))
+        return 0
+
+    adopt_now = mature.get("adopt_now")
+    sandbox = mature.get("sandbox_or_reference")
+    operator_path = mature.get("operator_path")
+
+    if args.commands:
+        if isinstance(operator_path, list):
+            for command in operator_path:
+                print(command)
+        return 0
+
+    print("CTOS Jarvis mature plan")
+    print("=======================")
+    print(mature.get("thesis", "Adopt mature local voice infrastructure behind CTOS."))
+    print()
+    print("Adopt now")
+    if isinstance(adopt_now, list):
+        for item in adopt_now:
+            if not isinstance(item, dict):
+                continue
+            print(f"  - {item.get('component', '-')}")
+            print(f"    role     {item.get('role', '-')}")
+            print(f"    boundary {item.get('ctos_boundary', '-')}")
+    print()
+    print("Sandbox/reference only")
+    if isinstance(sandbox, list):
+        for item in sandbox:
+            if not isinstance(item, dict):
+                continue
+            print(f"  - {item.get('component', '-')}: {item.get('reason', '-')}")
+    print()
+    print("Operator path")
+    if isinstance(operator_path, list):
+        for command in operator_path:
+            print(f"  {command}")
+    print()
+    print("Rule: voice/model output may propose; CTOS approval is still required for mutation.")
+    return 0
+
+
+def sample_manifest_summary(manifest: Path) -> dict[str, object]:
+    if not manifest.exists():
+        return {
+            "exists": False,
+            "path": str(manifest),
+            "count": 0,
+            "labels": [],
+            "error": "",
+        }
+    labels: list[str] = []
+    count = 0
+    errors: list[str] = []
+    try:
+        for line_no, raw in enumerate(manifest.read_text(encoding="utf-8").splitlines(), start=1):
+            line = raw.strip()
+            if not line:
+                continue
+            count += 1
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                errors.append(f"line {line_no}: {exc}")
+                continue
+            if isinstance(row, dict):
+                label = row.get("label") or row.get("expected_text") or row.get("intent_id")
+                if isinstance(label, str) and label:
+                    labels.append(label)
+    except OSError as exc:
+        return {
+            "exists": True,
+            "path": str(manifest),
+            "count": 0,
+            "labels": [],
+            "error": str(exc),
+        }
+    return {
+        "exists": True,
+        "path": str(manifest),
+        "count": count,
+        "labels": labels[-5:],
+        "error": "; ".join(errors[:3]),
+    }
+
+
+def default_sample_manifest() -> Path:
+    return default_sample_dir() / "manifest.jsonl"
+
+
+def load_sample_rows(manifest: Path) -> tuple[list[dict[str, object]], list[str]]:
+    rows: list[dict[str, object]] = []
+    errors: list[str] = []
+    if not manifest.exists():
+        return rows, errors
+    try:
+        lines = manifest.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        return rows, [str(exc)]
+    for line_no, raw in enumerate(lines, start=1):
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError as exc:
+            errors.append(f"line {line_no}: {exc}")
+            continue
+        if isinstance(parsed, dict):
+            rows.append(parsed)
+        else:
+            errors.append(f"line {line_no}: expected object")
+    return rows, errors
+
+
+def sample_row_label(row: dict[str, object]) -> str:
+    for key in ("label", "expected_text", "intent_id"):
+        value = row.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return "-"
+
+
+def sample_file_path(row: dict[str, object], manifest: Path) -> Path | None:
+    value = row.get("file")
+    if not isinstance(value, str) or not value:
+        return None
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = manifest.parent / path
+    return path
+
+
+def normalize_phrase(text: str) -> str:
+    return " ".join(text.lower().split())
+
+
+def command_ok(result: dict[str, object]) -> bool:
+    return bool(result.get("ok"))
+
+
+def compact_step(name: str, result: dict[str, object]) -> dict[str, object]:
+    return {
+        "name": name,
+        "command": result.get("command"),
+        "rc": result.get("rc"),
+        "ok": result.get("ok"),
+        "stdout_preview": preview(str(result.get("stdout", ""))),
+        "stderr_preview": preview(str(result.get("stderr", ""))),
+    }
+
+
+def audio_warning_from_doctor(
+    doctor_payload: dict[str, object],
+    node_name: str,
+    fallback: str,
+) -> str:
+    node = doctor_payload.get(node_name)
+    if not isinstance(node, dict):
+        return fallback
+    reason = str(node.get("reason") or "unknown")
+    if reason == "pipewire_context_denied":
+        return f"{fallback}: current execution context cannot access PipeWire/DBus"
+    if reason == "pipewire_unreachable":
+        return f"{fallback}: PipeWire is unreachable from current session"
+    if reason == "missing_wpctl":
+        return f"{fallback}: wpctl is missing"
+    if reason == "empty_wpctl_output":
+        return f"{fallback}: wpctl returned no volume data"
+    if reason == "unparsed_wpctl_output":
+        return f"{fallback}: wpctl output was not understood"
+    return f"{fallback}: {reason}"
+
+
+def mature_next_action(
+    *,
+    prefer: str,
+    local_failed: bool,
+    target_failed: bool,
+    doctor_state: str,
+    sample_count: int,
+) -> str:
+    if local_failed:
+        return "ctos-jarvis doctor"
+    if target_failed:
+        return "restore T480 <-> ctos-core SSH/link, then rerun ctos-jarvis mature-check --full"
+    if prefer == "deterministic":
+        if doctor_state in {"missing_token", "missing_token_file", "empty_token", "hass_token_not_ready"}:
+            return "ctos-jarvis unlock-voice --interactive"
+        if doctor_state == "ready_to_start_speech_to_phrase":
+            return "ctos-jarvis unlock-voice --start"
+        if doctor_state == "ready":
+            return "ctos-jarvis unlock-voice --test"
+        return "ctos-jarvis unlock-voice"
+    if sample_count == 0:
+        return "ctos-jarvis improve"
+    return "ctos-jarvis improve"
+
+
+def cmd_mature_check(args: argparse.Namespace) -> int:
+    stack = load_jarvis_stack()
+    mature = stack.get("mature_adoption")
+    stack_errors = jarvis_stack_integrity_errors(stack)
+    intent_errors: list[str] = []
+    try:
+        intent_errors = voice_intents_integrity_errors(load_voice_intents_catalog())
+    except SystemExit as exc:
+        intent_errors = [str(exc)]
+    stack_ok = isinstance(mature, dict) and not stack_errors and not intent_errors
+    manifest = Path(args.manifest).expanduser() if args.manifest else default_sample_dir() / "manifest.jsonl"
+    samples = sample_manifest_summary(manifest)
+
+    steps: list[tuple[str, dict[str, object]]] = []
+    steps.append((
+        "voice probe",
+        run_capture([script("ctos-voice"), "probe", "--json"], timeout=30),
+    ))
+    doctor_cmd = [script("ctos-voice-v2"), "doctor", "--json"]
+    if not args.full:
+        doctor_cmd.append("--local-only")
+    steps.append(("voice doctor", run_capture(doctor_cmd, timeout=120 if args.full else 60)))
+    steps.append(("audio output", run_capture([script("ctos-audio"), "status"], timeout=20)))
+    steps.append(("audio input", run_capture([script("ctos-audio"), "mic-status"], timeout=20)))
+    steps.append(("audio doctor", run_capture([script("ctos-audio"), "doctor", "--json"], timeout=20)))
+
+    if args.full:
+        steps.append((
+            "open-STT status",
+            run_capture([script("ctos-voice-v2"), "open-stt", "status", "--json"], timeout=90),
+        ))
+
+    if args.smoke:
+        steps.append((
+            "jarvis smoke",
+            run_capture([script("ctos-jarvis"), "smoke", "--json"], timeout=90),
+        ))
+
+    doctor_payload = parse_json_result(steps[1][1]) if len(steps) > 1 else {}
+    doctor_state = str(doctor_payload.get("state") or "unknown")
+    doctor_blockers = doctor_payload.get("blockers")
+    if not isinstance(doctor_blockers, list):
+        doctor_blockers = []
+
+    local_failed = (not stack_ok) or not command_ok(steps[0][1]) or doctor_state in {
+        "local_catalog_error",
+        "voice_v1_probe_failed",
+    }
+    target_failed = args.full and doctor_state == "ctos_core_unreachable"
+    hard_failures = bool(local_failed or target_failed)
+    sample_count = int(samples.get("count") or 0)
+    next_action = mature_next_action(
+        prefer=args.prefer,
+        local_failed=local_failed,
+        target_failed=target_failed,
+        doctor_state=doctor_state,
+        sample_count=sample_count,
+    )
+
+    warnings: list[str] = []
+    audio_doctor_payload = parse_json_result(steps[4][1]) if len(steps) > 4 else {}
+    if not command_ok(steps[2][1]):
+        warnings.append(audio_warning_from_doctor(
+            audio_doctor_payload,
+            "output",
+            "audio output control is not readable",
+        ))
+    if not command_ok(steps[3][1]):
+        warnings.append(audio_warning_from_doctor(
+            audio_doctor_payload,
+            "microphone",
+            "microphone control is not readable",
+        ))
+    if samples.get("error"):
+        warnings.append(f"sample manifest has parse/read warnings: {samples['error']}")
+    if sample_count == 0:
+        warnings.append("no reusable Jarvis voice samples yet")
+    for error in [*stack_errors, *intent_errors]:
+        warnings.append(f"stack integrity: {error}")
+    for blocker in doctor_blockers:
+        text = str(blocker)
+        if text and text not in warnings:
+            warnings.append(text)
+
+    state = "ready"
+    if hard_failures:
+        state = "blocked"
+    elif args.full and doctor_state not in {"ready", "ready_to_start_speech_to_phrase", "local_ok_target_skipped"}:
+        state = "partial"
+    elif warnings:
+        state = "ready_with_warnings"
+
+    payload = {
+        "schema": 1,
+        "mode": "ctos-jarvis-mature-check",
+        "state": state,
+        "ok": not hard_failures,
+        "full": args.full,
+        "prefer": args.prefer,
+        "stack_ok": stack_ok,
+        "integrity": {
+            "stack_errors": stack_errors,
+            "voice_intents_errors": intent_errors,
+        },
+        "doctor_state": doctor_state,
+        "next_action": next_action,
+        "warnings": warnings,
+        "samples": samples,
+        "steps": [compact_step(name, result) for name, result in steps],
+    }
+
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print("CTOS Jarvis mature check")
+        print("========================")
+        print(f"state       {state}")
+        print(f"prefer      {args.prefer}")
+        print(f"stack       {'ok' if stack_ok else 'missing mature_adoption'}")
+        print(f"doctor      {doctor_state}")
+        print(f"samples     {sample_count} in {manifest}")
+        if samples.get("labels"):
+            print(f"sample ids  {', '.join(str(label) for label in samples['labels'])}")
+        print()
+        for name, result in steps:
+            marker = "OK" if result.get("ok") else "WARN"
+            print(f"{marker:4} {name:<16} rc={result.get('rc')}")
+            if not result.get("ok"):
+                detail = result.get("stderr_preview") or result.get("stdout_preview")
+                if detail:
+                    print(f"     {detail}")
+        if warnings:
+            print()
+            print("warnings")
+            for warning in warnings:
+                print(f"  - {warning}")
+        print()
+        print(f"next        {next_action}")
+    return 0 if not hard_failures else 1
+
+
+def cmd_smoke(args: argparse.Namespace) -> int:
+    temp_dir = Path(tempfile.mkdtemp(prefix="ctos-jarvis-smoke-", dir="/tmp"))
+    temp_env = os.environ.copy()
+    temp_env["CTOS_AI_APPROVAL_DB"] = str(temp_dir / "agenda-proposals.sqlite3")
+    temp_env["CTOS_AI_DB"] = str(temp_dir / "agenda.sqlite3")
+
+    steps: list[tuple[str, dict[str, object]]] = []
+    steps.append((
+        "voice backend doctor",
+        run_capture(
+            [script("ctos-voice-v2"), "doctor", "--json"] if args.full else [script("ctos-voice-v2"), "doctor", "--local-only", "--json"],
+            timeout=90 if args.full else 45,
+        ),
+    ))
+    steps.append((
+        "voice probe",
+        run_capture([script("ctos-voice"), "probe", "--json"], timeout=30),
+    ))
+    steps.append((
+        "safe action route",
+        run_capture([script("ctos-jarvis"), "text", "agenda", "--json"], timeout=45),
+    ))
+    steps.append((
+        "agenda proposal staging",
+        run_capture(
+            [
+                script("ctos-jarvis"),
+                "text",
+                "ajoute acheter du pain demain 30 min priorité 4",
+                "--save-agenda",
+                "--json",
+            ],
+            env=temp_env,
+            timeout=45,
+        ),
+    ))
+    steps.append((
+        "agenda proposal review",
+        run_capture([script("ctos-jarvis"), "review", "--json"], env=temp_env, timeout=30),
+    ))
+    if args.with_model:
+        steps.append((
+            "local model fallback",
+            run_capture(
+                [script("ctos-jarvis"), "text", "explique en une phrase ce que tu peux faire", "--json"],
+                timeout=args.model_timeout,
+            ),
+        ))
+
+    payload = {
+        "schema": 1,
+        "mode": "ctos-jarvis-smoke",
+        "full": args.full,
+        "with_model": args.with_model,
+        "temp_dir": str(temp_dir),
+        "steps": [
+            {
+                "name": name,
+                **result,
+                "stdout_preview": preview(str(result.get("stdout", ""))),
+                "stderr_preview": preview(str(result.get("stderr", ""))),
+            }
+            for name, result in steps
+        ],
+    }
+    payload["ok"] = all(bool(step["ok"]) for step in payload["steps"])
+    payload["failed"] = [step["name"] for step in payload["steps"] if not step["ok"]]
+
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print("CTOS Jarvis smoke")
+        print("=================")
+        for step in payload["steps"]:
+            marker = "OK" if step["ok"] else "FAIL"
+            print(f"{marker:4} {step['name']} rc={step['rc']}")
+            if not step["ok"]:
+                detail = step["stderr_preview"] or step["stdout_preview"]
+                if detail:
+                    print(f"     {detail}")
+        if payload["ok"]:
+            print("next  ctos-jarvis voice --seconds 4")
+        else:
+            print("next  ctos-jarvis doctor")
+    return 0 if payload["ok"] else 1
+
+
+def review_pending_count(payload: dict[str, object]) -> int:
+    value = payload.get("pending_count")
+    if isinstance(value, int):
+        return value
+    proposals = payload.get("proposals")
+    return len(proposals) if isinstance(proposals, list) else 0
+
+
+def status_next_commands(
+    mature: dict[str, object],
+    improve: dict[str, object],
+    collect_next: dict[str, object],
+    review: dict[str, object],
+) -> list[str]:
+    pending = review_pending_count(review)
+    if pending > 0:
+        return ["ctos-jarvis review", "ctos-jarvis confirm latest --yes  # si correct"]
+
+    mature_state = str(mature.get("state") or "")
+    if mature_state == "blocked":
+        return [str(mature.get("next_action") or "ctos-jarvis doctor")]
+
+    target = collect_next.get("target")
+    if isinstance(target, dict) and target.get("phrase"):
+        return ["ctos-jarvis collect-next --run"]
+
+    verdict = str(improve.get("verdict") or "")
+    if verdict == "benchmark_backends":
+        return ["ctos-jarvis evaluate --backend both", "ctos-jarvis run"]
+
+    next_commands = improve.get("next")
+    if isinstance(next_commands, list) and next_commands:
+        return [str(item) for item in next_commands[:3]]
+
+    return [str(mature.get("next_action") or "ctos-jarvis improve")]
+
+
+def daily_payload(args: argparse.Namespace) -> dict[str, object]:
+    manifest = Path(args.manifest).expanduser() if args.manifest else default_sample_manifest()
+    plan_cmd = [script("ctos-agenda"), "plan-day", "--json"]
+    if args.date:
+        plan_cmd.extend(["--date", args.date])
+    if args.start:
+        plan_cmd.extend(["--start", args.start])
+    if args.end:
+        plan_cmd.extend(["--end", args.end])
+
+    status_cmd = [
+        script("ctos-jarvis"),
+        "status",
+        "--json",
+        "--preset",
+        args.preset,
+        "--prefer",
+        args.prefer,
+        "--manifest",
+        str(manifest),
+    ]
+    if args.full:
+        status_cmd.append("--full")
+
+    steps: list[tuple[str, dict[str, object]]] = [
+        ("stack-check", run_capture([script("ctos-jarvis"), "stack-check", "--json"], timeout=20)),
+        ("brief", run_capture([script("ctos-ai"), "brief", "--json"], timeout=45)),
+        ("plan-day", run_capture(plan_cmd, timeout=20)),
+        ("review", run_capture([script("ctos-jarvis"), "review", "--json"], timeout=20)),
+        ("status", run_capture(status_cmd, timeout=120 if args.full else 60)),
+    ]
+    parsed = {name: parse_json_result(result) for name, result in steps}
+    hard_ok = all(bool(result.get("ok")) for name, result in steps if name in {"stack-check", "plan-day", "review", "status"})
+    return {
+        "schema": 1,
+        "mode": "ctos-jarvis-daily",
+        "ok": hard_ok,
+        "date": args.date,
+        "manifest": str(manifest),
+        "stack": parsed["stack-check"],
+        "brief": parsed["brief"],
+        "plan": parsed["plan-day"],
+        "review": parsed["review"],
+        "status": parsed["status"],
+        "steps": [compact_step(name, result) for name, result in steps],
+    }
+
+
+def cmd_daily(args: argparse.Namespace) -> int:
+    payload = daily_payload(args)
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0 if payload["ok"] else 1
+
+    brief = payload.get("brief") if isinstance(payload.get("brief"), dict) else {}
+    plan = payload.get("plan") if isinstance(payload.get("plan"), dict) else {}
+    review = payload.get("review") if isinstance(payload.get("review"), dict) else {}
+    status = payload.get("status") if isinstance(payload.get("status"), dict) else {}
+    readiness = status.get("readiness") if isinstance(status.get("readiness"), dict) else {}
+    improve = status.get("improve") if isinstance(status.get("improve"), dict) else {}
+    next_commands = status.get("next") if isinstance(status.get("next"), list) else []
+    blocks = plan.get("blocks") if isinstance(plan.get("blocks"), list) else []
+    spillover = plan.get("spillover") if isinstance(plan.get("spillover"), list) else []
+    proposals = review.get("proposals") if isinstance(review.get("proposals"), list) else []
+    agenda = brief.get("agenda") if isinstance(brief.get("agenda"), dict) else {}
+    counts = agenda.get("counts") if isinstance(agenda.get("counts"), dict) else {}
+    core = brief.get("core") if isinstance(brief.get("core"), dict) else {}
+    kali = brief.get("kali") if isinstance(brief.get("kali"), dict) else {}
+
+    print("CTOS Jarvis daily")
+    print("=================")
+    print(f"readiness  {readiness.get('state', 'unknown')}")
+    print(f"verdict    {improve.get('verdict', '-')}")
+    print(f"core       {core.get('hostname', '-') if core.get('available') else 'unavailable'}")
+    print(f"kali       {kali.get('state', 'unknown')}")
+    print(
+        "agenda     "
+        f"open {counts.get('open', 0)} "
+        f"due {counts.get('due_today', 0)} "
+        f"pending {review_pending_count(review)}"
+    )
+    print()
+    print("plan")
+    print("----")
+    if blocks:
+        for block in blocks[:8]:
+            print(
+                f"{block.get('start')}-{block.get('end')}  "
+                f"#{block.get('task_id')}  P{block.get('priority')}  {block.get('title')}"
+            )
+    else:
+        print("no schedulable open tasks")
+    if spillover:
+        print(f"spillover  {len(spillover)}")
+    if proposals:
+        print()
+        print("pending proposals")
+        print("-----------------")
+        for proposal in proposals[:3]:
+            print(f"#{proposal.get('id')}  P{proposal.get('priority')}  {proposal.get('title')}")
+        print("confirm    ctos-jarvis confirm latest --yes")
+    print()
+    print("next")
+    if next_commands:
+        for command in next_commands:
+            print(f"  {command}")
+    else:
+        print("  ctos-jarvis status")
+    return 0 if payload["ok"] else 1
+
+
+def inbox_payload(args: argparse.Namespace) -> dict[str, object]:
+    review_result = run_capture([script("ctos-jarvis"), "review", "--json"], timeout=20)
+    approvals_cmd = [script("ctos-ai"), "approvals", "--json", "--limit", str(args.limit)]
+    if args.all:
+        approvals_cmd.append("--all")
+    approvals_result = run_capture(approvals_cmd, timeout=20)
+    review = parse_json_result(review_result)
+    approvals_value = parse_json_value(approvals_result)
+    approvals = approvals_value if isinstance(approvals_value, list) else []
+    agenda_pending = review_pending_count(review)
+    approvals_pending = sum(1 for item in approvals if isinstance(item, dict) and item.get("status") == "pending")
+    next_commands: list[str] = []
+    if agenda_pending:
+        next_commands.extend([
+            "ctos-jarvis review",
+            "ctos-jarvis confirm latest --yes  # si correct",
+            "ctos-jarvis reject latest --reason \"...\"",
+        ])
+    if approvals_pending:
+        first = next((item for item in approvals if isinstance(item, dict) and item.get("status") == "pending"), None)
+        if isinstance(first, dict):
+            approval_id = first.get("id")
+            next_commands.extend([
+                f"ctos-ai show {approval_id}",
+                f"ctos-ai approve {approval_id} --dry-run",
+                f"ctos-ai approve {approval_id}  # seulement si correct",
+            ])
+    if not next_commands:
+        next_commands.append("ctos-jarvis daily")
+    return {
+        "schema": 1,
+        "mode": "ctos-jarvis-inbox",
+        "ok": bool(review_result.get("ok")) and bool(approvals_result.get("ok")) and isinstance(approvals_value, list),
+        "agenda": review,
+        "approvals": approvals,
+        "counts": {
+            "agenda_pending": agenda_pending,
+            "approval_pending": approvals_pending,
+        },
+        "steps": [
+            compact_step("review", review_result),
+            compact_step("approvals", approvals_result),
+        ],
+        "next": next_commands,
+    }
+
+
+def cmd_inbox(args: argparse.Namespace) -> int:
+    payload = inbox_payload(args)
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0 if payload["ok"] else 1
+
+    agenda = payload.get("agenda") if isinstance(payload.get("agenda"), dict) else {}
+    proposals = agenda.get("proposals") if isinstance(agenda.get("proposals"), list) else []
+    approvals = payload.get("approvals") if isinstance(payload.get("approvals"), list) else []
+    counts = payload.get("counts") if isinstance(payload.get("counts"), dict) else {}
+    next_commands = payload.get("next") if isinstance(payload.get("next"), list) else []
+
+    print("CTOS Jarvis inbox")
+    print("=================")
+    print(f"agenda     pending {counts.get('agenda_pending', 0)}")
+    if proposals:
+        for proposal in proposals[: args.limit]:
+            if not isinstance(proposal, dict):
+                continue
+            print(
+                f"  #{proposal.get('id')}  P{proposal.get('priority')}  "
+                f"{proposal.get('due_date') or '-':<10} {proposal.get('title')}"
+            )
+    print(f"approvals  pending {counts.get('approval_pending', 0)}")
+    for approval in approvals[: args.limit]:
+        if not isinstance(approval, dict):
+            continue
+        print(
+            f"  #{approval.get('id')}  {approval.get('status')}  "
+            f"T{approval.get('tier')}  {approval.get('action')}  {approval.get('title')}"
+        )
+    print()
+    print("next")
+    for command in next_commands:
+        print(f"  {command}")
+    return 0 if payload["ok"] else 1
+
+
+def draft_text(args: argparse.Namespace) -> str:
+    text = " ".join(args.text).strip()
+    if text == "-":
+        text = sys.stdin.read().strip()
+    return text
+
+
+def draft_payload(args: argparse.Namespace, text: str) -> dict[str, object]:
+    route_cmd = [
+        script("ctos-ai"),
+        "route-text",
+        text,
+        "--source",
+        args.source,
+        "--threshold",
+        str(args.threshold),
+        "--json",
+    ]
+    route_result = run_capture(route_cmd, timeout=45)
+    route_payload = parse_json_result(route_result)
+    route = ctos_route(route_payload)
+    proposal = route_agenda_proposal(route)
+
+    state = "planned"
+    save_result: dict[str, object] | None = None
+    save_payload: dict[str, object] = {}
+    review_result: dict[str, object] | None = None
+    review_payload: dict[str, object] = {}
+    save_reason = ""
+
+    if args.save:
+        if route.get("category") == "agenda_candidate" and proposal.get("recognized"):
+            save_cmd = [
+                script("ctos-ai"),
+                "agenda-propose",
+                text,
+                "--save",
+                "--source",
+                args.source,
+                "--json",
+            ]
+            save_result = run_capture(save_cmd, timeout=30)
+            save_payload = parse_json_result(save_result)
+            if save_result.get("ok"):
+                state = "saved_pending"
+                review_result = run_capture([script("ctos-jarvis"), "review", "--json"], timeout=20)
+                review_payload = parse_json_result(review_result)
+            else:
+                state = "save_failed"
+                save_reason = compact(save_result.get("stderr") or save_result.get("stdout"), "save failed")
+        else:
+            state = "not_saveable"
+            if route.get("matched"):
+                save_reason = "matched intent is not an agenda proposal"
+            else:
+                save_reason = compact(
+                    route.get("reason"),
+                    "text did not produce a recognized agenda proposal",
+                )
+
+    ok = bool(route_result.get("ok")) and state not in {"not_saveable", "save_failed"}
+    payload: dict[str, object] = {
+        "schema": 1,
+        "mode": "ctos-jarvis-draft",
+        "ok": ok,
+        "state": state,
+        "source": args.source,
+        "input": text,
+        "threshold": args.threshold,
+        "route": route_payload,
+        "steps": [compact_step("route-text", route_result)],
+        "mutations": ["pending_agenda_proposal"] if state == "saved_pending" else [],
+        "next": [],
+    }
+    if save_result is not None:
+        payload["agenda_save"] = save_payload
+        payload["steps"].append(compact_step("agenda-propose --save", save_result))  # type: ignore[index]
+    if review_result is not None:
+        payload["review"] = review_payload
+        payload["steps"].append(compact_step("review", review_result))  # type: ignore[index]
+    if save_reason:
+        payload["save_reason"] = save_reason
+
+    quoted = shlex.quote(text)
+    if state == "saved_pending":
+        payload["next"] = ["ctos-jarvis review", "ctos-jarvis confirm latest --yes  # si correct"]
+    elif proposal.get("recognized"):
+        payload["next"] = [f"ctos-jarvis draft {quoted} --save"]
+    elif route.get("safe_to_execute"):
+        payload["next"] = [f"ctos-ai route-text {quoted} --execute-safe"]
+    else:
+        payload["next"] = ["reformule en action concrete ou ajoute une phrase agenda plus directe"]
+    return payload
+
+
+def cmd_draft(args: argparse.Namespace) -> int:
+    text = draft_text(args)
+    if not text:
+        print("text is required", file=sys.stderr)
+        return 2
+    payload = draft_payload(args, text)
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0 if payload["ok"] else 2
+
+    route = ctos_route(payload.get("route"))
+    proposal = route_agenda_proposal(route)
+    next_commands = payload.get("next") if isinstance(payload.get("next"), list) else []
+
+    print("CTOS Jarvis draft")
+    print("=================")
+    print(f"state     {payload.get('state')}")
+    print(f"input     {payload.get('input')}")
+    print(f"mode      {compact(route.get('mode'))}")
+    print(f"matched   {route.get('matched', False)}")
+    if route.get("matched"):
+        command = route.get("command") if isinstance(route.get("command"), list) else []
+        print(f"intent    {compact(route.get('intent_id'))}")
+        print(f"tier      {compact(route.get('tier'))}")
+        print(f"safe      {route.get('safe_to_execute', False)}")
+        print(f"command   {' '.join(str(item) for item in command) if command else '-'}")
+    else:
+        print(f"category  {compact(route.get('category'))}")
+        if proposal:
+            print(f"agenda    {compact(proposal.get('title'))}")
+            print(f"due       {compact(proposal.get('due_date'))}")
+            print(f"priority  {compact(proposal.get('priority'))}")
+            print(f"estimate  {compact(proposal.get('estimate_minutes'))} min")
+    if payload.get("save_reason"):
+        print(f"save      {payload.get('save_reason')}")
+    print(f"reason    {compact(route.get('reason'))}")
+    print()
+    print("next")
+    for command in next_commands:
+        print(f"  {command}")
+    return 0 if payload["ok"] else 2
+
+
+def request_payload(args: argparse.Namespace, text: str) -> dict[str, object]:
+    plan_args = argparse.Namespace(
+        text=[text],
+        source=args.source,
+        threshold=args.threshold,
+        save=False,
+    )
+    draft = draft_payload(plan_args, text)
+    saved_attempted = False
+
+    if not args.no_save:
+        route = ctos_route(draft.get("route"))
+        proposal = route_agenda_proposal(route)
+        if route.get("category") == "agenda_candidate" and proposal.get("recognized"):
+            save_args = argparse.Namespace(
+                text=[text],
+                source=args.source,
+                threshold=args.threshold,
+                save=True,
+            )
+            draft = draft_payload(save_args, text)
+            saved_attempted = True
+
+    inbox_result: dict[str, object] | None = None
+    inbox_payload: dict[str, object] = {}
+    show_inbox = args.inbox or (draft.get("state") == "saved_pending" and not args.no_inbox)
+    if show_inbox and not args.no_inbox:
+        inbox_result = run_capture([script("ctos-jarvis"), "inbox", "--json"], timeout=20)
+        inbox_payload = parse_json_result(inbox_result)
+
+    ok = bool(draft.get("ok")) and (inbox_result is None or bool(inbox_result.get("ok")))
+    next_commands: list[str] = []
+    if draft.get("state") == "saved_pending":
+        next_commands = [
+            "ctos-jarvis confirm latest --yes  # si correct",
+            "ctos-jarvis reject latest --reason \"...\"",
+        ]
+    else:
+        draft_next = draft.get("next") if isinstance(draft.get("next"), list) else []
+        next_commands = [str(item) for item in draft_next]
+
+    payload: dict[str, object] = {
+        "schema": 1,
+        "mode": "ctos-jarvis-request",
+        "ok": ok,
+        "source": args.source,
+        "input": text,
+        "save_mode": "off" if args.no_save else "auto",
+        "saved_attempted": saved_attempted,
+        "draft": draft,
+        "next": next_commands,
+        "steps": [
+            {
+                "name": "draft-save" if saved_attempted else "draft-plan",
+                "ok": bool(draft.get("ok")),
+                "state": draft.get("state"),
+            }
+        ],
+    }
+    if inbox_result is not None:
+        payload["inbox"] = inbox_payload
+        payload["steps"].append(compact_step("inbox", inbox_result))  # type: ignore[index]
+    return payload
+
+
+def cmd_request(args: argparse.Namespace) -> int:
+    if args.inbox and args.no_inbox:
+        print("choose --inbox or --no-inbox, not both", file=sys.stderr)
+        return 2
+    text = draft_text(args)
+    if not text:
+        print("text is required", file=sys.stderr)
+        return 2
+
+    payload = request_payload(args, text)
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0 if payload["ok"] else 2
+
+    draft = payload.get("draft") if isinstance(payload.get("draft"), dict) else {}
+    route = ctos_route(draft.get("route"))
+    proposal = route_agenda_proposal(route)
+    command = route.get("command") if isinstance(route.get("command"), list) else []
+
+    print("CTOS Jarvis request")
+    print("===================")
+    print(f"state     {draft.get('state', '-')}")
+    print(f"save      {payload.get('save_mode')}")
+    print(f"input     {payload.get('input')}")
+    print(f"mode      {compact(route.get('mode'))}")
+    if proposal:
+        print(f"agenda    {compact(proposal.get('title'))}")
+        print(f"due       {compact(proposal.get('due_date'))}")
+        print(f"priority  {compact(proposal.get('priority'))}")
+        print(f"estimate  {compact(proposal.get('estimate_minutes'))} min")
+    elif route.get("matched"):
+        print(f"intent    {compact(route.get('intent_id'))}")
+        print(f"safe      {route.get('safe_to_execute', False)}")
+        print(f"command   {' '.join(str(item) for item in command) if command else '-'}")
+    else:
+        print(f"category  {compact(route.get('category'))}")
+    if draft.get("save_reason"):
+        print(f"note      {draft.get('save_reason')}")
+
+    if "inbox" in payload:
+        inbox = payload.get("inbox") if isinstance(payload.get("inbox"), dict) else {}
+        counts = inbox.get("counts") if isinstance(inbox.get("counts"), dict) else {}
+        agenda = inbox.get("agenda") if isinstance(inbox.get("agenda"), dict) else {}
+        proposals = agenda.get("proposals") if isinstance(agenda.get("proposals"), list) else []
+        approvals = inbox.get("approvals") if isinstance(inbox.get("approvals"), list) else []
+        inbox_next = inbox.get("next") if isinstance(inbox.get("next"), list) else []
+        print()
+        print("jarvis inbox")
+        print("------------")
+        print(f"agenda     pending {counts.get('agenda_pending', 0)}")
+        for proposal_item in proposals[:5]:
+            if isinstance(proposal_item, dict):
+                print(
+                    f"  #{proposal_item.get('id')}  P{proposal_item.get('priority')}  "
+                    f"{proposal_item.get('due_date') or '-':<10} {proposal_item.get('title')}"
+                )
+        print(f"approvals  pending {counts.get('approval_pending', 0)}")
+        for approval in approvals[:5]:
+            if isinstance(approval, dict):
+                print(
+                    f"  #{approval.get('id')}  {approval.get('status')}  "
+                    f"T{approval.get('tier')}  {approval.get('action')}  {approval.get('title')}"
+                )
+        print()
+        print("next")
+        for command_text in inbox_next or payload.get("next", []):
+            print(f"  {command_text}")
+        return 0 if payload["ok"] else 2
+
+    print()
+    print("next")
+    for command_text in payload.get("next", []):
+        print(f"  {command_text}")
+    return 0 if payload["ok"] else 2
+
+
+def jarvis_chat_system(extra: str = "") -> str:
+    base = (
+        "Tu es CTOS Jarvis, assistant local pour les machines appartenant a l'operateur. "
+        "Tu peux expliquer, planifier et proposer des commandes CTOS, mais tu ne dois pas "
+        "pretendre avoir execute une action. Pour toute mutation agenda, VM, desktop, "
+        "service, paquet, reseau, stockage ou securite, propose une commande CTOS explicite "
+        "et garde la confirmation humaine. Reponds court, concret, en francais."
+    )
+    extra = extra.strip()
+    return f"{base}\n\nContexte CTOS courant:\n{extra}" if extra else base
+
+
+def chat_prompt(args: argparse.Namespace) -> str:
+    prompt = " ".join(args.prompt).strip()
+    if prompt == "-":
+        prompt = sys.stdin.read().strip()
+    return prompt
+
+
+def chat_command(args: argparse.Namespace, prompt: str, system: str) -> list[str]:
+    cmd = [
+        script("ctos-ai-chat"),
+        "--model",
+        args.model,
+        "--temperature",
+        str(args.temperature),
+        "--max-tokens",
+        str(args.max_tokens),
+        "--max-turns",
+        str(args.max_turns),
+        "--timeout",
+        str(args.timeout),
+        "--system",
+        system,
+    ]
+    if args.speak:
+        cmd.append("--speak")
+    if not args.ensure_server:
+        cmd.append("--no-ensure-server")
+    if args.stop_server:
+        cmd.append("--stop-server")
+    if prompt:
+        cmd.append(prompt)
+    return cmd
+
+
+def cmd_chat(args: argparse.Namespace) -> int:
+    prompt = chat_prompt(args)
+    brief_result: dict[str, object] | None = None
+    brief_text = ""
+    if args.brief:
+        brief_result = run_capture([script("ctos-ai"), "brief"], timeout=30)
+        if brief_result.get("ok"):
+            brief_text = str(brief_result.get("stdout") or "")
+        else:
+            brief_text = "brief unavailable: " + compact(brief_result.get("stderr") or brief_result.get("stdout"))
+
+    system = args.system.strip() if args.system else jarvis_chat_system(brief_text)
+    cmd = chat_command(args, prompt, system)
+    payload: dict[str, object] = {
+        "schema": 1,
+        "mode": "ctos-jarvis-chat",
+        "ok": True,
+        "plan": bool(args.plan),
+        "prompt_present": bool(prompt),
+        "brief": bool(args.brief),
+        "model": args.model,
+        "command": cmd,
+        "authority": "read-only chat; propose CTOS commands only",
+    }
+    if brief_result is not None:
+        payload["brief_step"] = compact_step("brief", brief_result)
+
+    if args.plan:
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print("CTOS Jarvis chat plan")
+            print("=====================")
+            print(user_command(cmd))
+            print()
+            print("authority  read-only chat; proposes CTOS commands only")
+        return 0
+
+    if args.json:
+        result = run_capture(cmd, timeout=max(args.timeout + 30, 60))
+        payload["ok"] = bool(result.get("ok"))
+        payload["result"] = compact_step("ctos-ai-chat", result)
+        payload["response"] = str(result.get("stdout") or "")
+        if result.get("stderr"):
+            payload["stderr"] = str(result.get("stderr") or "")
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0 if result.get("ok") else int(result.get("rc") or 1)
+
+    print("CTOS Jarvis chat")
+    print("================")
+    print(f"model      {args.model}")
+    print(f"brief      {bool(args.brief)}")
+    print("authority  read-only; actions stay as CTOS commands to confirm")
+    print()
+    sys.stdout.flush()
+    return run(cmd)
+
+
+def operator_command_to_argv(command: str) -> list[str]:
+    argv = shlex.split(command, comments=True)
+    if argv and argv[0] == "ctos-jarvis":
+        argv[0] = script("ctos-jarvis")
+    return argv
+
+
+def command_records_audio(command: str) -> bool:
+    argv = shlex.split(command, comments=True)
+    if not argv:
+        return False
+    if argv[0] == "ctos-jarvis":
+        argv = argv[1:]
+    command_name = argv[0] if argv else ""
+    if command_name in {"voice", "listen", "open-voice", "calibrate", "calibration", "session", "practice", "drill", "run"}:
+        return True
+    if command_name in {"sample", "collect", "collect-samples"} and "--plan" not in argv and "--from-wav" not in argv:
+        return True
+    if command_name in {"collect-next", "sample-next", "next-sample", "improve", "cycle", "advance"} and "--run" in argv:
+        return True
+    return False
+
+
+def maybe_add_yes(argv: list[str], *, yes: bool) -> list[str]:
+    if not yes or "--yes" in argv:
+        return argv
+    if len(argv) < 2:
+        return argv
+    if argv[1] in {"collect-next", "sample-next", "next-sample", "collect", "collect-samples", "improve", "cycle", "advance"}:
+        return [*argv, "--yes"]
+    return argv
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    manifest = Path(args.manifest).expanduser() if args.manifest else default_sample_manifest()
+    mature_cmd = [
+        script("ctos-jarvis"),
+        "mature-check",
+        "--json",
+        "--prefer",
+        args.prefer,
+        "--manifest",
+        str(manifest),
+    ]
+    if args.full:
+        mature_cmd.append("--full")
+    improve_cmd = [
+        script("ctos-jarvis"),
+        "improve",
+        "--json",
+        "--manifest",
+        str(manifest),
+        "--preset",
+        args.preset,
+    ]
+    collect_next_cmd = [
+        script("ctos-jarvis"),
+        "collect-next",
+        "--json",
+        "--manifest",
+        str(manifest),
+        "--preset",
+        args.preset,
+    ]
+    review_cmd = [script("ctos-jarvis"), "review", "--json"]
+
+    mature_result = run_capture(mature_cmd, timeout=120 if args.full else 60)
+    improve_result = run_capture(improve_cmd, timeout=60)
+    collect_next_result = run_capture(collect_next_cmd, timeout=30)
+    review_result = run_capture(review_cmd, timeout=30)
+
+    mature_payload = parse_json_result(mature_result)
+    improve_payload = parse_json_result(improve_result)
+    collect_next_payload = parse_json_result(collect_next_result)
+    review_payload = parse_json_result(review_result)
+    next_commands = status_next_commands(mature_payload, improve_payload, collect_next_payload, review_payload)
+
+    corpus = improve_payload.get("corpus") if isinstance(improve_payload.get("corpus"), dict) else {}
+    target = collect_next_payload.get("target") if isinstance(collect_next_payload.get("target"), dict) else {}
+    warnings = mature_payload.get("warnings") if isinstance(mature_payload.get("warnings"), list) else []
+    payload = {
+        "schema": 1,
+        "mode": "ctos-jarvis-status",
+        "ok": all(bool(result.get("ok")) for result in (mature_result, improve_result, collect_next_result, review_result)),
+        "full": args.full,
+        "manifest": str(manifest),
+        "readiness": mature_payload,
+        "improve": improve_payload,
+        "collect_next": collect_next_payload,
+        "review": review_payload,
+        "next": next_commands,
+        "steps": [
+            compact_step("mature-check", mature_result),
+            compact_step("improve", improve_result),
+            compact_step("collect-next", collect_next_result),
+            compact_step("review", review_result),
+        ],
+    }
+
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0 if payload["ok"] else 1
+
+    print("CTOS Jarvis status")
+    print("==================")
+    print(f"readiness  {mature_payload.get('state', 'unknown')}")
+    print(f"doctor     {mature_payload.get('doctor_state', '-')}")
+    print(f"corpus     {corpus.get('state', '-')}")
+    print(f"samples    {corpus.get('count', 0)}/{corpus.get('min_samples', '-')}")
+    print(f"verdict    {improve_payload.get('verdict', '-')}")
+    print(f"agenda     pending {review_pending_count(review_payload)}")
+    if target.get("phrase"):
+        print(f"target     {target.get('phrase')}")
+    if warnings:
+        print()
+        print("warnings")
+        for warning in warnings[:5]:
+            print(f"  - {warning}")
+    print()
+    print("next")
+    for command in next_commands:
+        print(f"  {command}")
+    return 0 if payload["ok"] else 1
+
+
+def cmd_bootstrap(args: argparse.Namespace) -> int:
+    manifest = Path(args.manifest).expanduser() if args.manifest else default_sample_manifest()
+    status_cmd = [
+        script("ctos-jarvis"),
+        "status",
+        "--json",
+        "--preset",
+        args.preset,
+        "--prefer",
+        args.prefer,
+        "--manifest",
+        str(manifest),
+    ]
+    if args.full:
+        status_cmd.append("--full")
+    status_result = run_capture(status_cmd, timeout=120 if args.full else 60)
+    status_payload = parse_json_result(status_result)
+    next_commands = status_payload.get("next") if isinstance(status_payload.get("next"), list) else []
+    command_text = str(next_commands[0]) if next_commands else "ctos-jarvis status"
+    records_audio = command_records_audio(command_text)
+
+    payload: dict[str, object] = {
+        "schema": 1,
+        "mode": "ctos-jarvis-bootstrap",
+        "ok": bool(status_result.get("ok")),
+        "run": bool(args.run),
+        "manifest": str(manifest),
+        "command": command_text,
+        "records_audio": records_audio,
+        "status": status_payload,
+        "status_step": compact_step("status", status_result),
+        "result": None,
+        "after": None,
+    }
+
+    if not args.run:
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return 0 if status_result.get("ok") else 1
+        readiness = status_payload.get("readiness") if isinstance(status_payload.get("readiness"), dict) else {}
+        improve = status_payload.get("improve") if isinstance(status_payload.get("improve"), dict) else {}
+        collect_next = status_payload.get("collect_next") if isinstance(status_payload.get("collect_next"), dict) else {}
+        target = collect_next.get("target") if isinstance(collect_next.get("target"), dict) else {}
+        print("CTOS Jarvis bootstrap")
+        print("=====================")
+        print(f"readiness  {readiness.get('state', 'unknown')}")
+        print(f"verdict    {improve.get('verdict', '-')}")
+        if target.get("phrase"):
+            print(f"target     {target.get('phrase')}")
+        print(f"action     {command_text}")
+        if records_audio:
+            print("audio      yes")
+        print()
+        print("run")
+        print("  ctos-jarvis bootstrap --run")
+        return 0 if status_result.get("ok") else 1
+
+    if args.json and records_audio and not args.yes:
+        payload["ok"] = False
+        payload["state"] = "refused_interactive_audio"
+        payload["reason"] = "interactive audio capture is not run in --json mode unless --yes is explicit"
+        payload["next"] = ["ctos-jarvis bootstrap --run", "ctos-jarvis collect-next --run"]
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 2
+
+    argv = maybe_add_yes(operator_command_to_argv(command_text), yes=args.yes)
+    if not argv:
+        print("no bootstrap command available", file=sys.stderr)
+        return 2
+
+    if args.json:
+        result = run_capture(argv, timeout=args.run_timeout)
+        after_result = run_capture(status_cmd, timeout=120 if args.full else 60)
+        payload["result"] = compact_step("run", result)
+        payload["after"] = parse_json_result(after_result) or compact_step("status-after", after_result)
+        payload["ok"] = bool(result.get("ok"))
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0 if result.get("ok") else 1
+
+    print("CTOS Jarvis bootstrap")
+    print("=====================")
+    print(f"running    {command_text}")
+    rc = run(argv)
+    print()
+    print("status")
+    status_after_cmd = [
+        script("ctos-jarvis"),
+        "status",
+        "--preset",
+        args.preset,
+        "--prefer",
+        args.prefer,
+        "--manifest",
+        str(manifest),
+    ]
+    if args.full:
+        status_after_cmd.append("--full")
+    run(status_after_cmd)
+    return rc
+
+
+def cmd_text(args: argparse.Namespace) -> int:
+    cmd = [
+        script("ctos-voice"),
+        "assistant",
+        *args.phrase,
+        "--model",
+        args.model,
+        "--max-tokens",
+        str(args.max_tokens),
+        "--threshold",
+        str(args.threshold),
+    ]
+    if args.save_agenda:
+        cmd.append("--save-agenda")
+    if args.no_actions:
+        cmd.append("--no-actions")
+    if args.json:
+        cmd.append("--json")
+    if not args.speak:
+        cmd.append("--no-speak")
+    return run(cmd)
+
+
+def cmd_voice(args: argparse.Namespace) -> int:
+    cmd = [
+        script("ctos-voice"),
+        "assistant-once",
+        "--seconds",
+        str(args.seconds),
+        "--model",
+        args.model,
+        "--max-tokens",
+        str(args.max_tokens),
+        "--threshold",
+        str(args.threshold),
+    ]
+    if args.from_wav:
+        cmd += ["--from-wav", args.from_wav]
+    if args.save_agenda:
+        cmd.append("--save-agenda")
+    if args.no_actions:
+        cmd.append("--no-actions")
+    if args.json:
+        cmd.append("--json")
+    if args.no_speak:
+        cmd.append("--no-speak")
+    return run(cmd)
+
+
+def cmd_listen(args: argparse.Namespace) -> int:
+    if args.execute_safe and args.save_agenda:
+        print("choose --execute-safe or --save-agenda, not both", file=sys.stderr)
+        return 2
+    if args.from_wav and args.keep_wav:
+        print("--from-wav and --keep-wav are mutually exclusive", file=sys.stderr)
+        return 2
+    if args.preprocess == "off" and args.preprocess_wav:
+        print("--preprocess-wav requires --preprocess auto or --preprocess normalize", file=sys.stderr)
+        return 2
+    if args.keep_backend and args.stop:
+        print("choose --keep-backend or --stop, not both", file=sys.stderr)
+        return 2
+
+    use_draft = not args.execute_safe
+    open_stt_base = [
+        script("ctos-voice-v2"),
+        "open-stt",
+        "--host",
+        args.host,
+        "--user",
+        args.user,
+        "--port",
+        str(args.port),
+        "--model",
+        args.model,
+    ]
+    transcribe_cmd = [
+        script("ctos-voice-v2"),
+        "stp-transcribe",
+        "--wyoming-port",
+        str(args.port),
+        "--target-tunnel",
+        "--host",
+        args.host,
+        "--user",
+        args.user,
+        "--record-seconds",
+        str(args.seconds),
+        "--preprocess",
+        args.preprocess,
+    ]
+    if args.from_wav:
+        transcribe_cmd += ["--from-wav", args.from_wav]
+    if args.keep_wav:
+        transcribe_cmd += ["--keep-wav", args.keep_wav]
+    if args.preprocess_wav:
+        transcribe_cmd += ["--preprocess-wav", args.preprocess_wav]
+    if args.execute_safe:
+        transcribe_cmd.append("--execute-safe")
+    if args.no_transcript_guard:
+        transcribe_cmd.append("--no-transcript-guard")
+    if args.no_speak:
+        transcribe_cmd.append("--no-speak")
+    if args.json or use_draft:
+        transcribe_cmd.append("--json")
+
+    if args.plan:
+        print("CTOS Jarvis open-STT listen plan")
+        print("================================")
+        print("status")
+        print("  " + " ".join([*open_stt_base, "status"]))
+        if not args.no_start:
+            print("start if missing")
+            print("  " + " ".join([*open_stt_base, "start"]))
+        print("listen")
+        print("  " + " ".join(transcribe_cmd))
+        if use_draft:
+            draft_preview = [
+                "ctos-jarvis",
+                "draft",
+                "<transcript>",
+                "--source",
+                "stt",
+                "--threshold",
+                str(args.threshold),
+            ]
+            if args.save_agenda:
+                draft_preview.append("--save")
+            print("draft")
+            print("  " + " ".join(draft_preview))
+        print("cleanup")
+        if args.keep_backend:
+            print("  keep open-STT backend running for the next prompt")
+        else:
+            print("  stop only if this command started the backend")
+            print("  " + " ".join([*open_stt_base, "stop"]))
+        return 0
+
+    steps: list[tuple[str, dict[str, object]]] = []
+    status_result = run_capture([*open_stt_base, "status", "--json"], timeout=45)
+    steps.append(("open-STT status", status_result))
+    status_payload = parse_json_result(status_result)
+    backend_running = status_result.get("ok") is True and open_stt_running(status_payload)
+    started_backend = False
+
+    if not backend_running:
+        if args.no_start:
+            result = {
+                "command": [],
+                "rc": 2,
+                "ok": False,
+                "stdout": "",
+                "stderr": "open-STT backend is not running and --no-start was used",
+            }
+            steps.append(("open-STT start skipped", result))
+            payload = {
+                "schema": 1,
+                "mode": "ctos-jarvis-listen",
+                "ok": False,
+                "state": "backend_not_running",
+                "steps": [
+                    {
+                        "name": name,
+                        **step,
+                        "stdout_preview": preview(str(step.get("stdout", ""))),
+                        "stderr_preview": preview(str(step.get("stderr", ""))),
+                    }
+                    for name, step in steps
+                ],
+            }
+            if args.json:
+                print(json.dumps(payload, ensure_ascii=False, indent=2))
+            else:
+                print("CTOS Jarvis open-STT listen")
+                print("===========================")
+                print("state backend_not_running")
+                print("next  ctos-jarvis listen --seconds 5")
+            return 2
+
+        start_result = run_capture([*open_stt_base, "start", "--json"], timeout=930)
+        steps.append(("open-STT start", start_result))
+        if not start_result.get("ok"):
+            payload = {
+                "schema": 1,
+                "mode": "ctos-jarvis-listen",
+                "ok": False,
+                "state": "backend_start_failed",
+                "steps": [
+                    {
+                        "name": name,
+                        **step,
+                        "stdout_preview": preview(str(step.get("stdout", ""))),
+                        "stderr_preview": preview(str(step.get("stderr", ""))),
+                    }
+                    for name, step in steps
+                ],
+            }
+            if args.json:
+                print(json.dumps(payload, ensure_ascii=False, indent=2))
+            else:
+                print("CTOS Jarvis open-STT listen")
+                print("===========================")
+                print("state backend_start_failed")
+                detail = str(start_result.get("stderr") or start_result.get("stdout") or "")
+                if detail:
+                    print(preview(detail, 500))
+            return int(start_result.get("rc") or 1)
+        started_backend = True
+
+    transcribe_result = run_capture(transcribe_cmd, timeout=max(90, int(args.seconds) + 90))
+    steps.append(("open-STT transcribe", transcribe_result))
+    transcribe_payload = parse_json_result(transcribe_result)
+
+    draft_result: dict[str, object] | None = None
+    draft_payload: dict[str, object] = {}
+    draft_skipped = ""
+    if use_draft and transcribe_payload:
+        recognition = transcribe_payload.get("recognition") if isinstance(transcribe_payload.get("recognition"), dict) else {}
+        guard = transcribe_payload.get("transcript_guard") if isinstance(transcribe_payload.get("transcript_guard"), dict) else {}
+        transcript = str(recognition.get("transcript") or "").strip() if isinstance(recognition, dict) else ""
+        if transcript and guard.get("route_allowed"):
+            draft_cmd = [
+                script("ctos-jarvis"),
+                "draft",
+                transcript,
+                "--source",
+                "stt",
+                "--threshold",
+                str(args.threshold),
+                "--json",
+            ]
+            if args.save_agenda:
+                draft_cmd.append("--save")
+            draft_result = run_capture(draft_cmd, timeout=45)
+            draft_payload = parse_json_result(draft_result)
+            steps.append(("ctos-jarvis draft", draft_result))
+            transcribe_payload["draft_payload"] = draft_payload
+            transcribe_payload["draft_step"] = compact_step("ctos-jarvis draft", draft_result)
+            transcribe_payload["route_payload"] = draft_payload
+            transcribe_payload["route"] = compact_step("ctos-jarvis draft", draft_result)
+        elif transcript:
+            draft_skipped = compact(guard.get("reason"), "transcript guard blocked routing")
+            transcribe_payload["draft_skipped"] = draft_skipped
+        else:
+            draft_skipped = "no transcript"
+            transcribe_payload["draft_skipped"] = draft_skipped
+
+    stop_result: dict[str, object] | None = None
+    if args.stop or (started_backend and not args.keep_backend):
+        stop_result = run_capture([*open_stt_base, "stop", "--json"], timeout=90)
+        steps.append(("open-STT stop", stop_result))
+
+    ok = (
+        bool(transcribe_result.get("ok"))
+        and (draft_result is None or bool(draft_result.get("ok")))
+        and (stop_result is None or bool(stop_result.get("ok")))
+    )
+    backend_left_running = (backend_running and not args.stop) or (started_backend and args.keep_backend)
+    payload = {
+        "schema": 1,
+        "mode": "ctos-jarvis-listen",
+        "ok": ok,
+        "state": "ok" if ok else "failed",
+        "backend_was_running": backend_running,
+        "backend_started": started_backend,
+        "backend_left_running": backend_left_running,
+        "steps": [
+            {
+                "name": name,
+                **step,
+                "stdout_preview": preview(str(step.get("stdout", ""))),
+                "stderr_preview": preview(str(step.get("stderr", ""))),
+            }
+            for name, step in steps
+        ],
+    }
+    if transcribe_payload:
+        payload["transcribe"] = transcribe_payload
+    if draft_result is not None:
+        payload["draft"] = draft_payload
+    elif draft_skipped:
+        payload["draft_skipped"] = draft_skipped
+
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print("CTOS Jarvis open-STT listen")
+        print("===========================")
+        print(f"state   {payload['state']}")
+        print(f"backend {'already running' if backend_running else ('started' if started_backend else 'not started')}")
+        if backend_left_running:
+            print("backend kept running")
+        elif stop_result is not None:
+            print(f"cleanup {'ok' if stop_result.get('ok') else 'failed'}")
+        print()
+        if transcribe_payload:
+            recognition = transcribe_payload.get("recognition") if isinstance(transcribe_payload.get("recognition"), dict) else {}
+            guard = transcribe_payload.get("transcript_guard") if isinstance(transcribe_payload.get("transcript_guard"), dict) else {}
+            transcript = str(recognition.get("transcript") or "").strip() if isinstance(recognition, dict) else ""
+            print(f"transcript  {transcript or '-'}")
+            if isinstance(guard, dict):
+                print(f"guard       {compact(guard.get('state'))} - {compact(guard.get('reason'))}")
+            if draft_payload:
+                route = ctos_route(draft_payload)
+                proposal = route_agenda_proposal(route)
+                print(f"draft       {compact(draft_payload.get('state'))}")
+                if route:
+                    print(
+                        "route       "
+                        f"mode={compact(route.get('mode'))} "
+                        f"matched={compact(route.get('matched'))} "
+                        f"category={compact(route.get('category'))}"
+                    )
+                if proposal:
+                    print(
+                        "proposal    "
+                        f"title={compact(proposal.get('title'))} "
+                        f"due={compact(proposal.get('due_date'))} "
+                        f"p={compact(proposal.get('priority'))} "
+                        f"estimate={compact(proposal.get('estimate_minutes'))}m"
+                    )
+            elif draft_skipped:
+                print(f"draft       skipped - {draft_skipped}")
+        elif transcribe_result.get("stdout"):
+            print(transcribe_result["stdout"])
+        if transcribe_result.get("stderr"):
+            print(transcribe_result["stderr"], file=sys.stderr)
+        if not ok:
+            print()
+            print("next  ctos-voice-v2 mic-check --record-seconds 3 --keep-wav /tmp/ctos-open-stt-mic.wav")
+    if ok:
+        return 0
+    if draft_result is not None and not draft_result.get("ok"):
+        return int(draft_result.get("rc") or 1)
+    return int(transcribe_result.get("rc") or 1)
+
+
+def cmd_calibrate(args: argparse.Namespace) -> int:
+    if args.from_wav and args.keep_wav:
+        print("--from-wav and --keep-wav are mutually exclusive", file=sys.stderr)
+        return 2
+    if args.save_agenda and args.execute_safe:
+        print("choose --save-agenda or --execute-safe, not both", file=sys.stderr)
+        return 2
+
+    delete_after = False
+    if args.keep_wav:
+        wav_path = Path(args.keep_wav).expanduser()
+    elif args.from_wav:
+        wav_path = Path(args.from_wav).expanduser()
+    else:
+        handle = tempfile.NamedTemporaryFile(prefix="ctos-jarvis-calibrate-", suffix=".wav", delete=False, dir="/tmp")
+        handle.close()
+        wav_path = Path(handle.name)
+
+    if args.preprocess_wav:
+        preprocess_wav = Path(args.preprocess_wav).expanduser()
+    else:
+        handle = tempfile.NamedTemporaryFile(prefix="ctos-jarvis-calibrate-stt-", suffix=".wav", delete=False, dir="/tmp")
+        handle.close()
+        preprocess_wav = Path(handle.name)
+        delete_after = args.clean
+
+    cmd = [
+        script("ctos-jarvis"),
+        "listen",
+        "--seconds",
+        str(args.seconds),
+        "--host",
+        args.host,
+        "--user",
+        args.user,
+        "--port",
+        str(args.port),
+        "--model",
+        args.model,
+        "--preprocess",
+        args.preprocess,
+        "--threshold",
+        str(args.threshold),
+        "--preprocess-wav",
+        str(preprocess_wav),
+        "--json",
+        "--no-speak",
+    ]
+    if args.from_wav:
+        cmd += ["--from-wav", str(wav_path)]
+    else:
+        cmd += ["--keep-wav", str(wav_path)]
+    if args.no_start:
+        cmd.append("--no-start")
+    if args.keep_backend and not args.stop:
+        cmd.append("--keep-backend")
+    if args.stop:
+        cmd.append("--stop")
+    if args.save_agenda:
+        cmd.append("--save-agenda")
+    if args.execute_safe:
+        cmd.append("--execute-safe")
+    if args.no_transcript_guard:
+        cmd.append("--no-transcript-guard")
+
+    result = run_capture(cmd, timeout=max(120, int(args.seconds) + 930))
+    payload = parse_json_result(result)
+    if payload:
+        payload["calibration"] = {
+            "audio": str(wav_path),
+            "preprocess_wav": str(preprocess_wav),
+            "save_agenda_requested": bool(args.save_agenda),
+            "execute_safe_requested": bool(args.execute_safe),
+        }
+
+    if args.clean:
+        if not args.keep_wav and not args.from_wav:
+            wav_path.unlink(missing_ok=True)
+        if not args.preprocess_wav:
+            preprocess_wav.unlink(missing_ok=True)
+
+    if args.json:
+        if payload:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print(json.dumps({
+                "schema": 1,
+                "mode": "ctos-jarvis-calibrate",
+                "ok": False,
+                "command": result.get("command"),
+                "rc": result.get("rc"),
+                "stdout": result.get("stdout"),
+                "stderr": result.get("stderr"),
+            }, ensure_ascii=False, indent=2))
+        return 0 if bool(payload.get("ok")) else int(result.get("rc") or 1)
+
+    print("CTOS Jarvis calibration")
+    print("=======================")
+    if not payload:
+        print("state       failed")
+        print(f"rc          {result.get('rc')}")
+        detail = str(result.get("stderr") or result.get("stdout") or "")
+        if detail:
+            print(f"detail      {preview(detail, 700)}")
+        return int(result.get("rc") or 1)
+
+    transcribe = payload.get("transcribe") if isinstance(payload.get("transcribe"), dict) else {}
+    audio = nested(transcribe, "audio_analysis")
+    stt_audio = nested(transcribe, "stt_audio_analysis")
+    preprocess = nested(transcribe, "preprocess")
+    recognition = nested(transcribe, "recognition")
+    guard = nested(transcribe, "transcript_guard")
+    route_payload = nested(transcribe, "route_payload")
+    route = ctos_route(route_payload)
+    proposal = route_agenda_proposal(route)
+    execution = route_execution(route_payload, route)
+    top_candidate = route_top_candidate(route)
+    agenda_save = {}
+    if isinstance(route_payload, dict) and isinstance(route_payload.get("agenda_save"), dict):
+        agenda_save = route_payload.get("agenda_save")  # type: ignore[assignment]
+    elif isinstance(route.get("agenda_save"), dict):
+        agenda_save = route.get("agenda_save")  # type: ignore[assignment]
+    draft_payload = nested(transcribe, "draft_payload")
+
+    print(f"state       {compact(payload.get('state'))}")
+    print(f"audio       {wav_path}")
+    if isinstance(audio, dict):
+        activity = audio.get("activity") if isinstance(audio.get("activity"), dict) else {}
+        print(
+            "mic         "
+            f"state={compact(audio.get('state'))} "
+            f"rms={compact(audio.get('rms_pct'))}% "
+            f"peak={compact(audio.get('peak_pct'))}% "
+            f"active={compact(activity.get('active_pct') if isinstance(activity, dict) else None)}%"
+        )
+    if isinstance(preprocess, dict):
+        print(
+            "preprocess  "
+            f"{compact(preprocess.get('state'))} "
+            f"gain={compact(preprocess.get('gain'))} "
+            f"wav={preprocess_wav}"
+        )
+    if isinstance(stt_audio, dict):
+        activity = stt_audio.get("activity") if isinstance(stt_audio.get("activity"), dict) else {}
+        print(
+            "stt-audio   "
+            f"state={compact(stt_audio.get('state'))} "
+            f"rms={compact(stt_audio.get('rms_pct'))}% "
+            f"peak={compact(stt_audio.get('peak_pct'))}% "
+            f"active={compact(activity.get('active_pct') if isinstance(activity, dict) else None)}%"
+        )
+    transcript = compact(nested(recognition, "transcript"), "")
+    print(f"transcript  {transcript or '-'}")
+    if isinstance(guard, dict):
+        print(f"guard       {compact(guard.get('state'))} - {compact(guard.get('reason'))}")
+    if isinstance(route, dict) and route:
+        print(
+            "route       "
+            f"mode={compact(route.get('mode'))} "
+            f"matched={compact(route.get('matched'))} "
+            f"category={compact(route.get('category'))} "
+            f"reason={compact(route.get('reason'))}"
+        )
+    if isinstance(draft_payload, dict) and draft_payload:
+        print(f"draft       {compact(draft_payload.get('state'))}")
+    if isinstance(top_candidate, dict) and top_candidate:
+        print(
+            "candidate   "
+            f"id={compact(top_candidate.get('intent_id'))} "
+            f"score={compact(top_candidate.get('score'))} "
+            f"phrase={compact(top_candidate.get('phrase'))}"
+        )
+    if isinstance(proposal, dict) and proposal:
+        print(
+            "proposal    "
+            f"recognized={compact(proposal.get('recognized'))} "
+            f"title={compact(proposal.get('title'))} "
+            f"due={compact(proposal.get('due_date'))} "
+            f"p={compact(proposal.get('priority'))} "
+            f"estimate={compact(proposal.get('estimate_minutes'))}m"
+        )
+    if isinstance(agenda_save, dict) and agenda_save:
+        print(
+            "agenda-save "
+            f"attempted={compact(agenda_save.get('attempted'))} "
+            f"rc={compact(agenda_save.get('rc'))} "
+            f"reason={compact(agenda_save.get('reason'))}"
+        )
+    if isinstance(execution, dict) and execution:
+        print(
+            "execution   "
+            f"kind={compact(execution.get('kind'))} "
+            f"rc={compact(execution.get('rc'))} "
+            f"reason={compact(execution.get('reason'))}"
+        )
+    print()
+    print("next")
+    for step in calibration_next_steps(payload, saved_requested=args.save_agenda):
+        print(f"  - {step}")
+    return 0 if bool(payload.get("ok")) else int(result.get("rc") or 1)
+
+
+def cmd_session(args: argparse.Namespace) -> int:
+    if args.rounds < 1:
+        print("--rounds must be >= 1", file=sys.stderr)
+        return 2
+    if args.save_agenda and args.execute_safe:
+        print("choose --save-agenda or --execute-safe, not both", file=sys.stderr)
+        return 2
+    if args.inbox and args.no_inbox:
+        print("choose --inbox or --no-inbox, not both", file=sys.stderr)
+        return 2
+    if args.inbox and args.review:
+        print("choose --inbox or --review, not both", file=sys.stderr)
+        return 2
+
+    show_inbox = args.inbox or (args.save_agenda and not args.no_inbox and not args.no_review and not args.review)
+    show_review = args.review or (args.save_agenda and args.no_inbox and not args.no_review)
+
+    print("CTOS Jarvis voice session")
+    print("=========================")
+    print(f"rounds      {args.rounds}")
+    print(f"seconds     {args.seconds}")
+    print(f"model       {args.model}")
+    print(f"threshold   {args.threshold}")
+    print(f"agenda-save {args.save_agenda}")
+    print(f"cleanup     {'keep backend running' if args.keep_backend else 'stop backend at end'}")
+    print(f"inbox       {show_inbox}")
+    print(f"review      {show_review}")
+    print(f"preflight   {not args.no_preflight}")
+    print()
+    sys.stdout.flush()
+
+    if not args.no_preflight:
+        preflight: list[tuple[str, dict[str, object]]] = [
+            ("microphone", run_capture([script("ctos-audio"), "mic-status"], timeout=10)),
+            (
+                "open-STT status",
+                run_capture([
+                    script("ctos-voice-v2"),
+                    "open-stt",
+                    "--host",
+                    args.host,
+                    "--user",
+                    args.user,
+                    "--port",
+                    str(args.port),
+                    "--model",
+                    args.model,
+                    "status",
+                    "--json",
+                ], timeout=45),
+            ),
+            ("agenda review", run_capture([script("ctos-jarvis"), "review", "--json"], timeout=20)),
+        ]
+        print("preflight")
+        print("---------")
+        for label, result in preflight:
+            marker = "OK" if result.get("ok") else "WARN"
+            detail = preview(str(result.get("stdout") or result.get("stderr") or ""), 180)
+            print(f"{marker:4} {label} rc={result.get('rc')} {detail}")
+        print()
+        if args.strict_preflight and not all(bool(result.get("ok")) for _, result in preflight):
+            print("state preflight_failed")
+            print("next  ctos-jarvis doctor")
+            return 1
+        sys.stdout.flush()
+
+    exit_codes: list[int] = []
+    interrupted = False
+    try:
+        for index in range(1, args.rounds + 1):
+            if not args.no_prompt:
+                try:
+                    input(f"Round {index}/{args.rounds}: appuie sur Entree, puis parle apres le depart de l'enregistrement. ")
+                except EOFError:
+                    pass
+
+            cmd = [
+                script("ctos-jarvis"),
+                "calibrate",
+                "--seconds",
+                str(args.seconds),
+                "--host",
+                args.host,
+                "--user",
+                args.user,
+                "--port",
+                str(args.port),
+                "--model",
+                args.model,
+                "--preprocess",
+                args.preprocess,
+                "--threshold",
+                str(args.threshold),
+            ]
+            if args.from_wav:
+                cmd += ["--from-wav", args.from_wav]
+            if args.no_start:
+                cmd.append("--no-start")
+            if args.save_agenda:
+                cmd.append("--save-agenda")
+            if args.execute_safe:
+                cmd.append("--execute-safe")
+            if args.no_transcript_guard:
+                cmd.append("--no-transcript-guard")
+            if args.clean:
+                cmd.append("--clean")
+
+            last_round = index == args.rounds
+            if args.keep_backend or not last_round:
+                cmd.append("--keep-backend")
+            else:
+                cmd.append("--stop")
+
+            print()
+            print(f"--- round {index}/{args.rounds} ---")
+            sys.stdout.flush()
+            rc = run(cmd)
+            exit_codes.append(rc)
+
+            if rc == 0 and args.stop_on_success:
+                print()
+                print("session  stopping after first successful round")
+                break
+            if rc != 0 and args.stop_on_failure:
+                print()
+                print(f"session  stopping after failed round rc={rc}")
+                break
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\nsession  interrupted", file=sys.stderr)
+    finally:
+        if interrupted and not args.keep_backend:
+            print("cleanup  stopping open-STT backend after interrupted session")
+            run([
+                script("ctos-voice-v2"),
+                "open-stt",
+                "--host",
+                args.host,
+                "--user",
+                args.user,
+                "--port",
+                str(args.port),
+                "--model",
+                args.model,
+                "stop",
+            ])
+
+    print()
+    if interrupted:
+        print("state interrupted")
+        return 130
+    failed = [rc for rc in exit_codes if rc != 0]
+    state_rc = failed[-1] if failed else 0
+    if failed:
+        print(f"state failed rounds={len(failed)}/{len(exit_codes)} last_rc={exit_codes[-1]}")
+    else:
+        print(f"state ok rounds={len(exit_codes)}")
+
+    review_rc: int | None = None
+    inbox_rc: int | None = None
+    if show_inbox:
+        print()
+        print("jarvis inbox")
+        print("------------")
+        sys.stdout.flush()
+        inbox_rc = run([script("ctos-jarvis"), "inbox"])
+    elif show_review:
+        print()
+        print("agenda review")
+        print("-------------")
+        sys.stdout.flush()
+        review_rc = run([script("ctos-jarvis"), "review"])
+
+    print()
+    if failed:
+        print("next  ctos-jarvis doctor")
+    elif args.save_agenda and (inbox_rc == 0 or review_rc == 0):
+        print("next  ctos-jarvis confirm latest --yes  # only if the inbox/review proposal is correct")
+    elif args.save_agenda:
+        print("next  ctos-jarvis inbox")
+    else:
+        print("next  ctos-jarvis session --save-agenda")
+    if state_rc == 0 and inbox_rc not in (None, 0):
+        return inbox_rc
+    if state_rc == 0 and review_rc not in (None, 0):
+        return review_rc
+    return state_rc
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    if args.inbox and args.no_inbox:
+        print("choose --inbox or --no-inbox, not both", file=sys.stderr)
+        return 2
+    if args.inbox and args.review:
+        print("choose --inbox or --review, not both", file=sys.stderr)
+        return 2
+
+    inbox_default = (not args.no_save_agenda and not args.execute_safe) or args.inbox
+
+    cmd = [
+        script("ctos-jarvis"),
+        "session",
+        "--rounds",
+        str(args.rounds),
+        "--seconds",
+        str(args.seconds),
+        "--host",
+        args.host,
+        "--user",
+        args.user,
+        "--port",
+        str(args.port),
+        "--model",
+        args.model,
+        "--preprocess",
+        args.preprocess,
+        "--threshold",
+        str(args.threshold),
+    ]
+    if args.from_wav:
+        cmd += ["--from-wav", args.from_wav]
+    if not args.no_save_agenda and not args.execute_safe:
+        cmd.append("--save-agenda")
+    if args.execute_safe:
+        cmd.append("--execute-safe")
+    if args.no_start:
+        cmd.append("--no-start")
+    if args.keep_backend:
+        cmd.append("--keep-backend")
+    if args.strict_preflight:
+        cmd.append("--strict-preflight")
+    if args.no_preflight:
+        cmd.append("--no-preflight")
+    if args.no_transcript_guard:
+        cmd.append("--no-transcript-guard")
+    if args.no_prompt:
+        cmd.append("--no-prompt")
+    if args.clean:
+        cmd.append("--clean")
+    if args.stop_on_success:
+        cmd.append("--stop-on-success")
+    if args.stop_on_failure:
+        cmd.append("--stop-on-failure")
+    if args.review:
+        cmd.append("--review")
+    elif inbox_default and not args.no_inbox and not args.no_review:
+        cmd.append("--inbox")
+    if args.no_inbox:
+        cmd.append("--no-inbox")
+    if args.no_review:
+        cmd.append("--no-review")
+
+    if args.plan:
+        print("CTOS Jarvis run plan")
+        print("====================")
+        print(" ".join(cmd))
+        print()
+        print("Guarantees:")
+        if args.execute_safe:
+            print("  - executes only CTOS-owned Tier 0/1 safe actions")
+        elif args.no_save_agenda:
+            print("  - agenda proposal staging is disabled")
+        else:
+            print("  - stages agenda proposals only; no agenda write")
+            if not args.no_inbox and not args.no_review and not args.review:
+                print("  - ends on ctos-jarvis inbox for review")
+            elif args.review or (args.no_inbox and not args.no_review):
+                print("  - ends on agenda-only review")
+        print("  - typed confirmation remains the only agenda write path")
+        print("  - use --execute-safe only for CTOS-owned Tier 0/1 actions, not agenda writes")
+        return 0
+
+    print("CTOS Jarvis run")
+    print("================")
+    print("mode       daily open-STT operator loop")
+    print(f"agenda     {'stage proposals' if not args.no_save_agenda and not args.execute_safe else 'disabled'}")
+    print(f"actions    {'execute Tier 0/1 safe actions' if args.execute_safe else 'plan/stage only'}")
+    print(f"inbox      {inbox_default and not args.no_inbox and not args.no_review and not args.review}")
+    print("confirm    typed only after inbox: ctos-jarvis confirm latest --yes")
+    print("audio      Waybar VOL, Super+PageUp/PageDown, ctos-audio mixer")
+    print()
+    sys.stdout.flush()
+    return run(cmd)
+
+
+def cmd_sample(args: argparse.Namespace) -> int:
+    label = " ".join(args.label).strip()
+    if args.name:
+        label = args.name.strip()
+    if not label:
+        print("sample label is required", file=sys.stderr)
+        return 2
+    if args.from_wav and args.seconds <= 0:
+        print("--seconds is ignored with --from-wav but must stay positive", file=sys.stderr)
+        return 2
+    if not args.from_wav and args.seconds <= 0:
+        print("--seconds must be positive", file=sys.stderr)
+        return 2
+
+    sample_dir = Path(args.dir).expanduser() if args.dir else default_sample_dir()
+    manifest = Path(args.manifest).expanduser() if args.manifest else sample_dir / "manifest.jsonl"
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    wav_path = sample_dir / f"{stamp}__{safe_slug(label)}.wav"
+
+    if args.plan:
+        print("CTOS Jarvis sample plan")
+        print("=======================")
+        print(f"sample_dir {sample_dir}")
+        print(f"manifest   {manifest}")
+        print(f"wav        {wav_path}")
+        print()
+        if args.from_wav:
+            print(f"copy       {Path(args.from_wav).expanduser()} -> {wav_path}")
+        else:
+            print("record")
+            print(f"  {script('ctos-voice')} record-once --seconds {args.seconds:g} --out {shlex.quote(str(wav_path))} --json")
+        print("analyze")
+        print(f"  {script('ctos-voice-v2')} mic-check --from-wav {shlex.quote(str(wav_path))} --json")
+        print("append")
+        print(f"  {manifest}")
+        print()
+        print("replay")
+        print(f"  ctos-jarvis calibrate --from-wav {shlex.quote(str(wav_path))} --no-start")
+        print(f"  ctos-jarvis calibrate --from-wav {shlex.quote(str(wav_path))} --save-agenda")
+        print(f"  ctos-voice-v2 regression --manifest {shlex.quote(str(manifest))}")
+        print(f"  ctos-voice-v2 regression --manifest {shlex.quote(str(manifest))} --backend open-stt --target-tunnel")
+        return 0
+
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+
+    if args.from_wav:
+        source = Path(args.from_wav).expanduser()
+        if not source.exists():
+            print(f"source WAV not found: {source}", file=sys.stderr)
+            return 2
+        shutil.copy2(source, wav_path)
+        record_result = {
+            "command": ["copy", str(source), str(wav_path)],
+            "rc": 0,
+            "ok": True,
+            "stdout": str(wav_path),
+            "stderr": "",
+        }
+    else:
+        record_result = run_capture(
+            [script("ctos-voice"), "record-once", "--seconds", str(args.seconds), "--out", str(wav_path), "--json"],
+            timeout=max(30, int(args.seconds) + 20),
+        )
+        if not record_result.get("ok"):
+            if args.json:
+                print(json.dumps({
+                    "ok": False,
+                    "stage": "record",
+                    "record": record_result,
+                }, ensure_ascii=False, indent=2))
+            else:
+                print("CTOS Jarvis sample")
+                print("==================")
+                print("state record_failed")
+                detail = str(record_result.get("stderr") or record_result.get("stdout") or "")
+                if detail:
+                    print(preview(detail, 500))
+            return int(record_result.get("rc") or 1)
+
+    analysis_result = run_capture(
+        [script("ctos-voice-v2"), "mic-check", "--from-wav", str(wav_path), "--json"],
+        timeout=45,
+    )
+    analysis_payload = parse_json_result(analysis_result)
+    row: dict[str, object] = {
+        "schema": 1,
+        "kind": "ctos-jarvis-open-stt-sample",
+        "created_at": stamp,
+        "label": label,
+        "expected_text": label,
+        "file": wav_path.name if manifest.parent.resolve() == wav_path.parent.resolve() else str(wav_path),
+        "seconds": args.seconds,
+        "recommended_replay": [
+            f"ctos-jarvis calibrate --from-wav {shlex.quote(str(wav_path))} --no-start",
+            f"ctos-jarvis calibrate --from-wav {shlex.quote(str(wav_path))} --save-agenda",
+            f"ctos-voice-v2 regression --manifest {shlex.quote(str(manifest))}",
+            f"ctos-voice-v2 regression --manifest {shlex.quote(str(manifest))} --backend open-stt --target-tunnel",
+        ],
+    }
+    if args.intent_id:
+        row["intent_id"] = args.intent_id
+    if args.note:
+        row["note"] = args.note
+    if analysis_payload:
+        row["audio_state"] = nested(analysis_payload, "analysis", "state") or analysis_payload.get("state")
+        row["audio_rms_pct"] = nested(analysis_payload, "analysis", "rms_pct") or analysis_payload.get("rms_pct")
+        row["audio_peak_pct"] = nested(analysis_payload, "analysis", "peak_pct") or analysis_payload.get("peak_pct")
+
+    with manifest.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+
+    payload = {
+        "ok": bool(record_result.get("ok")) and bool(analysis_result.get("ok")),
+        "sample_dir": str(sample_dir),
+        "manifest": str(manifest),
+        "wav": str(wav_path),
+        "row": row,
+        "record": record_result,
+        "analysis": analysis_payload or analysis_result,
+    }
+
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0 if payload["ok"] else 1
+
+    print("CTOS Jarvis sample")
+    print("==================")
+    print(f"state      {'ok' if payload['ok'] else 'warning'}")
+    print(f"label      {label}")
+    print(f"wav        {wav_path}")
+    print(f"manifest   {manifest}")
+    if analysis_payload:
+        analysis = analysis_payload.get("analysis") if isinstance(analysis_payload.get("analysis"), dict) else analysis_payload
+        if isinstance(analysis, dict):
+            activity = analysis.get("activity") if isinstance(analysis.get("activity"), dict) else {}
+            print(
+                "audio      "
+                f"state={compact(analysis.get('state'))} "
+                f"rms={compact(analysis.get('rms_pct'))}% "
+                f"peak={compact(analysis.get('peak_pct'))}% "
+                f"active={compact(activity.get('active_pct') if isinstance(activity, dict) else None)}%"
+            )
+            if analysis.get("recommendation"):
+                print(f"advice     {analysis.get('recommendation')}")
+    elif analysis_result.get("stderr") or analysis_result.get("stdout"):
+        print(f"analysis   {preview(str(analysis_result.get('stderr') or analysis_result.get('stdout')), 500)}")
+    print()
+    print("replay")
+    print(f"  ctos-jarvis calibrate --from-wav {shlex.quote(str(wav_path))} --no-start")
+    print(f"  ctos-jarvis calibrate --from-wav {shlex.quote(str(wav_path))} --save-agenda")
+    print(f"  ctos-voice-v2 regression --manifest {shlex.quote(str(manifest))}")
+    print(f"  ctos-voice-v2 regression --manifest {shlex.quote(str(manifest))} --backend open-stt --target-tunnel")
+    return 0 if payload["ok"] else 1
+
+
+def collect_phrases(args: argparse.Namespace) -> list[str]:
+    phrases: list[str] = []
+    if args.phrase:
+        phrases.extend(item.strip() for item in args.phrase if item.strip())
+    if args.phrases:
+        joined = " ".join(args.phrases).strip()
+        if joined:
+            phrases.append(joined)
+    if not phrases:
+        phrases.extend(COLLECT_PRESETS[args.preset])
+    seen: set[str] = set()
+    unique: list[str] = []
+    for phrase in phrases:
+        normalized = " ".join(phrase.split())
+        key = normalized.lower()
+        if normalized and key not in seen:
+            seen.add(key)
+            unique.append(normalized)
+    return unique
+
+
+def collect_intent_id(phrase: str, *, enabled: bool) -> str | None:
+    if not enabled:
+        return None
+    return COLLECT_INTENT_IDS.get(" ".join(phrase.lower().split()))
+
+
+def collect_preflight_steps() -> list[dict[str, object]]:
+    checks: list[tuple[str, list[str]]] = [
+        ("audio output", [script("ctos-audio"), "status"]),
+        ("microphone", [script("ctos-audio"), "mic-status"]),
+        ("audio doctor", [script("ctos-audio"), "doctor", "--json"]),
+    ]
+    return [
+        compact_step(label, run_capture(command, timeout=10))
+        for label, command in checks
+    ]
+
+
+def collect_next_target(manifest: Path, preset: str) -> dict[str, object]:
+    rows, errors = load_sample_rows(manifest)
+    required = COLLECT_PRESETS[preset]
+    labels = {normalize_phrase(sample_row_label(row)) for row in rows}
+    missing = [phrase for phrase in required if normalize_phrase(phrase) not in labels]
+    if missing:
+        return {
+            "state": "missing",
+            "phrase": missing[0],
+            "missing": missing,
+            "errors": errors,
+            "count": len(rows),
+            "min_samples": len(required),
+        }
+    for row in rows:
+        audio_state = row.get("audio_state")
+        if isinstance(audio_state, str) and audio_state and audio_state not in {"ok", "unknown", "-"}:
+            return {
+                "state": "weak_audio",
+                "phrase": sample_row_label(row),
+                "audio_state": audio_state,
+                "errors": errors,
+                "count": len(rows),
+                "min_samples": len(required),
+            }
+    return {
+        "state": "ready" if not errors else "invalid",
+        "phrase": "",
+        "errors": errors,
+        "count": len(rows),
+        "min_samples": len(required),
+    }
+
+
+def cmd_collect_next(args: argparse.Namespace) -> int:
+    sample_dir = Path(args.dir).expanduser() if args.dir else default_sample_dir()
+    manifest = Path(args.manifest).expanduser() if args.manifest else sample_dir / "manifest.jsonl"
+    target = collect_next_target(manifest, args.preset)
+    phrase = str(target.get("phrase") or "")
+
+    command = [
+        script("ctos-jarvis"),
+        "sample",
+        phrase,
+        "--seconds",
+        str(args.seconds),
+        "--manifest",
+        str(manifest),
+    ]
+    if args.dir:
+        command.extend(["--dir", str(sample_dir)])
+    intent_id = collect_intent_id(phrase, enabled=not args.no_intent_ids)
+    if intent_id:
+        command.extend(["--intent-id", intent_id])
+    note = args.note or f"ctos-jarvis collect-next preset={args.preset}"
+    command.extend(["--note", note])
+
+    payload: dict[str, object] = {
+        "schema": 1,
+        "mode": "ctos-jarvis-collect-next",
+        "ok": target.get("state") == "ready",
+        "run": bool(args.run),
+        "preset": args.preset,
+        "manifest": str(manifest),
+        "target": target,
+        "command": user_command(command) if phrase else "",
+        "result": None,
+    }
+
+    if args.json and args.run and phrase and not args.yes:
+        payload["ok"] = False
+        payload["result"] = {
+            "ok": False,
+            "rc": 2,
+            "reason": "interactive audio capture is not run in --json mode unless --yes is explicit",
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 2
+
+    if args.json and not args.run:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    if not args.json:
+        print("CTOS Jarvis collect-next")
+        print("========================")
+        print(f"state      {target.get('state')}")
+        print(f"manifest   {manifest}")
+        print(f"samples    {target.get('count', 0)}/{target.get('min_samples', '-')}")
+        if phrase:
+            print(f"phrase     {phrase}")
+            print()
+            print("command")
+            print(f"  {user_command(command)}")
+        else:
+            if target.get("state") == "ready":
+                print("next       ctos-jarvis evaluate --backend both")
+            else:
+                print("next       ctos-jarvis samples")
+        if not args.run:
+            if phrase:
+                print()
+                print("run")
+                print("  ctos-jarvis collect-next --run")
+            return 0
+
+    if not phrase:
+        return 0 if target.get("state") == "ready" else 1
+
+    preflight_steps: list[dict[str, object]] = []
+    if not args.no_preflight:
+        preflight_steps = collect_preflight_steps()
+        preflight_ok = all(bool(step.get("ok")) for step in preflight_steps)
+        if not args.json:
+            print()
+            print("preflight")
+            for step in preflight_steps:
+                marker = "OK" if step.get("ok") else "WARN"
+                detail = str(step.get("stdout_preview") or step.get("stderr_preview") or "")
+                print(f"{marker:4} {step.get('name')} rc={step.get('rc')} {detail}")
+        if args.strict_preflight and not preflight_ok:
+            if args.json:
+                payload["ok"] = False
+                payload["result"] = {"ok": False, "rc": 1, "reason": "preflight_failed", "preflight": preflight_steps}
+                print(json.dumps(payload, ensure_ascii=False, indent=2))
+            else:
+                print()
+                print("blocked    preflight_failed")
+            return 1
+
+    if not args.yes and not args.json:
+        try:
+            input("Entree, puis prononce la phrase. ")
+        except EOFError:
+            pass
+
+    run_command = command + (["--json"] if args.json else [])
+    if args.json:
+        result = run_capture(run_command, timeout=max(45, int(args.seconds) + 35))
+        payload["result"] = parse_json_result(result) or compact_step("sample", result)
+        payload["ok"] = bool(result.get("ok"))
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0 if result.get("ok") else int(result.get("rc") or 1)
+
+    print()
+    print("record")
+    print("------")
+    rc = run(command)
+    print()
+    print("next")
+    print("  ctos-jarvis collect-next")
+    print("  ctos-jarvis corpus")
+    return rc
+
+
+def cmd_collect(args: argparse.Namespace) -> int:
+    phrases = collect_phrases(args)
+    sample_dir = Path(args.dir).expanduser() if args.dir else default_sample_dir()
+    manifest = Path(args.manifest).expanduser() if args.manifest else sample_dir / "manifest.jsonl"
+
+    regression_cmd = [
+        script("ctos-jarvis"),
+        "regression",
+        "--manifest",
+        str(manifest),
+        "--backend",
+        args.regression_backend,
+        "--threshold",
+        str(args.threshold),
+        "--text-threshold",
+        str(args.text_threshold),
+        "--timeout",
+        str(args.timeout),
+        "--preprocess",
+        args.preprocess,
+    ]
+    if args.regression_backend == "open-stt":
+        regression_cmd.append("--target-tunnel")
+        regression_cmd.extend(["--host", args.host, "--user", args.user])
+
+    if args.plan:
+        print("CTOS Jarvis collection plan")
+        print("===========================")
+        print(f"preset     {args.preset}")
+        print(f"sample_dir {sample_dir}")
+        print(f"manifest   {manifest}")
+        print()
+        if not args.no_preflight:
+            print("preflight")
+            print(f"  {script('ctos-audio')} status")
+            print(f"  {script('ctos-audio')} mic-status")
+            print()
+        for index, phrase in enumerate(phrases, start=1):
+            command = [
+                "ctos-jarvis",
+                "sample",
+                phrase,
+                "--seconds",
+                str(args.seconds),
+                "--manifest",
+                str(manifest),
+            ]
+            if args.dir:
+                command.extend(["--dir", str(sample_dir)])
+            intent_id = collect_intent_id(phrase, enabled=not args.no_intent_ids)
+            if intent_id:
+                command.extend(["--intent-id", intent_id])
+            if args.note:
+                command.extend(["--note", args.note])
+            print(f"{index}. {phrase}")
+            print("   " + " ".join(shlex.quote(part) for part in command))
+        print()
+        print("after")
+        print(f"  ctos-jarvis samples --manifest {shlex.quote(str(manifest))}")
+        print(f"  ctos-jarvis corpus --manifest {shlex.quote(str(manifest))} --preset {args.preset}")
+        print(f"  ctos-jarvis evaluate --manifest {shlex.quote(str(manifest))} --preset {args.preset}")
+        print("  " + " ".join(shlex.quote(part) for part in regression_cmd))
+        return 0
+
+    if not phrases:
+        print("no phrases to collect", file=sys.stderr)
+        return 2
+
+    steps: list[dict[str, object]] = []
+    preflight_steps: list[dict[str, object]] = []
+    preflight_ok = True
+    print_json = bool(args.json)
+    if not print_json:
+        print("CTOS Jarvis collect")
+        print("===================")
+        print(f"phrases    {len(phrases)}")
+        print(f"manifest   {manifest}")
+        print(f"seconds    {args.seconds:g}")
+        print()
+
+    if not args.no_preflight:
+        preflight_steps = collect_preflight_steps()
+        preflight_ok = all(bool(step.get("ok")) for step in preflight_steps)
+        if not print_json:
+            print("preflight")
+            print("---------")
+            for step in preflight_steps:
+                marker = "OK" if step.get("ok") else "WARN"
+                detail = str(step.get("stdout_preview") or step.get("stderr_preview") or "")
+                print(f"{marker:4} {step.get('name')} rc={step.get('rc')} {detail}")
+            print()
+        if args.strict_preflight and not preflight_ok:
+            payload = {
+                "schema": 1,
+                "mode": "ctos-jarvis-collect",
+                "ok": False,
+                "state": "preflight_failed",
+                "preset": args.preset,
+                "manifest": str(manifest),
+                "phrases": phrases,
+                "preflight": {
+                    "enabled": True,
+                    "strict": True,
+                    "ok": False,
+                    "steps": preflight_steps,
+                },
+                "steps": [],
+                "samples": None,
+                "regression": None,
+                "next": [
+                    "ctos-audio panel",
+                    "ctos-audio report",
+                    "ctos-jarvis collect --no-preflight",
+                ],
+            }
+            if print_json:
+                print(json.dumps(payload, ensure_ascii=False, indent=2))
+            else:
+                print("state preflight_failed")
+                print("next")
+                for command in payload["next"]:
+                    print(f"  {command}")
+            return 1
+        sys.stdout.flush()
+
+    for index, phrase in enumerate(phrases, start=1):
+        if not print_json:
+            print(f"[{index}/{len(phrases)}] {phrase}")
+            if not args.yes:
+                try:
+                    input("Appuie sur Entree, puis prononce exactement cette phrase. ")
+                except EOFError:
+                    pass
+
+        command = [
+            script("ctos-jarvis"),
+            "sample",
+            phrase,
+            "--seconds",
+            str(args.seconds),
+            "--manifest",
+            str(manifest),
+            "--json",
+        ]
+        if args.dir:
+            command.extend(["--dir", str(sample_dir)])
+        intent_id = collect_intent_id(phrase, enabled=not args.no_intent_ids)
+        if intent_id:
+            command.extend(["--intent-id", intent_id])
+        note = args.note or f"ctos-jarvis collect preset={args.preset}"
+        command.extend(["--note", note])
+
+        result = run_capture(command, timeout=max(45, int(args.seconds) + 35))
+        step = compact_step(phrase, result)
+        step["intent_id"] = intent_id
+        steps.append(step)
+
+        if not print_json:
+            marker = "OK" if result.get("ok") else "FAIL"
+            print(f"{marker:4} rc={result.get('rc')}")
+            detail = preview(str(result.get("stderr") or result.get("stdout") or ""), 260)
+            if detail and not result.get("ok"):
+                print(f"     {detail}")
+            print()
+        if not result.get("ok") and args.stop_on_failure:
+            break
+
+    samples_result = run_capture([script("ctos-jarvis"), "samples", "--manifest", str(manifest), "--json"], timeout=30)
+    regression_result: dict[str, object] | None = None
+    if args.run_regression:
+        regression_result = run_capture(regression_cmd + (["--json"] if args.json else []), timeout=max(60, len(phrases) * int(args.timeout)))
+
+    ok = all(bool(step.get("ok")) for step in steps)
+    if regression_result is not None:
+        ok = ok and bool(regression_result.get("ok"))
+
+    payload = {
+        "schema": 1,
+        "mode": "ctos-jarvis-collect",
+        "ok": ok,
+        "preset": args.preset,
+        "manifest": str(manifest),
+        "phrases": phrases,
+        "preflight": {
+            "enabled": not args.no_preflight,
+            "strict": bool(args.strict_preflight),
+            "ok": preflight_ok,
+            "steps": preflight_steps,
+        },
+        "steps": steps,
+        "samples": parse_json_result(samples_result) or compact_step("samples", samples_result),
+        "regression": parse_json_result(regression_result) if regression_result else None,
+        "next": [
+            f"ctos-jarvis samples --manifest {shlex.quote(str(manifest))}",
+            f"ctos-jarvis corpus --manifest {shlex.quote(str(manifest))} --preset {args.preset}",
+            f"ctos-jarvis evaluate --manifest {shlex.quote(str(manifest))} --preset {args.preset}",
+            " ".join(shlex.quote(part) for part in regression_cmd),
+            "ctos-jarvis run",
+        ],
+    }
+
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print("summary")
+        print("-------")
+        print(f"state      {'ok' if ok else 'warning'}")
+        print(f"captured   {sum(1 for step in steps if step.get('ok'))}/{len(phrases)}")
+        print(f"manifest   {manifest}")
+        if regression_result is not None:
+            print(f"regression {'ok' if regression_result.get('ok') else 'failed'} rc={regression_result.get('rc')}")
+        print()
+        print("next")
+        for command in payload["next"]:
+            print(f"  {command}")
+    return 0 if ok else 1
+
+
+def cmd_corpus(args: argparse.Namespace) -> int:
+    manifest = Path(args.manifest).expanduser() if args.manifest else default_sample_manifest()
+    rows, errors = load_sample_rows(manifest)
+    required_phrases = [normalize_phrase(item) for item in COLLECT_PRESETS[args.preset]]
+    labels = [normalize_phrase(sample_row_label(row)) for row in rows]
+    label_set = set(labels)
+    missing_phrases = [phrase for phrase in required_phrases if phrase not in label_set]
+
+    missing_files: list[str] = []
+    weak_audio: list[dict[str, object]] = []
+    intent_count = 0
+    natural_count = 0
+    for row in rows:
+        if row.get("intent_id"):
+            intent_count += 1
+        else:
+            natural_count += 1
+        file_path = sample_file_path(row, manifest)
+        if args.check_files and file_path is not None and not file_path.exists():
+            missing_files.append(str(file_path))
+        audio_state = row.get("audio_state")
+        if isinstance(audio_state, str) and audio_state and audio_state not in {"ok", "unknown", "-"}:
+            weak_audio.append({
+                "label": sample_row_label(row),
+                "audio_state": audio_state,
+                "file": row.get("file"),
+            })
+
+    min_samples = args.min_samples if args.min_samples is not None else len(COLLECT_PRESETS[args.preset])
+    if min_samples < 1:
+        print("--min-samples must be >= 1", file=sys.stderr)
+        return 2
+    if errors:
+        state = "invalid"
+    elif not manifest.exists() or not rows:
+        state = "empty"
+    elif missing_files:
+        state = "broken"
+    elif len(rows) < min_samples or missing_phrases:
+        state = "incomplete"
+    else:
+        state = "ready"
+
+    next_commands: list[str]
+    if state in {"empty", "incomplete"}:
+        next_commands = [
+            f"ctos-jarvis collect --preset {args.preset}",
+            "ctos-jarvis corpus",
+        ]
+    elif state == "broken":
+        next_commands = [
+            "ctos-jarvis samples",
+            f"ctos-jarvis collect --preset {args.preset}",
+        ]
+    elif state == "invalid":
+        next_commands = [
+            f"inspect manifest: {manifest}",
+            "ctos-jarvis samples",
+        ]
+    else:
+        next_commands = [
+            "ctos-jarvis regression",
+            "ctos-jarvis regression --backend open-stt --target-tunnel",
+            "ctos-jarvis run",
+        ]
+
+    payload = {
+        "schema": 1,
+        "mode": "ctos-jarvis-corpus",
+        "ok": state == "ready",
+        "state": state,
+        "preset": args.preset,
+        "manifest": str(manifest),
+        "exists": manifest.exists(),
+        "count": len(rows),
+        "min_samples": min_samples,
+        "intent_samples": intent_count,
+        "natural_samples": natural_count,
+        "missing_phrases": missing_phrases,
+        "missing_files": missing_files,
+        "weak_audio": weak_audio,
+        "errors": errors,
+        "next": next_commands,
+    }
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0 if state == "ready" or (args.allow_incomplete and state == "incomplete") else 1
+
+    print("CTOS Jarvis corpus")
+    print("==================")
+    print(f"state      {state}")
+    print(f"preset     {args.preset}")
+    print(f"manifest   {manifest}")
+    print(f"samples    {len(rows)}/{min_samples}")
+    print(f"types      intent={intent_count} natural={natural_count}")
+    if errors:
+        print()
+        print("errors")
+        for error in errors[:5]:
+            print(f"  - {error}")
+    if missing_phrases:
+        print()
+        print("missing")
+        for phrase in missing_phrases:
+            print(f"  - {phrase}")
+    if missing_files:
+        print()
+        print("missing files")
+        for path in missing_files[:5]:
+            print(f"  - {path}")
+    if weak_audio:
+        print()
+        print("audio warnings")
+        for item in weak_audio[:5]:
+            print(f"  - {item['label']}: {item['audio_state']}")
+    print()
+    print("next")
+    for command in next_commands:
+        print(f"  {command}")
+    return 0 if state == "ready" or (args.allow_incomplete and state == "incomplete") else 1
+
+
+def cmd_samples(args: argparse.Namespace) -> int:
+    manifest = Path(args.manifest).expanduser() if args.manifest else default_sample_manifest()
+    rows, errors = load_sample_rows(manifest)
+    visible = rows[-args.limit:] if args.limit > 0 else rows
+
+    payload = {
+        "ok": not errors,
+        "manifest": str(manifest),
+        "exists": manifest.exists(),
+        "count": len(rows),
+        "errors": errors,
+        "samples": visible,
+        "commands": {
+            "collect_core": "ctos-jarvis collect",
+            "corpus_check": "ctos-jarvis corpus",
+            "capture_agenda": 'ctos-jarvis sample "agenda"',
+            "regression": f"ctos-jarvis regression --manifest {shlex.quote(str(manifest))}",
+            "open_stt_regression": (
+                f"ctos-jarvis regression --manifest {shlex.quote(str(manifest))} "
+                "--backend open-stt --target-tunnel"
+            ),
+        },
+    }
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0 if payload["ok"] else 1
+
+    print("CTOS Jarvis samples")
+    print("===================")
+    print(f"manifest   {manifest}")
+    print(f"samples    {len(rows)}")
+    if errors:
+        print("errors")
+        for error in errors[:5]:
+            print(f"  - {error}")
+    if visible:
+        print()
+        print("latest")
+        for row in visible:
+            created = compact(row.get("created_at"))
+            label = sample_row_label(row)
+            file_name = compact(row.get("file"))
+            audio_state = compact(row.get("audio_state"))
+            print(f"  {created:<18} {label:<32} {audio_state:<10} {file_name}")
+    else:
+        print()
+        print("next")
+        print("  ctos-jarvis collect")
+    print()
+    print("replay")
+    print(f"  ctos-jarvis regression --manifest {shlex.quote(str(manifest))}")
+    print(f"  ctos-jarvis regression --manifest {shlex.quote(str(manifest))} --backend open-stt --target-tunnel")
+    return 0 if not errors else 1
+
+
+def cmd_regression(args: argparse.Namespace) -> int:
+    manifest = Path(args.manifest).expanduser() if args.manifest else default_sample_manifest()
+    command = [
+        script("ctos-voice-v2"),
+        "regression",
+        "--manifest",
+        str(manifest),
+        "--backend",
+        args.backend,
+        "--threshold",
+        str(args.threshold),
+        "--text-threshold",
+        str(args.text_threshold),
+        "--timeout",
+        str(args.timeout),
+        "--language",
+        args.language,
+        "--preprocess",
+        args.preprocess,
+    ]
+    if args.backend == "open-stt":
+        command.extend(["--wyoming-host", args.wyoming_host, "--wyoming-port", str(args.wyoming_port)])
+    if args.target_tunnel:
+        command.append("--target-tunnel")
+    if args.host:
+        command.extend(["--host", args.host])
+    if args.user:
+        command.extend(["--user", args.user])
+    if args.json:
+        command.append("--json")
+    if args.plan:
+        print("CTOS Jarvis regression plan")
+        print("===========================")
+        print(" ".join(shlex.quote(part) for part in command))
+        return 0
+    if not manifest.exists():
+        print(f"sample manifest not found: {manifest}", file=sys.stderr)
+        print("next: ctos-jarvis collect", file=sys.stderr)
+        return 2
+    return run(command)
+
+
+def evaluate_regression_command(args: argparse.Namespace, manifest: Path, backend: str) -> list[str]:
+    command = [
+        script("ctos-jarvis"),
+        "regression",
+        "--manifest",
+        str(manifest),
+        "--backend",
+        backend,
+        "--threshold",
+        str(args.threshold),
+        "--text-threshold",
+        str(args.text_threshold),
+        "--timeout",
+        str(args.timeout),
+        "--language",
+        args.language,
+        "--preprocess",
+        args.preprocess,
+    ]
+    if backend == "open-stt":
+        command.extend(["--wyoming-host", args.wyoming_host, "--wyoming-port", str(args.wyoming_port)])
+        if not args.no_target_tunnel:
+            command.append("--target-tunnel")
+            command.extend(["--host", args.host, "--user", args.user])
+    if args.json:
+        command.append("--json")
+    return command
+
+
+def cmd_evaluate(args: argparse.Namespace) -> int:
+    manifest = Path(args.manifest).expanduser() if args.manifest else default_sample_manifest()
+    corpus_cmd = [
+        script("ctos-jarvis"),
+        "corpus",
+        "--manifest",
+        str(manifest),
+        "--preset",
+        args.preset,
+        "--json",
+    ]
+    if args.min_samples is not None:
+        corpus_cmd.extend(["--min-samples", str(args.min_samples)])
+    if not args.check_files:
+        corpus_cmd.append("--no-check-files")
+
+    backends = ["vosk", "open-stt"] if args.backend == "both" else [args.backend]
+    regression_cmds = [evaluate_regression_command(args, manifest, backend) for backend in backends]
+
+    if args.plan:
+        print("CTOS Jarvis evaluate plan")
+        print("=========================")
+        print("corpus")
+        print("  " + " ".join(shlex.quote(part) for part in corpus_cmd))
+        print("regression")
+        for command in regression_cmds:
+            print("  " + " ".join(shlex.quote(part) for part in command))
+        return 0
+
+    corpus_result = run_capture(corpus_cmd, timeout=30)
+    corpus_payload = parse_json_result(corpus_result)
+    corpus_state = str(corpus_payload.get("state") or "unknown")
+    corpus_ready = corpus_state == "ready" or (args.allow_incomplete and corpus_state == "incomplete")
+
+    steps: list[dict[str, object]] = [compact_step("corpus", corpus_result)]
+    regression_results: list[dict[str, object]] = []
+    if corpus_ready:
+        for backend, command in zip(backends, regression_cmds):
+            result = run_capture(command, timeout=max(60, float(args.timeout) * max(1, int(corpus_payload.get("count") or 1)) + 30))
+            step = compact_step(f"regression:{backend}", result)
+            step["backend"] = backend
+            regression_results.append(step)
+            steps.append(step)
+
+    ok = corpus_ready and all(bool(step.get("ok")) for step in regression_results)
+    payload = {
+        "schema": 1,
+        "mode": "ctos-jarvis-evaluate",
+        "ok": ok,
+        "manifest": str(manifest),
+        "preset": args.preset,
+        "backend": args.backend,
+        "corpus": corpus_payload or compact_step("corpus", corpus_result),
+        "regression": regression_results,
+        "next": (
+            ["ctos-jarvis run"]
+            if ok
+            else list(corpus_payload.get("next") or ["ctos-jarvis collect", "ctos-jarvis corpus"])
+            if not corpus_ready
+            else ["ctos-jarvis regression", "ctos-jarvis regression --backend open-stt --target-tunnel"]
+        ),
+        "steps": steps,
+    }
+
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0 if ok else 1
+
+    print("CTOS Jarvis evaluate")
+    print("====================")
+    print(f"manifest   {manifest}")
+    print(f"corpus     {corpus_state}")
+    if corpus_payload:
+        print(f"samples    {corpus_payload.get('count', 0)}/{corpus_payload.get('min_samples', '-')}")
+    if not corpus_ready:
+        missing = corpus_payload.get("missing_phrases") if isinstance(corpus_payload, dict) else None
+        if isinstance(missing, list) and missing:
+            print()
+            print("missing")
+            for phrase in missing[:8]:
+                print(f"  - {phrase}")
+        print()
+        print("next")
+        for command in payload["next"]:
+            print(f"  {command}")
+        return 1
+
+    print()
+    print("regression")
+    for step in regression_results:
+        marker = "OK" if step.get("ok") else "FAIL"
+        print(f"  {marker:4} {step.get('backend')} rc={step.get('rc')}")
+        if not step.get("ok"):
+            detail = step.get("stderr_preview") or step.get("stdout_preview")
+            if detail:
+                print(f"       {detail}")
+    print()
+    print("next")
+    for command in payload["next"]:
+        print(f"  {command}")
+    return 0 if ok else 1
+
+
+def triage_recommendations(corpus: dict[str, object], samples: dict[str, object], *, preset: str) -> tuple[str, list[str], list[str]]:
+    state = str(corpus.get("state") or "unknown")
+    manifest = str(corpus.get("manifest") or samples.get("manifest") or default_sample_manifest())
+    weak_audio = corpus.get("weak_audio")
+    errors = corpus.get("errors")
+    missing_files = corpus.get("missing_files")
+    missing_phrases = corpus.get("missing_phrases")
+
+    if state == "empty":
+        return (
+            "capture_corpus",
+            [
+                f"ctos-jarvis collect --preset {preset}",
+                f"ctos-jarvis corpus --manifest {shlex.quote(manifest)} --preset {preset}",
+            ],
+            ["No reusable voice corpus exists yet."],
+        )
+    if state == "incomplete":
+        return (
+            "complete_corpus",
+            [
+                f"ctos-jarvis collect --preset {preset}",
+                f"ctos-jarvis corpus --manifest {shlex.quote(manifest)} --preset {preset}",
+            ],
+            [f"Missing phrases: {len(missing_phrases) if isinstance(missing_phrases, list) else 0}."],
+        )
+    if state == "broken":
+        return (
+            "repair_sample_files",
+            [
+                f"ctos-jarvis samples --manifest {shlex.quote(manifest)}",
+                f"ctos-jarvis collect --preset {preset} --strict-preflight",
+            ],
+            [f"Referenced WAV files are missing: {len(missing_files) if isinstance(missing_files, list) else 0}."],
+        )
+    if state == "invalid":
+        return (
+            "repair_manifest",
+            [
+                f"ctos-jarvis samples --manifest {shlex.quote(manifest)}",
+                f"inspect manifest: {manifest}",
+            ],
+            [f"Manifest parse errors: {len(errors) if isinstance(errors, list) else 0}."],
+        )
+    if state == "ready" and isinstance(weak_audio, list) and weak_audio:
+        return (
+            "recapture_weak_audio",
+            [
+                "ctos-audio panel",
+                f"ctos-jarvis collect --preset {preset} --strict-preflight",
+                f"ctos-jarvis evaluate --manifest {shlex.quote(manifest)} --preset {preset} --backend both",
+            ],
+            [f"Corpus is complete, but {len(weak_audio)} sample(s) carry audio warnings."],
+        )
+    if state == "ready":
+        return (
+            "benchmark_backends",
+            [
+                f"ctos-jarvis evaluate --manifest {shlex.quote(manifest)} --preset {preset} --backend both",
+                "ctos-jarvis run",
+            ],
+            ["Corpus is complete enough to compare recognition backends."],
+        )
+    return (
+        "inspect_state",
+        [
+            f"ctos-jarvis corpus --manifest {shlex.quote(manifest)} --preset {preset}",
+            f"ctos-jarvis samples --manifest {shlex.quote(manifest)}",
+        ],
+        [f"Unexpected corpus state: {state}."],
+    )
+
+
+def cmd_triage(args: argparse.Namespace) -> int:
+    manifest = Path(args.manifest).expanduser() if args.manifest else default_sample_manifest()
+    corpus_cmd = [
+        script("ctos-jarvis"),
+        "corpus",
+        "--manifest",
+        str(manifest),
+        "--preset",
+        args.preset,
+        "--json",
+    ]
+    if args.min_samples is not None:
+        corpus_cmd.extend(["--min-samples", str(args.min_samples)])
+    if not args.check_files:
+        corpus_cmd.append("--no-check-files")
+    samples_cmd = [
+        script("ctos-jarvis"),
+        "samples",
+        "--manifest",
+        str(manifest),
+        "--limit",
+        str(args.limit),
+        "--json",
+    ]
+
+    corpus_result = run_capture(corpus_cmd, timeout=30)
+    samples_result = run_capture(samples_cmd, timeout=30)
+    corpus_payload = parse_json_result(corpus_result)
+    samples_payload = parse_json_result(samples_result)
+    if not corpus_payload:
+        corpus_payload = compact_step("corpus", corpus_result)
+        corpus_payload["state"] = "unreadable"
+        corpus_payload["manifest"] = str(manifest)
+    if not samples_payload:
+        samples_payload = compact_step("samples", samples_result)
+        samples_payload["manifest"] = str(manifest)
+
+    verdict, next_commands, notes = triage_recommendations(corpus_payload, samples_payload, preset=args.preset)
+    ok = verdict == "benchmark_backends"
+    payload = {
+        "schema": 1,
+        "mode": "ctos-jarvis-triage",
+        "ok": ok,
+        "verdict": verdict,
+        "preset": args.preset,
+        "manifest": str(manifest),
+        "corpus": corpus_payload,
+        "samples": samples_payload,
+        "notes": notes,
+        "next": next_commands,
+        "steps": [
+            compact_step("corpus", corpus_result),
+            compact_step("samples", samples_result),
+        ],
+    }
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0 if ok else 1
+
+    print("CTOS Jarvis triage")
+    print("==================")
+    print(f"verdict    {verdict}")
+    print(f"manifest   {manifest}")
+    print(f"corpus     {corpus_payload.get('state', '-')}")
+    print(f"samples    {corpus_payload.get('count', 0)}/{corpus_payload.get('min_samples', '-')}")
+    print()
+    if notes:
+        print("notes")
+        for note in notes:
+            print(f"  - {note}")
+        print()
+    missing = corpus_payload.get("missing_phrases")
+    if isinstance(missing, list) and missing:
+        print("missing")
+        for phrase in missing[:8]:
+            print(f"  - {phrase}")
+        print()
+    weak_audio = corpus_payload.get("weak_audio")
+    if isinstance(weak_audio, list) and weak_audio:
+        print("audio warnings")
+        for item in weak_audio[:8]:
+            if isinstance(item, dict):
+                print(f"  - {item.get('label', '-')}: {item.get('audio_state', '-')}")
+        print()
+    print("next")
+    for command in next_commands:
+        print(f"  {command}")
+    return 0 if ok else 1
+
+
+def improve_triage_command(args: argparse.Namespace, manifest: Path) -> list[str]:
+    command = [
+        script("ctos-jarvis"),
+        "triage",
+        "--manifest",
+        str(manifest),
+        "--preset",
+        args.preset,
+        "--limit",
+        str(args.limit),
+        "--json",
+    ]
+    if args.min_samples is not None:
+        command.extend(["--min-samples", str(args.min_samples)])
+    if not args.check_files:
+        command.append("--no-check-files")
+    return command
+
+
+def improve_collect_command(args: argparse.Namespace, manifest: Path) -> list[str]:
+    command = [
+        script("ctos-jarvis"),
+        "collect",
+        "--manifest",
+        str(manifest),
+        "--preset",
+        args.preset,
+        "--seconds",
+        str(args.seconds),
+    ]
+    if args.dir:
+        command.extend(["--dir", args.dir])
+    if args.no_intent_ids:
+        command.append("--no-intent-ids")
+    if args.note:
+        command.extend(["--note", args.note])
+    if args.yes:
+        command.append("--yes")
+    if args.no_preflight:
+        command.append("--no-preflight")
+    elif not args.relaxed_preflight:
+        command.append("--strict-preflight")
+    if args.stop_on_failure:
+        command.append("--stop-on-failure")
+    return command
+
+
+def improve_evaluate_command(args: argparse.Namespace, manifest: Path) -> list[str]:
+    command = [
+        script("ctos-jarvis"),
+        "evaluate",
+        "--manifest",
+        str(manifest),
+        "--preset",
+        args.preset,
+        "--backend",
+        args.backend,
+        "--threshold",
+        str(args.threshold),
+        "--text-threshold",
+        str(args.text_threshold),
+        "--timeout",
+        str(args.timeout),
+        "--language",
+        args.language,
+        "--preprocess",
+        args.preprocess,
+        "--host",
+        args.host,
+        "--user",
+        args.user,
+    ]
+    if args.min_samples is not None:
+        command.extend(["--min-samples", str(args.min_samples)])
+    if not args.check_files:
+        command.append("--no-check-files")
+    if args.allow_incomplete:
+        command.append("--allow-incomplete")
+    if args.no_target_tunnel:
+        command.append("--no-target-tunnel")
+    return command
+
+
+def improve_inspect_command(args: argparse.Namespace, manifest: Path, verdict: str) -> list[str]:
+    if verdict in {"repair_sample_files", "repair_manifest"}:
+        return [
+            script("ctos-jarvis"),
+            "samples",
+            "--manifest",
+            str(manifest),
+            "--limit",
+            str(args.limit),
+        ]
+    return [
+        script("ctos-jarvis"),
+        "triage",
+        "--manifest",
+        str(manifest),
+        "--preset",
+        args.preset,
+    ]
+
+
+def improve_action(args: argparse.Namespace, manifest: Path, verdict: str) -> tuple[str, list[str], bool]:
+    if verdict in {"capture_corpus", "complete_corpus", "recapture_weak_audio"}:
+        return "collect", improve_collect_command(args, manifest), True
+    if verdict == "benchmark_backends":
+        return "evaluate", improve_evaluate_command(args, manifest), False
+    return "inspect", improve_inspect_command(args, manifest, verdict), False
+
+
+def user_command(command: list[str]) -> str:
+    visible = list(command)
+    ctos_jarvis = script("ctos-jarvis")
+    if visible and visible[0] == ctos_jarvis:
+        visible[0] = "ctos-jarvis"
+    return shlex.join(visible)
+
+
+def cmd_improve(args: argparse.Namespace) -> int:
+    manifest = Path(args.manifest).expanduser() if args.manifest else default_sample_manifest()
+    if args.plan:
+        args.run = False
+
+    triage_result = run_capture(improve_triage_command(args, manifest), timeout=45)
+    triage_payload = parse_json_result(triage_result)
+    if not triage_payload:
+        triage_payload = compact_step("triage", triage_result)
+        triage_payload["verdict"] = "inspect_state"
+        triage_payload["manifest"] = str(manifest)
+        triage_payload["corpus"] = {"state": "unreadable", "manifest": str(manifest)}
+
+    verdict = str(triage_payload.get("verdict") or "inspect_state")
+    action, command, records_audio = improve_action(args, manifest, verdict)
+    corpus = triage_payload.get("corpus") if isinstance(triage_payload.get("corpus"), dict) else {}
+    next_commands = triage_payload.get("next")
+    if not isinstance(next_commands, list):
+        next_commands = [user_command(command)]
+
+    payload: dict[str, object] = {
+        "schema": 1,
+        "mode": "ctos-jarvis-improve",
+        "ok": True,
+        "run": bool(args.run),
+        "verdict": verdict,
+        "action": action,
+        "records_audio": records_audio,
+        "preset": args.preset,
+        "manifest": str(manifest),
+        "corpus": corpus,
+        "triage": triage_payload,
+        "command": user_command(command),
+        "next": [user_command(command)] if action != "inspect" else next_commands,
+        "result": None,
+    }
+
+    if args.run and args.json and records_audio and not args.yes:
+        payload["ok"] = False
+        payload["result"] = {
+            "ok": False,
+            "rc": 2,
+            "reason": "interactive audio capture is not run in --json mode unless --yes is explicit",
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 2
+
+    if args.json and not args.run:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    if not args.json:
+        print("CTOS Jarvis improve")
+        print("===================")
+        print(f"verdict    {verdict}")
+        print(f"action     {action}")
+        print(f"manifest   {manifest}")
+        if isinstance(corpus, dict):
+            print(f"corpus     {corpus.get('state', '-')}")
+            print(f"samples    {corpus.get('count', 0)}/{corpus.get('min_samples', '-')}")
+        print()
+        notes = triage_payload.get("notes")
+        if isinstance(notes, list) and notes:
+            print("notes")
+            for note in notes:
+                print(f"  - {note}")
+            print()
+        print("command")
+        print(f"  {user_command(command)}")
+        if not args.run:
+            print()
+            print("next")
+            print("  ctos-jarvis improve --run")
+            if records_audio:
+                print("  # this will run guided microphone capture")
+            return 0
+
+    if not args.run:
+        return 0
+
+    if args.json:
+        result = run_capture(command + ["--json"], timeout=args.run_timeout)
+        payload["result"] = parse_json_result(result) or compact_step(action, result)
+        payload["ok"] = bool(result.get("ok"))
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0 if result.get("ok") else int(result.get("rc") or 1)
+
+    print()
+    print("running")
+    print("-------")
+    sys.stdout.flush()
+    return run(command)
+
+
+def cmd_review(args: argparse.Namespace) -> int:
+    cmd = [script("ctos-ai"), "agenda-review"]
+    if args.json:
+        cmd.append("--json")
+    return run(cmd)
+
+
+def cmd_confirm(args: argparse.Namespace) -> int:
+    cmd = [script("ctos-ai"), "agenda-confirm", args.selector]
+    if args.yes:
+        cmd.append("--yes")
+    if args.json:
+        cmd.append("--json")
+        confirm_result = run_capture(cmd, timeout=20)
+        inbox_result: dict[str, object] | None = None
+        inbox_payload: dict[str, object] = {}
+        if confirm_result.get("ok") and not args.no_inbox:
+            inbox_result = run_capture([script("ctos-jarvis"), "inbox", "--json"], timeout=20)
+            inbox_payload = parse_json_result(inbox_result)
+        payload: dict[str, object] = {
+            "schema": 1,
+            "mode": "ctos-jarvis-confirm",
+            "ok": bool(confirm_result.get("ok")) and (inbox_result is None or bool(inbox_result.get("ok"))),
+            "selector": args.selector,
+            "confirm": parse_json_result(confirm_result),
+            "steps": [compact_step("agenda-confirm", confirm_result)],
+        }
+        if inbox_result is not None:
+            payload["inbox"] = inbox_payload
+            payload["steps"].append(compact_step("inbox", inbox_result))  # type: ignore[index]
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        if not confirm_result.get("ok"):
+            return int(confirm_result.get("rc") or 1)
+        if inbox_result is not None and not inbox_result.get("ok"):
+            return int(inbox_result.get("rc") or 1)
+        return 0
+
+    rc = run(cmd)
+    if rc == 0 and not args.no_inbox:
+        print()
+        print("jarvis inbox")
+        print("------------")
+        sys.stdout.flush()
+        inbox_rc = run([script("ctos-jarvis"), "inbox"])
+        if inbox_rc != 0:
+            return inbox_rc
+    return rc
+
+
+def cmd_reject(args: argparse.Namespace) -> int:
+    cmd = [script("ctos-ai"), "agenda-reject", args.selector]
+    if args.reason:
+        cmd += ["--reason", args.reason]
+    if args.json:
+        cmd.append("--json")
+        reject_result = run_capture(cmd, timeout=20)
+        inbox_result: dict[str, object] | None = None
+        inbox_payload: dict[str, object] = {}
+        if reject_result.get("ok") and not args.no_inbox:
+            inbox_result = run_capture([script("ctos-jarvis"), "inbox", "--json"], timeout=20)
+            inbox_payload = parse_json_result(inbox_result)
+        payload: dict[str, object] = {
+            "schema": 1,
+            "mode": "ctos-jarvis-reject",
+            "ok": bool(reject_result.get("ok")) and (inbox_result is None or bool(inbox_result.get("ok"))),
+            "selector": args.selector,
+            "reject": parse_json_result(reject_result),
+            "steps": [compact_step("agenda-reject", reject_result)],
+        }
+        if inbox_result is not None:
+            payload["inbox"] = inbox_payload
+            payload["steps"].append(compact_step("inbox", inbox_result))  # type: ignore[index]
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        if not reject_result.get("ok"):
+            return int(reject_result.get("rc") or 1)
+        if inbox_result is not None and not inbox_result.get("ok"):
+            return int(inbox_result.get("rc") or 1)
+        return 0
+
+    rc = run(cmd)
+    if rc == 0 and not args.no_inbox:
+        print()
+        print("jarvis inbox")
+        print("------------")
+        sys.stdout.flush()
+        inbox_rc = run([script("ctos-jarvis"), "inbox"])
+        if inbox_rc != 0:
+            return inbox_rc
+    return rc
+
+
+def cmd_setup_voice(args: argparse.Namespace) -> int:
+    cmd = [script("ctos-voice-setup")]
+    if args.plan:
+        cmd.append("--plan")
+    return run(cmd)
+
+
+def cmd_unlock_voice(args: argparse.Namespace) -> int:
+    if args.plan:
+        return run([script("ctos-voice-setup"), "--plan"])
+    if args.interactive:
+        return run([script("ctos-voice-setup")])
+
+    steps: list[tuple[str, dict[str, object]]] = []
+    if not args.no_tunnel:
+        steps.append((
+            "home assistant tunnel",
+            run_capture([script("ctos-voice-v2"), "hass-context", "tunnel-start"], timeout=45),
+        ))
+    def read_doctor(label: str) -> dict[str, object]:
+        result = run_capture([script("ctos-voice-v2"), "doctor", "--json"], timeout=90)
+        payload: dict[str, object] = {}
+        if result["stdout"]:
+            try:
+                parsed = json.loads(str(result["stdout"]))
+                if isinstance(parsed, dict):
+                    payload = parsed
+            except json.JSONDecodeError:
+                payload = {}
+        if payload:
+            result["ok"] = True
+        steps.append((label, result))
+        return payload
+
+    doctor_payload = read_doctor("voice stack doctor")
+    state = str(doctor_payload.get("state") or "unknown")
+
+    if state == "ready_to_start_speech_to_phrase" and (args.start or args.test):
+        steps.append((
+            "speech-to-phrase start",
+            run_capture([script("ctos-voice-v2"), "stp-container", "start"], timeout=180),
+        ))
+        doctor_payload = read_doctor("voice stack doctor after start")
+        state = str(doctor_payload.get("state") or "unknown")
+
+    next_action = str(doctor_payload.get("next_action") or "ctos-jarvis doctor")
+    blockers = doctor_payload.get("blockers")
+    if not isinstance(blockers, list):
+        blockers = []
+    ready = state == "ready" and all(bool(result["ok"]) for _, result in steps)
+
+    test_result: dict[str, object] | None = None
+    if args.test:
+        if ready:
+            stp_cmd = [
+                script("ctos-voice-v2"),
+                "stp-transcribe",
+                "--target-tunnel",
+                "--record-seconds",
+                str(args.record_seconds),
+            ]
+            stp_cmd.append("--execute-safe" if args.execute_safe else "--route")
+            test_result = run_capture(stp_cmd, timeout=max(45, int(args.record_seconds) + 45))
+            steps.append(("speech-to-phrase test", test_result))
+            ready = ready and bool(test_result["ok"])
+        else:
+            test_result = {
+                "command": [],
+                "rc": 2,
+                "ok": False,
+                "stdout": "",
+                "stderr": f"voice stack is not ready: {state}",
+            }
+            steps.append(("speech-to-phrase test", test_result))
+
+    payload = {
+        "schema": 1,
+        "mode": "ctos-jarvis-unlock-voice",
+        "state": state,
+        "next_action": next_action,
+        "blockers": blockers,
+        "ready": ready,
+        "steps": [
+            {
+                "name": name,
+                **result,
+                "stdout_preview": preview(str(result.get("stdout", ""))),
+                "stderr_preview": preview(str(result.get("stderr", ""))),
+            }
+            for name, result in steps
+        ],
+    }
+    if doctor_payload:
+        payload["doctor"] = doctor_payload
+
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print("CTOS Jarvis voice unlock")
+        print("========================")
+        for step in payload["steps"]:
+            marker = "OK" if step["ok"] else "WARN"
+            print(f"{marker:4} {step['name']} rc={step['rc']}")
+            if not step["ok"]:
+                detail = step["stderr_preview"] or step["stdout_preview"]
+                if detail:
+                    print(f"     {detail}")
+        print(f"state {state}")
+        if blockers:
+            print("blockers")
+            for blocker in blockers:
+                print(f"  - {blocker}")
+        if ready:
+            print("next  ctos-jarvis unlock-voice --test")
+        elif state == "ready_to_start_speech_to_phrase":
+            print("next  ctos-jarvis unlock-voice --start")
+            print("test  ctos-jarvis unlock-voice --test")
+        elif state == "missing_token":
+            print("next  ctos-jarvis unlock-voice --interactive")
+            print("note  this opens the hidden Home Assistant onboarding/token prompt; do not paste the password in chat")
+        else:
+            print(f"next  {next_action}")
+    return 0 if ready else 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="CTOS Jarvis operator facade: one entrypoint for voice, agenda review, and backend checks"
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    brief = sub.add_parser("brief", help="show the deterministic CTOS AI brief")
+    brief.set_defaults(func=cmd_brief)
+
+    doctor = sub.add_parser("doctor", help="check current voice/backend readiness")
+    doctor.set_defaults(func=cmd_doctor)
+
+    next_cmd = sub.add_parser("next", help="print the current Jarvis operator workflow")
+    next_cmd.set_defaults(func=cmd_next)
+
+    stack = sub.add_parser("stack", help="show the selected open-source/local Jarvis stack")
+    stack.add_argument("--json", action="store_true")
+    stack.add_argument("--verbose", "-v", action="store_true", help="also show deferred research candidates")
+    stack.set_defaults(func=cmd_stack)
+
+    stack_check = sub.add_parser("stack-check", help="validate Jarvis stack and voice intent JSON roles")
+    stack_check.add_argument("--json", action="store_true")
+    stack_check.set_defaults(func=cmd_stack_check)
+
+    status = sub.add_parser(
+        "status",
+        aliases=["now", "mission"],
+        help="compact read-only Jarvis state plus the next operator action",
+    )
+    status.add_argument("--full", action="store_true", help="include ctos-core SSH/backend probes")
+    status.add_argument("--preset", choices=tuple(COLLECT_PRESETS.keys()), default="core")
+    status.add_argument(
+        "--prefer",
+        choices=("open-stt", "deterministic"),
+        default="open-stt",
+        help="choose the readiness rail to prioritize",
+    )
+    status.add_argument("--manifest", help="Jarvis sample manifest path")
+    status.add_argument("--json", action="store_true")
+    status.set_defaults(func=cmd_status)
+
+    daily = sub.add_parser(
+        "daily",
+        aliases=["today"],
+        help="read-only daily Jarvis brief: status, agenda plan, proposals, next action",
+    )
+    daily.add_argument("--date", help="agenda plan date, YYYY-MM-DD")
+    daily.add_argument("--start", help="agenda start time, HH:MM")
+    daily.add_argument("--end", help="agenda end time, HH:MM")
+    daily.add_argument("--preset", choices=tuple(COLLECT_PRESETS.keys()), default="core")
+    daily.add_argument(
+        "--prefer",
+        choices=("open-stt", "deterministic"),
+        default="open-stt",
+        help="choose the readiness rail to prioritize",
+    )
+    daily.add_argument("--manifest", help="Jarvis sample manifest path")
+    daily.add_argument("--full", action="store_true", help="include ctos-core SSH/backend probes through status")
+    daily.add_argument("--json", action="store_true")
+    daily.set_defaults(func=cmd_daily)
+
+    inbox = sub.add_parser(
+        "inbox",
+        aliases=["queue"],
+        help="show pending agenda proposals and generic CTOS approvals; read-only",
+    )
+    inbox.add_argument("--limit", type=int, default=5)
+    inbox.add_argument("--all", action="store_true", help="show all generic approval statuses")
+    inbox.add_argument("--json", action="store_true")
+    inbox.set_defaults(func=cmd_inbox)
+
+    draft = sub.add_parser(
+        "draft",
+        aliases=["stage"],
+        help="route natural text and optionally save a pending agenda proposal",
+    )
+    draft.add_argument("text", nargs="+", help="text to route; use '-' to read stdin")
+    draft.add_argument("--source", choices=("typed", "voice", "stt", "assistant"), default="typed")
+    draft.add_argument("--threshold", type=float, default=0.72)
+    draft.add_argument(
+        "--save",
+        action="store_true",
+        help="save only a recognized agenda proposal as pending; never write the final agenda",
+    )
+    draft.add_argument("--json", action="store_true")
+    draft.set_defaults(func=cmd_draft)
+
+    request = sub.add_parser(
+        "request",
+        aliases=["do", "handle"],
+        help="one-shot text-first Jarvis request: auto-stage agenda proposals, then show inbox",
+    )
+    request.add_argument("text", nargs="+", help="text to route; use '-' to read stdin")
+    request.add_argument("--source", choices=("typed", "voice", "stt", "assistant"), default="typed")
+    request.add_argument("--threshold", type=float, default=0.72)
+    request.add_argument("--no-save", action="store_true", help="do not auto-stage recognized agenda proposals")
+    request.add_argument("--inbox", action="store_true", help="show the inbox even when nothing was staged")
+    request.add_argument("--no-inbox", action="store_true", help="do not show the inbox after staging")
+    request.add_argument("--json", action="store_true")
+    request.set_defaults(func=cmd_request)
+
+    chat = sub.add_parser(
+        "chat",
+        aliases=["talk"],
+        help="local read-only Jarvis chat over ctos-ai-chat/Ollama",
+    )
+    chat.add_argument("prompt", nargs="*", help="optional one-shot prompt; omit for REPL, use '-' to read stdin")
+    chat.add_argument("--brief", action="store_true", help="inject the current CTOS brief into the system prompt")
+    chat.add_argument("--model", default="qwen2.5-coder:0.5b")
+    chat.add_argument("--temperature", type=float, default=0.2)
+    chat.add_argument("--max-tokens", type=int, default=180)
+    chat.add_argument("--max-turns", type=int, default=8)
+    chat.add_argument("--timeout", type=float, default=240)
+    chat.add_argument("--system", default="", help="override the default CTOS bounded system prompt")
+    chat.add_argument("--speak", action="store_true", help="speak replies through ctos-voice")
+    chat.add_argument("--no-ensure-server", action="store_false", dest="ensure_server", help="do not start ctos-ai-api-server")
+    chat.add_argument("--stop-server", action="store_true", help="stop the API server after this chat exits")
+    chat.add_argument("--plan", action="store_true", help="show the lower-level ctos-ai-chat command")
+    chat.add_argument("--json", action="store_true")
+    chat.set_defaults(func=cmd_chat, ensure_server=True)
+
+    bootstrap = sub.add_parser(
+        "bootstrap",
+        aliases=["onboard"],
+        help="show or run one safe Jarvis bootstrap step, then recheck status",
+    )
+    bootstrap.add_argument("--full", action="store_true", help="include ctos-core SSH/backend probes")
+    bootstrap.add_argument("--preset", choices=tuple(COLLECT_PRESETS.keys()), default="core")
+    bootstrap.add_argument(
+        "--prefer",
+        choices=("open-stt", "deterministic"),
+        default="open-stt",
+        help="choose the readiness rail to prioritize",
+    )
+    bootstrap.add_argument("--manifest", help="Jarvis sample manifest path")
+    bootstrap.add_argument("--run", action="store_true", help="execute one selected bootstrap step")
+    bootstrap.add_argument("--yes", action="store_true", help="pass non-interactive confirmation to compatible capture commands")
+    bootstrap.add_argument("--run-timeout", type=float, default=300.0, help="timeout for --run --json subprocess capture")
+    bootstrap.add_argument("--json", action="store_true")
+    bootstrap.set_defaults(func=cmd_bootstrap)
+
+    mature_plan = sub.add_parser(
+        "mature-plan",
+        aliases=["mature", "adopt"],
+        help="show the open-source adoption path behind CTOS authority",
+    )
+    mature_plan.add_argument("--commands", action="store_true", help="print only the operator command sequence")
+    mature_plan.add_argument("--json", action="store_true")
+    mature_plan.set_defaults(func=cmd_mature_plan)
+
+    mature_check = sub.add_parser(
+        "mature-check",
+        aliases=["readiness", "preflight"],
+        help="read-only readiness check for the mature Jarvis stack",
+    )
+    mature_check.add_argument("--full", action="store_true", help="include ctos-core SSH/backend probes")
+    mature_check.add_argument(
+        "--prefer",
+        choices=("open-stt", "deterministic"),
+        default="open-stt",
+        help="choose the next-action rail to prioritize",
+    )
+    mature_check.add_argument("--manifest", help="Jarvis sample manifest path")
+    mature_check.add_argument("--smoke", action="store_true", help="also run the local non-destructive Jarvis smoke test")
+    mature_check.add_argument("--json", action="store_true")
+    mature_check.set_defaults(func=cmd_mature_check)
+
+    smoke = sub.add_parser("smoke", help="run a quick non-destructive Jarvis readiness check")
+    smoke.add_argument("--full", action="store_true", help="include ctos-core SSH/backend checks instead of local-only doctor")
+    smoke.add_argument("--with-model", action="store_true", help="also ask the local model fallback")
+    smoke.add_argument("--model-timeout", type=float, default=180)
+    smoke.add_argument("--json", action="store_true")
+    smoke.set_defaults(func=cmd_smoke)
+
+    text = sub.add_parser("text", aliases=["ask"], help="send typed text through the bounded Jarvis bridge")
+    add_common_assistant_args(text, typed=True)
+    text.add_argument("phrase", nargs="+")
+    text.set_defaults(func=cmd_text)
+
+    voice = sub.add_parser("voice", help="record one push-to-talk phrase and route it through Jarvis")
+    add_common_assistant_args(voice, typed=False)
+    voice.add_argument("--seconds", type=float, default=4.0)
+    voice.add_argument("--from-wav", help="debug: use an existing WAV instead of recording")
+    voice.set_defaults(func=cmd_voice)
+
+    listen = sub.add_parser(
+        "listen",
+        aliases=["open-voice"],
+        help="record one phrase through the open-STT Whisper rail and route it through CTOS",
+    )
+    listen.add_argument("--seconds", type=float, default=5.0)
+    listen.add_argument("--host", default="10.42.0.2")
+    listen.add_argument("--user", default="ctos")
+    listen.add_argument("--port", type=int, default=10301)
+    listen.add_argument("--model", default="base-int8")
+    listen.add_argument("--preprocess", choices=("auto", "off", "normalize"), default="auto")
+    listen.add_argument("--threshold", type=float, default=0.72, help="intent/proposal threshold for the draft rail")
+    listen.add_argument("--from-wav", help="debug: use an existing WAV instead of recording")
+    listen.add_argument("--keep-wav", help="record to this WAV path and keep it for debugging")
+    listen.add_argument("--preprocess-wav", help="keep the preprocessed STT WAV for debugging")
+    listen.add_argument("--no-start", action="store_true", help="do not start open-STT if it is not already running")
+    listen.add_argument("--keep-backend", action="store_true", help="leave open-STT running after this prompt")
+    listen.add_argument("--stop", action="store_true", help="stop open-STT after this prompt even if it was already running")
+    listen.add_argument("--execute-safe", action="store_true", help="execute only CTOS-owned Tier 0/1 actions")
+    listen.add_argument("--save-agenda", action="store_true", help="store a recognized agenda proposal without writing agenda state")
+    listen.add_argument("--no-transcript-guard", action="store_true", help="debug only: bypass the transcript guard")
+    listen.add_argument("--no-speak", action="store_true")
+    listen.add_argument("--plan", action="store_true")
+    listen.add_argument("--json", action="store_true")
+    listen.set_defaults(func=cmd_listen)
+
+    calibrate = sub.add_parser(
+        "calibrate",
+        aliases=["calibration"],
+        help="run one readable open-STT calibration: audio level, transcript, guard, and CTOS route",
+    )
+    calibrate.add_argument("--seconds", type=float, default=5.0)
+    calibrate.add_argument("--host", default="10.42.0.2")
+    calibrate.add_argument("--user", default="ctos")
+    calibrate.add_argument("--port", type=int, default=10301)
+    calibrate.add_argument("--model", default="base-int8")
+    calibrate.add_argument("--preprocess", choices=("auto", "off", "normalize"), default="auto")
+    calibrate.add_argument("--threshold", type=float, default=0.72, help="intent/proposal threshold for the draft rail")
+    calibrate.add_argument("--from-wav", help="debug: use an existing WAV instead of recording")
+    calibrate.add_argument("--keep-wav", help="record to this WAV path and keep it")
+    calibrate.add_argument("--preprocess-wav", help="keep the preprocessed STT WAV at this path")
+    calibrate.add_argument("--no-start", action="store_true", help="do not start open-STT if it is not already running")
+    calibrate.add_argument("--keep-backend", action="store_true", default=True, help="leave open-STT running after the calibration")
+    calibrate.add_argument("--stop", action="store_true", help="stop open-STT after this calibration")
+    calibrate.add_argument("--execute-safe", action="store_true", help="execute only CTOS-owned Tier 0/1 actions")
+    calibrate.add_argument("--save-agenda", action="store_true", help="store a recognized agenda proposal without writing agenda state")
+    calibrate.add_argument("--no-transcript-guard", action="store_true", help="debug only: bypass the transcript guard")
+    calibrate.add_argument("--clean", action="store_true", help="remove temporary WAVs after printing the report")
+    calibrate.add_argument("--json", action="store_true")
+    calibrate.set_defaults(func=cmd_calibrate)
+
+    session = sub.add_parser(
+        "session",
+        aliases=["practice", "drill"],
+        help="run several readable open-STT calibration rounds while reusing the backend",
+    )
+    session.add_argument("--rounds", type=int, default=3)
+    session.add_argument("--seconds", type=float, default=5.0)
+    session.add_argument("--host", default="10.42.0.2")
+    session.add_argument("--user", default="ctos")
+    session.add_argument("--port", type=int, default=10301)
+    session.add_argument("--model", default="base-int8")
+    session.add_argument("--preprocess", choices=("auto", "off", "normalize"), default="auto")
+    session.add_argument("--threshold", type=float, default=0.72, help="intent/proposal threshold for the draft rail")
+    session.add_argument("--from-wav", help="debug: reuse an existing WAV for every round")
+    session.add_argument("--no-start", action="store_true", help="do not start open-STT if it is not already running")
+    session.add_argument("--keep-backend", action="store_true", help="leave open-STT running after the session")
+    session.add_argument("--save-agenda", action="store_true", help="store recognized agenda proposals without writing agenda state")
+    session.add_argument("--execute-safe", action="store_true", help="execute only CTOS-owned Tier 0/1 actions")
+    session.add_argument("--no-transcript-guard", action="store_true", help="debug only: bypass the transcript guard")
+    session.add_argument("--clean", action="store_true", help="remove temporary WAVs after each report")
+    session.add_argument("--inbox", action="store_true", help="show the combined Jarvis inbox at the end of the session")
+    session.add_argument("--no-inbox", action="store_true", help="disable the automatic inbox after --save-agenda")
+    session.add_argument("--review", action="store_true", help="show agenda-only proposals at the end of the session")
+    session.add_argument("--no-review", action="store_true", help="disable the automatic read-only inbox/review after --save-agenda")
+    session.add_argument("--no-preflight", action="store_true", help="skip the read-only microphone/backend/agenda checks before recording")
+    session.add_argument("--strict-preflight", action="store_true", help="stop if any preflight check warns")
+    session.add_argument("--no-prompt", action="store_true", help="do not wait for Enter before each round")
+    session.add_argument("--stop-on-success", action="store_true", help="stop after the first successful calibration")
+    session.add_argument("--stop-on-failure", action="store_true", help="stop after the first failed calibration")
+    session.set_defaults(func=cmd_session)
+
+    run_cmd = sub.add_parser(
+        "run",
+        help="daily safe voice loop: open-STT session, proposal staging, and inbox review",
+    )
+    run_cmd.add_argument("--rounds", type=int, default=3)
+    run_cmd.add_argument("--seconds", type=float, default=5.0)
+    run_cmd.add_argument("--host", default="10.42.0.2")
+    run_cmd.add_argument("--user", default="ctos")
+    run_cmd.add_argument("--port", type=int, default=10301)
+    run_cmd.add_argument("--model", default="base-int8")
+    run_cmd.add_argument("--preprocess", choices=("auto", "off", "normalize"), default="auto")
+    run_cmd.add_argument("--threshold", type=float, default=0.72, help="intent/proposal threshold for the draft rail")
+    run_cmd.add_argument("--from-wav", help="debug: reuse an existing WAV for every round")
+    run_cmd.add_argument("--no-start", action="store_true", help="do not start open-STT if it is not already running")
+    run_cmd.add_argument("--keep-backend", action="store_true", help="leave open-STT running after the run")
+    run_cmd.add_argument("--no-save-agenda", action="store_true", help="do not stage agenda proposals during the run")
+    run_cmd.add_argument("--execute-safe", action="store_true", help="execute only CTOS-owned Tier 0/1 actions instead of staging agenda")
+    run_cmd.add_argument("--no-transcript-guard", action="store_true", help="debug only: bypass the transcript guard")
+    run_cmd.add_argument("--clean", action="store_true", help="remove temporary WAVs after each report")
+    run_cmd.add_argument("--inbox", action="store_true", help="show the combined Jarvis inbox at the end even when agenda staging is disabled")
+    run_cmd.add_argument("--no-inbox", action="store_true", help="disable the automatic inbox")
+    run_cmd.add_argument("--review", action="store_true", help="show agenda-only proposals at the end instead of inbox")
+    run_cmd.add_argument("--no-review", action="store_true", help="disable the automatic read-only inbox/review")
+    run_cmd.add_argument("--no-preflight", action="store_true", help="skip the read-only microphone/backend/agenda checks before recording")
+    run_cmd.add_argument("--strict-preflight", action="store_true", help="stop if any preflight check warns")
+    run_cmd.add_argument("--no-prompt", action="store_true", help="do not wait for Enter before each round")
+    run_cmd.add_argument("--stop-on-success", action="store_true", help="stop after the first successful calibration")
+    run_cmd.add_argument("--stop-on-failure", action="store_true", help="stop after the first failed calibration")
+    run_cmd.add_argument("--plan", action="store_true", help="print the exact lower-level session command")
+    run_cmd.set_defaults(func=cmd_run)
+
+    sample = sub.add_parser(
+        "sample",
+        help="record or register a reusable labeled voice sample outside the repo",
+    )
+    sample.add_argument("label", nargs="*", help="expected phrase or human label for this sample")
+    sample.add_argument("--name", help="explicit label; overrides positional label text")
+    sample.add_argument("--seconds", type=float, default=5.0)
+    sample.add_argument("--from-wav", help="copy an existing WAV into the Jarvis sample store")
+    sample.add_argument("--dir", help="sample directory; default: ~/.local/state/ctos/jarvis-samples")
+    sample.add_argument("--manifest", help="JSONL manifest path; default: <sample-dir>/manifest.jsonl")
+    sample.add_argument("--intent-id", help="optional fixed CTOS intent id for Vosk-style regression")
+    sample.add_argument("--note", help="optional operator note stored in the manifest row")
+    sample.add_argument("--plan", action="store_true", help="print paths and commands without recording or writing")
+    sample.add_argument("--json", action="store_true")
+    sample.set_defaults(func=cmd_sample)
+
+    collect = sub.add_parser(
+        "collect",
+        aliases=["collect-samples"],
+        help="guided capture of a small reusable Jarvis voice sample suite",
+    )
+    collect.add_argument("phrases", nargs="*", help="optional single phrase; quote multi-word text")
+    collect.add_argument("--phrase", action="append", help="add one phrase; may be repeated")
+    collect.add_argument("--preset", choices=tuple(COLLECT_PRESETS.keys()), default="core")
+    collect.add_argument("--seconds", type=float, default=4.0)
+    collect.add_argument("--dir", help="sample directory; default: ~/.local/state/ctos/jarvis-samples")
+    collect.add_argument("--manifest", help="JSONL manifest path; default: <sample-dir>/manifest.jsonl")
+    collect.add_argument("--note", help="operator note stored on every sample")
+    collect.add_argument("--no-intent-ids", action="store_true", help="store transcript-only samples instead of fixed intent ids")
+    collect.add_argument("--yes", action="store_true", help="do not wait for Enter before each phrase")
+    collect.add_argument("--no-preflight", action="store_true", help="skip the read-only audio checks before recording")
+    collect.add_argument("--strict-preflight", action="store_true", help="stop before recording if an audio preflight check warns")
+    collect.add_argument("--stop-on-failure", action="store_true")
+    collect.add_argument("--run-regression", action="store_true", help="run regression after recording")
+    collect.add_argument("--regression-backend", choices=("vosk", "open-stt"), default="vosk")
+    collect.add_argument("--threshold", type=float, default=0.72)
+    collect.add_argument("--text-threshold", type=float, default=0.66)
+    collect.add_argument("--timeout", type=float, default=20.0)
+    collect.add_argument("--host", default="10.42.0.2")
+    collect.add_argument("--user", default="ctos")
+    collect.add_argument("--preprocess", choices=("auto", "off", "normalize"), default="auto")
+    collect.add_argument("--plan", action="store_true")
+    collect.add_argument("--json", action="store_true")
+    collect.set_defaults(func=cmd_collect)
+
+    collect_next = sub.add_parser(
+        "collect-next",
+        aliases=["sample-next", "next-sample"],
+        help="record only the next missing or weak corpus phrase",
+    )
+    collect_next.add_argument("--preset", choices=tuple(COLLECT_PRESETS.keys()), default="core")
+    collect_next.add_argument("--seconds", type=float, default=4.0)
+    collect_next.add_argument("--dir", help="sample directory; default: ~/.local/state/ctos/jarvis-samples")
+    collect_next.add_argument("--manifest", help="JSONL manifest path; default: <sample-dir>/manifest.jsonl")
+    collect_next.add_argument("--note", help="operator note stored on the sample")
+    collect_next.add_argument("--no-intent-ids", action="store_true", help="store transcript-only samples instead of fixed intent ids")
+    collect_next.add_argument("--yes", action="store_true", help="do not wait for Enter before recording")
+    collect_next.add_argument("--no-preflight", action="store_true", help="skip the read-only audio checks before recording")
+    collect_next.add_argument("--strict-preflight", action="store_true", help="stop before recording if an audio preflight check warns")
+    collect_next.add_argument("--run", action="store_true", help="record the selected phrase")
+    collect_next.add_argument("--json", action="store_true")
+    collect_next.set_defaults(func=cmd_collect_next)
+
+    corpus = sub.add_parser(
+        "corpus",
+        aliases=["corpus-check", "sample-check"],
+        help="read-only verdict for the reusable Jarvis voice sample corpus",
+    )
+    corpus.add_argument("--manifest", help="JSONL manifest path; default: ~/.local/state/ctos/jarvis-samples/manifest.jsonl")
+    corpus.add_argument("--preset", choices=tuple(COLLECT_PRESETS.keys()), default="core")
+    corpus.add_argument("--min-samples", type=int, help="override required sample count")
+    corpus.add_argument("--no-check-files", dest="check_files", action="store_false", help="do not verify referenced WAV files exist")
+    corpus.add_argument("--allow-incomplete", action="store_true", help="return success for incomplete but readable manifests")
+    corpus.add_argument("--json", action="store_true")
+    corpus.set_defaults(func=cmd_corpus, check_files=True)
+
+    samples = sub.add_parser("samples", aliases=["sample-list"], help="show reusable Jarvis samples and replay commands")
+    samples.add_argument("--manifest", help="JSONL manifest path; default: ~/.local/state/ctos/jarvis-samples/manifest.jsonl")
+    samples.add_argument("--limit", type=int, default=8, help="number of recent samples to show; 0 shows all")
+    samples.add_argument("--json", action="store_true")
+    samples.set_defaults(func=cmd_samples)
+
+    evaluate = sub.add_parser(
+        "evaluate",
+        aliases=["eval", "test-corpus"],
+        help="gate the Jarvis corpus, then run sample regression only when ready",
+    )
+    evaluate.add_argument("--manifest", help="JSONL manifest path; default: ~/.local/state/ctos/jarvis-samples/manifest.jsonl")
+    evaluate.add_argument("--preset", choices=tuple(COLLECT_PRESETS.keys()), default="core")
+    evaluate.add_argument("--min-samples", type=int, help="override required sample count")
+    evaluate.add_argument("--no-check-files", dest="check_files", action="store_false", help="do not verify referenced WAV files exist")
+    evaluate.add_argument("--allow-incomplete", action="store_true", help="allow regression on incomplete but readable manifests")
+    evaluate.add_argument("--backend", choices=("vosk", "open-stt", "both"), default="vosk")
+    evaluate.add_argument("--threshold", type=float, default=0.72)
+    evaluate.add_argument("--text-threshold", type=float, default=0.66)
+    evaluate.add_argument("--timeout", type=float, default=20.0)
+    evaluate.add_argument("--wyoming-host", default="127.0.0.1")
+    evaluate.add_argument("--wyoming-port", type=int, default=10301)
+    evaluate.add_argument("--no-target-tunnel", action="store_true", help="for open-STT, use local wyoming host/port instead of ctos-core tunnel")
+    evaluate.add_argument("--host", default="10.42.0.2")
+    evaluate.add_argument("--user", default="ctos")
+    evaluate.add_argument("--language", default="fr")
+    evaluate.add_argument("--preprocess", choices=("auto", "off", "normalize"), default="auto")
+    evaluate.add_argument("--plan", action="store_true")
+    evaluate.add_argument("--json", action="store_true")
+    evaluate.set_defaults(func=cmd_evaluate, check_files=True)
+
+    triage = sub.add_parser(
+        "triage",
+        aliases=["decide", "verdict"],
+        help="read-only next-action verdict for the reusable Jarvis voice corpus",
+    )
+    triage.add_argument("--manifest", help="JSONL manifest path; default: ~/.local/state/ctos/jarvis-samples/manifest.jsonl")
+    triage.add_argument("--preset", choices=tuple(COLLECT_PRESETS.keys()), default="core")
+    triage.add_argument("--min-samples", type=int, help="override required sample count")
+    triage.add_argument("--no-check-files", dest="check_files", action="store_false", help="do not verify referenced WAV files exist")
+    triage.add_argument("--limit", type=int, default=8, help="number of recent samples to include in JSON")
+    triage.add_argument("--json", action="store_true")
+    triage.set_defaults(func=cmd_triage, check_files=True)
+
+    improve = sub.add_parser(
+        "improve",
+        aliases=["cycle", "advance"],
+        help="triage the corpus and optionally run the next safe improvement step",
+    )
+    improve.add_argument("--manifest", help="JSONL manifest path; default: ~/.local/state/ctos/jarvis-samples/manifest.jsonl")
+    improve.add_argument("--dir", help="sample directory used if the next step records samples")
+    improve.add_argument("--preset", choices=tuple(COLLECT_PRESETS.keys()), default="core")
+    improve.add_argument("--min-samples", type=int, help="override required sample count")
+    improve.add_argument("--no-check-files", dest="check_files", action="store_false", help="do not verify referenced WAV files exist")
+    improve.add_argument("--limit", type=int, default=8, help="number of recent samples to inspect")
+    improve.add_argument("--backend", choices=("vosk", "open-stt", "both"), default="both")
+    improve.add_argument("--seconds", type=float, default=4.0, help="recording length when the next step is sample collection")
+    improve.add_argument("--yes", action="store_true", help="do not wait for Enter before each recorded phrase")
+    improve.add_argument("--no-preflight", action="store_true", help="skip audio preflight if the next step records samples")
+    improve.add_argument("--relaxed-preflight", action="store_true", help="warn instead of blocking on audio preflight during collection")
+    improve.add_argument("--stop-on-failure", action="store_true", help="stop guided collection after the first failed sample")
+    improve.add_argument("--no-intent-ids", action="store_true", help="store transcript-only samples during collection")
+    improve.add_argument("--note", help="operator note stored on every collected sample")
+    improve.add_argument("--allow-incomplete", action="store_true", help="allow evaluation on incomplete but readable manifests")
+    improve.add_argument("--threshold", type=float, default=0.72)
+    improve.add_argument("--text-threshold", type=float, default=0.66)
+    improve.add_argument("--timeout", type=float, default=20.0)
+    improve.add_argument("--run-timeout", type=float, default=300.0, help="timeout for --run --json subprocess capture")
+    improve.add_argument("--wyoming-host", default="127.0.0.1")
+    improve.add_argument("--wyoming-port", type=int, default=10301)
+    improve.add_argument("--no-target-tunnel", action="store_true", help="for open-STT, use local wyoming host/port instead of ctos-core tunnel")
+    improve.add_argument("--host", default="10.42.0.2")
+    improve.add_argument("--user", default="ctos")
+    improve.add_argument("--language", default="fr")
+    improve.add_argument("--preprocess", choices=("auto", "off", "normalize"), default="auto")
+    improve.add_argument("--plan", action="store_true", help="force plan-only output")
+    improve.add_argument("--run", action="store_true", help="execute the selected next step")
+    improve.add_argument("--json", action="store_true")
+    improve.set_defaults(func=cmd_improve, check_files=True)
+
+    regression = sub.add_parser("regression", aliases=["test-samples"], help="run sample regression through ctos-voice-v2")
+    regression.add_argument("--manifest", help="JSONL manifest path; default: ~/.local/state/ctos/jarvis-samples/manifest.jsonl")
+    regression.add_argument("--backend", choices=("vosk", "open-stt"), default="vosk")
+    regression.add_argument("--threshold", type=float, default=0.72)
+    regression.add_argument("--text-threshold", type=float, default=0.66)
+    regression.add_argument("--timeout", type=float, default=20.0)
+    regression.add_argument("--wyoming-host", default="127.0.0.1")
+    regression.add_argument("--wyoming-port", type=int, default=10301)
+    regression.add_argument("--target-tunnel", action="store_true")
+    regression.add_argument("--host", default="10.42.0.2")
+    regression.add_argument("--user", default="ctos")
+    regression.add_argument("--language", default="fr")
+    regression.add_argument("--preprocess", choices=("auto", "off", "normalize"), default="auto")
+    regression.add_argument("--plan", action="store_true")
+    regression.add_argument("--json", action="store_true")
+    regression.set_defaults(func=cmd_regression)
+
+    review = sub.add_parser("review", help="show pending agenda proposals; read-only")
+    review.add_argument("--json", action="store_true")
+    review.set_defaults(func=cmd_review)
+
+    confirm = sub.add_parser("confirm", help="confirm a pending agenda proposal by id or 'latest'")
+    confirm.add_argument("selector", nargs="?", default="latest")
+    confirm.add_argument("--yes", action="store_true", help="required by ctos-ai to write the agenda")
+    confirm.add_argument("--json", action="store_true", help="emit confirm result plus optional inbox as JSON")
+    confirm.add_argument("--no-inbox", action="store_true", help="do not show the consolidated inbox after success")
+    confirm.set_defaults(func=cmd_confirm)
+
+    reject = sub.add_parser("reject", help="reject a pending agenda proposal by id or 'latest'")
+    reject.add_argument("selector", nargs="?", default="latest")
+    reject.add_argument("--reason", help="store a short reason on the rejected proposal")
+    reject.add_argument("--json", action="store_true", help="emit reject result plus optional inbox as JSON")
+    reject.add_argument("--no-inbox", action="store_true", help="do not show the consolidated inbox after success")
+    reject.set_defaults(func=cmd_reject)
+
+    setup_voice = sub.add_parser("setup-voice", help="run or preview the mature voice backend setup gate")
+    setup_voice.add_argument("--plan", action="store_true")
+    setup_voice.set_defaults(func=cmd_setup_voice)
+
+    unlock_voice = sub.add_parser("unlock-voice", help="prepare the mature Home Assistant/Speech-to-Phrase rail")
+    unlock_voice.add_argument("--plan", action="store_true", help="show the lower-level setup sequence")
+    unlock_voice.add_argument("--interactive", action="store_true", help="run the guided setup; may request hidden secrets")
+    unlock_voice.add_argument("--no-tunnel", action="store_true", help="skip idempotent Home Assistant tunnel check/start")
+    unlock_voice.add_argument("--start", action="store_true", help="start Speech-to-Phrase if the token gate is ready")
+    unlock_voice.add_argument("--test", action="store_true", help="record one Speech-to-Phrase test only if the stack is ready")
+    unlock_voice.add_argument("--record-seconds", type=float, default=3.0)
+    unlock_voice.add_argument("--execute-safe", action="store_true", help="execute Tier 0/1 recognized command during --test")
+    unlock_voice.add_argument("--json", action="store_true")
+    unlock_voice.set_defaults(func=cmd_unlock_voice)
+
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

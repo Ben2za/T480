@@ -1,0 +1,120 @@
+{
+  "schema": 1,
+  "language": "fr",
+  "updated": "2026-07-07",
+  "policy": {
+    "microphone": "push_to_talk",
+    "default_tier": 1,
+    "mutable_actions": "approval_required",
+    "recordings": "temporary_by_default"
+  },
+  "intents": [
+    {
+      "id": "ctos_brief",
+      "tier": 0,
+      "command": ["ctos-ai", "brief"],
+      "spoken_reply": "Brief CTOS affiche.",
+      "phrases": [
+        "brief",
+        "statut",
+        "status",
+        "etat du systeme",
+        "sante du systeme",
+        "comment va ctos",
+        "rapport systeme"
+      ]
+    },
+    {
+      "id": "ctos_agenda",
+      "tier": 1,
+      "command": ["ctos-ai", "plan-day"],
+      "spoken_reply": "Plan agenda affiche.",
+      "phrases": [
+        "agenda",
+        "l agenda",
+        "a jenda",
+        "ajenda",
+        "mon agenda",
+        "plan du jour",
+        "ma journee",
+        "calendrier",
+        "planning du jour",
+        "organise ma journee",
+        "planning"
+      ]
+    },
+    {
+      "id": "ctos_agenda_review",
+      "tier": 0,
+      "command": ["ctos-ai", "agenda-review"],
+      "spoken_reply": "Propositions agenda affichees.",
+      "phrases": [
+        "propositions agenda",
+        "validation agenda",
+        "validations agenda",
+        "agenda en attente",
+        "taches en attente de validation",
+        "prochaine validation agenda",
+        "review agenda"
+      ]
+    },
+    {
+      "id": "ctos_open_desk",
+      "tier": 1,
+      "command": ["ctos-ai", "open-desk", "--wait", "20"],
+      "spoken_reply": "Ouverture ou reparation du bureau distant demandee.",
+      "phrases": [
+        "ouvre desk",
+        "ouvre le bureau",
+        "ouvre la tour",
+        "repare desk",
+        "repare le bureau distant",
+        "desktop",
+        "bureau distant"
+      ]
+    },
+    {
+      "id": "ctos_open_vms",
+      "tier": 1,
+      "command": ["ctos-ai", "open-vms"],
+      "spoken_reply": "Panneau VMS ouvert.",
+      "phrases": [
+        "ouvre vms",
+        "ouvre les vms",
+        "machines virtuelles",
+        "virtualisation",
+        "panneau kali",
+        "ouvre kali",
+        "vm kali"
+      ]
+    },
+    {
+      "id": "ctos_approvals",
+      "tier": 0,
+      "command": ["ctos-ai", "approvals"],
+      "spoken_reply": "Approbations affichees.",
+      "phrases": [
+        "approbations",
+        "validations",
+        "actions en attente",
+        "approval",
+        "approvals",
+        "ce qui attend validation"
+      ]
+    },
+    {
+      "id": "ctos_capabilities",
+      "tier": 0,
+      "command": ["ctos-ai", "capabilities"],
+      "spoken_reply": "Capacites CTOS affichees.",
+      "phrases": [
+        "capacites",
+        "permissions",
+        "droits",
+        "que peux tu faire",
+        "liste tes commandes",
+        "aide"
+      ]
+    }
+  ]
+}

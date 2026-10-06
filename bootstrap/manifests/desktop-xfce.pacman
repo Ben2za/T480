@@ -1,0 +1,38 @@
+# First tower desktop baseline.
+# Xfce is intentionally chosen for the 8 GiB RAM V1; richer desktops can come later.
+# Keep explicit packages here, not pacman groups, so bootstrap stays scriptable.
+exo
+garcon
+xfce4-appfinder
+xfce4-panel
+xfce4-power-manager
+xfce4-session
+xfce4-settings
+xfce4-terminal
+xfconf
+xfdesktop
+xfwm4
+mousepad
+ristretto
+thunar-volman
+xfce4-clipman-plugin
+xfce4-notifyd
+xfce4-pulseaudio-plugin
+xfce4-screenshooter
+xfce4-taskmanager
+xfce4-whiskermenu-plugin
+lightdm
+lightdm-gtk-greeter
+firefox
+kitty
+thunar
+thunar-archive-plugin
+gvfs
+gvfs-mtp
+tumbler
+ffmpegthumbnailer
+file-roller
+pavucontrol
+network-manager-applet
+xdg-user-dirs
+xdg-utils

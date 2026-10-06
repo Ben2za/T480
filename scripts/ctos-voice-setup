@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+ROOT="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
+VOICE_V2="${ROOT}/scripts/ctos-voice-v2"
+
+usage() {
+	cat <<'USAGE'
+usage: ctos-voice-setup [--plan]
+
+Interactive setup for the temporary CTOS voice backend:
+  - check local/ctos-core voice readiness
+  - ensure the temporary Home Assistant context is running
+  - ensure the local T480 tunnel to Home Assistant is available
+  - run browserless Home Assistant onboarding if the token is missing
+  - start the temporary Speech-to-Phrase container once readiness is green
+
+Secrets are requested only through hidden prompts and are not printed.
+
+Options:
+  --plan     print the sequence without running SSH/container commands
+  -h, --help show this help
+USAGE
+}
+
+section() {
+	printf '\n%s\n' "$1"
+	printf '%*s\n' "${#1}" '' | tr ' ' '='
+}
+
+run_optional() {
+	local rc
+	set +e
+	"$@"
+	rc=$?
+	set -e
+	return "$rc"
+}
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+	usage
+	exit 0
+fi
+
+if [ "${1:-}" = "--plan" ]; then
+	section "CTOS Voice Setup Plan"
+	printf '1. %s doctor\n' "$VOICE_V2"
+	printf '2. %s status --target-probe\n' "$VOICE_V2"
+	printf '3. %s hass-context status || %s hass-context start\n' "$VOICE_V2" "$VOICE_V2"
+	printf '4. %s hass-context tunnel-start\n' "$VOICE_V2"
+	printf '5. %s hass-context readiness\n' "$VOICE_V2"
+	printf '6. if token is missing: %s hass-context onboard-api\n' "$VOICE_V2"
+	printf '7. %s hass-context readiness\n' "$VOICE_V2"
+	printf '8. %s stp-container start\n' "$VOICE_V2"
+	printf '9. %s stp-transcribe --target-tunnel --record-seconds 3 --route\n' "$VOICE_V2"
+	printf '10. %s open-stt-plan --target-probe\n' "$VOICE_V2"
+	exit 0
+fi
+
+if [ "$#" -gt 0 ]; then
+	usage >&2
+	exit 2
+fi
+
+section "CTOS Voice Setup"
+printf 'This prepares the temporary local voice backend.\n'
+printf 'Secrets are requested only through hidden prompts and are not printed.\n'
+
+section "Local / Core Status"
+run_optional "$VOICE_V2" doctor || true
+run_optional "$VOICE_V2" status --target-probe || true
+
+section "Home Assistant Context"
+if ! run_optional "$VOICE_V2" hass-context status; then
+	printf '\nHome Assistant context is not healthy; trying to start it.\n'
+	"$VOICE_V2" hass-context start
+fi
+
+section "Home Assistant Local Tunnel"
+"$VOICE_V2" hass-context tunnel-start
+
+section "Home Assistant Token Gate"
+if run_optional "$VOICE_V2" hass-context readiness; then
+	printf '\nHome Assistant token is already ready.\n'
+else
+	printf '\nHome Assistant is running, but the token is missing or invalid.\n'
+	printf 'Starting browserless onboarding now.\n'
+	printf 'Use a temporary local Home Assistant password; do not paste it into chat.\n\n'
+	"$VOICE_V2" hass-context onboard-api
+fi
+
+section "Readiness Recheck"
+"$VOICE_V2" hass-context readiness
+
+section "Speech-to-Phrase Runtime"
+run_optional "$VOICE_V2" stp-container status || true
+"$VOICE_V2" stp-container start
+run_optional "$VOICE_V2" stp-container status || true
+
+section "Speech-to-Phrase One-Shot"
+printf 'When ready to speak a short command, run:\n'
+printf '  %s stp-transcribe --target-tunnel --record-seconds 3 --route\n' "$VOICE_V2"
+printf 'Use --execute-safe only after --route shows the expected CTOS intent.\n'
+
+section "Open STT Rail"
+run_optional "$VOICE_V2" open-stt-plan --target-probe || true
+
+section "Next"
+printf 'Fixed-command backend should now be ready for the first recognition loop.\n'
+printf 'Run voice regression/sample commands from:\n'
+printf '  ctos-voice-v2 next-commands\n'

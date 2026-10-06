@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+from datetime import date, datetime, time, timedelta
+from pathlib import Path
+from typing import Any
+
+
+APP_DIR = Path(os.environ.get("CTOS_AI_HOME", Path.home() / ".local/share/ctos-ai")).expanduser()
+DB_PATH = Path(os.environ.get("CTOS_AI_DB", APP_DIR / "agenda.sqlite3")).expanduser()
+STATUSES = {"open", "done", "blocked", "dropped"}
+
+
+def now_iso() -> str:
+    return datetime.now().replace(microsecond=0).isoformat()
+
+
+def connect() -> sqlite3.Connection:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    init_db(conn)
+    return conn
+
+
+def init_db(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            notes TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'open',
+            priority INTEGER NOT NULL DEFAULT 3,
+            estimate_minutes INTEGER NOT NULL DEFAULT 60,
+            due_date TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS blocks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+            block_date TEXT NOT NULL,
+            start_time TEXT NOT NULL,
+            end_time TEXT NOT NULL,
+            label TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+
+
+def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {key: row[key] for key in row.keys()}
+
+
+def parse_date(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value).isoformat()
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("date must be YYYY-MM-DD") from error
+
+
+def parse_hhmm(value: str) -> time:
+    try:
+        return datetime.strptime(value, "%H:%M").time()
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("time must be HH:MM") from error
+
+
+def parse_priority(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("priority must be an integer from 1 to 5") from error
+    if number < 1 or number > 5:
+        raise argparse.ArgumentTypeError("priority must be from 1 to 5")
+    return number
+
+
+def parse_estimate(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("estimate must be minutes") from error
+    if number < 5:
+        raise argparse.ArgumentTypeError("estimate must be at least 5 minutes")
+    return number
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    with connect():
+        pass
+    print(f"ctos agenda db ready: {DB_PATH}")
+    return 0
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    title = " ".join(args.title).strip()
+    if not title:
+        print("title is required", file=sys.stderr)
+        return 2
+    stamp = now_iso()
+    with connect() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO tasks (title, notes, priority, estimate_minutes, due_date, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (title, args.notes or "", args.priority, args.estimate, args.due, stamp, stamp),
+        )
+        task_id = cur.lastrowid
+    if args.json:
+        print(json.dumps({"id": task_id, "title": title}, ensure_ascii=False))
+    else:
+        print(f"added #{task_id}: {title}")
+    return 0
+
+
+def query_tasks(args: argparse.Namespace) -> list[dict[str, Any]]:
+    clauses = []
+    params: list[Any] = []
+    if not args.all:
+        clauses.append("status = ?")
+        params.append(args.status)
+    elif args.status:
+        clauses.append("status = ?")
+        params.append(args.status)
+    if args.due:
+        clauses.append("due_date = ?")
+        params.append(args.due)
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    sql = (
+        "SELECT * FROM tasks"
+        + where
+        + " ORDER BY CASE WHEN due_date IS NULL THEN 1 ELSE 0 END, due_date, priority DESC, id"
+    )
+    with connect() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def print_tasks(tasks: list[dict[str, Any]]) -> None:
+    if not tasks:
+        print("no tasks")
+        return
+    print("ID  P  EST  DUE         STATUS   TITLE")
+    print("--  -  ---  ----------  -------  -----")
+    for task in tasks:
+        due = task["due_date"] or "-"
+        print(
+            f"{task['id']:>2}  {task['priority']}  {task['estimate_minutes']:>3}  "
+            f"{due:<10}  {task['status']:<7}  {task['title']}"
+        )
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    tasks = query_tasks(args)
+    if args.json:
+        print(json.dumps({"tasks": tasks}, ensure_ascii=False))
+    else:
+        print_tasks(tasks)
+    return 0
+
+
+def cmd_done(args: argparse.Namespace) -> int:
+    stamp = now_iso()
+    with connect() as conn:
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+            (args.status, stamp, args.id),
+        )
+    if cur.rowcount == 0:
+        print(f"task #{args.id} not found", file=sys.stderr)
+        return 1
+    print(f"task #{args.id} -> {args.status}")
+    return 0
+
+
+def plan_candidates(plan_date: str) -> list[dict[str, Any]]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM tasks
+            WHERE status = 'open'
+              AND (due_date IS NULL OR due_date <= ?)
+            ORDER BY CASE WHEN due_date IS NULL THEN 1 ELSE 0 END, due_date, priority DESC, id
+            """,
+            (plan_date,),
+        ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def cmd_plan_day(args: argparse.Namespace) -> int:
+    plan_date = args.date or date.today().isoformat()
+    start = datetime.combine(date.fromisoformat(plan_date), args.start)
+    end = datetime.combine(date.fromisoformat(plan_date), args.end)
+    if start >= end:
+        print("start must be before end", file=sys.stderr)
+        return 2
+
+    cursor = start
+    blocks: list[dict[str, Any]] = []
+    spillover: list[dict[str, Any]] = []
+    for task in plan_candidates(plan_date):
+        duration = timedelta(minutes=int(task["estimate_minutes"]))
+        slack = timedelta(minutes=args.slack)
+        if cursor + duration > end:
+            spillover.append(task)
+            continue
+        block_end = cursor + duration
+        blocks.append(
+            {
+                "task_id": task["id"],
+                "title": task["title"],
+                "start": cursor.strftime("%H:%M"),
+                "end": block_end.strftime("%H:%M"),
+                "priority": task["priority"],
+                "due_date": task["due_date"],
+            }
+        )
+        cursor = min(block_end + slack, end)
+
+    payload = {"date": plan_date, "blocks": blocks, "spillover": spillover}
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+
+    print(f"CTOS agenda plan // {plan_date}")
+    print("=" * 32)
+    if not blocks:
+        print("no schedulable open tasks")
+    for block in blocks:
+        due = f" due {block['due_date']}" if block["due_date"] else ""
+        print(f"{block['start']}-{block['end']}  #{block['task_id']}  P{block['priority']}  {block['title']}{due}")
+    if spillover:
+        print("\nspillover")
+        for task in spillover:
+            print(f"- #{task['id']} P{task['priority']} {task['title']} ({task['estimate_minutes']} min)")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="CTOS local agenda helper")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    init = sub.add_parser("init", help="create the agenda database")
+    init.set_defaults(func=cmd_init)
+
+    add = sub.add_parser("add", help="add an agenda task")
+    add.add_argument("title", nargs="+")
+    add.add_argument("--notes", default="")
+    add.add_argument("--priority", type=parse_priority, default=3)
+    add.add_argument("--estimate", type=parse_estimate, default=60, help="minutes")
+    add.add_argument("--due", type=parse_date)
+    add.add_argument("--json", action="store_true")
+    add.set_defaults(func=cmd_add)
+
+    list_cmd = sub.add_parser("list", help="list agenda tasks")
+    list_cmd.add_argument("--all", action="store_true")
+    list_cmd.add_argument("--status", choices=sorted(STATUSES), default="open")
+    list_cmd.add_argument("--due", type=parse_date)
+    list_cmd.add_argument("--json", action="store_true")
+    list_cmd.set_defaults(func=cmd_list)
+
+    done = sub.add_parser("set-status", help="set a task status")
+    done.add_argument("id", type=int)
+    done.add_argument("status", choices=sorted(STATUSES))
+    done.set_defaults(func=cmd_done)
+
+    quick_done = sub.add_parser("done", help="mark a task done")
+    quick_done.add_argument("id", type=int)
+    quick_done.set_defaults(status="done", func=cmd_done)
+
+    plan = sub.add_parser("plan-day", help="create a simple day plan from open tasks")
+    plan.add_argument("--date", type=parse_date)
+    plan.add_argument("--start", type=parse_hhmm, default=time(9, 0))
+    plan.add_argument("--end", type=parse_hhmm, default=time(17, 0))
+    plan.add_argument("--slack", type=int, default=15, help="minutes between tasks")
+    plan.add_argument("--json", action="store_true")
+    plan.set_defaults(func=cmd_plan_day)
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        return int(args.func(args))
+    except (OSError, sqlite3.Error) as error:
+        print(f"ctos-agenda error: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

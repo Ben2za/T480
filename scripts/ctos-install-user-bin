@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BIN_DIR="${HOME}/.local/bin"
+BASHRC="${HOME}/.bashrc"
+
+COMMANDS=(
+  ctos-agenda
+  ctos-ai
+  ctos-ai-api
+  ctos-ai-api-server
+  ctos-ai-chat
+  ctos-ai-tunnel
+  ctos-audio
+  ctos-apple-host
+  ctos-apple-recovery
+  ctos-control
+  ctos-core
+  ctos-desk-guard
+  ctos-desk-remote
+  ctos-fleet
+  ctos-jarvis
+  ctos-kali
+  ctos-netwatch
+  ctos-ollama-bench
+  ctos-openjarvis
+  ctos-voice
+  ctos-voice-console
+  ctos-voice-ptt
+  ctos-voice-setup
+  ctos-voice-v2
+  ctos-vm
+  ctos-vms-panel
+)
+
+DRY_RUN=0
+FORCE=0
+
+usage() {
+  cat <<'USAGE'
+Usage: ctos-install-user-bin [--dry-run] [--force]
+
+Expose common CTOS repo commands through ~/.local/bin and make sure
+interactive Bash shells include ~/.local/bin in PATH.
+USAGE
+}
+
+while (($#)); do
+  case "$1" in
+    --dry-run) DRY_RUN=1 ;;
+    --force) FORCE=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+run() {
+  if ((DRY_RUN)); then
+    printf '[dry-run] %q' "$1"
+    shift
+    printf ' %q' "$@"
+    printf '\n'
+  else
+    "$@"
+  fi
+}
+
+if ((DRY_RUN)); then
+  echo "CTOS user command install plan"
+else
+  mkdir -p "$BIN_DIR"
+fi
+
+for name in "${COMMANDS[@]}"; do
+  src="${ROOT}/scripts/${name}"
+  dst="${BIN_DIR}/${name}"
+  if [[ ! -x "$src" ]]; then
+    echo "skip missing executable: $src" >&2
+    continue
+  fi
+  if [[ -L "$dst" && "$(readlink "$dst")" == "$src" ]]; then
+    echo "ok: $dst -> $src"
+    continue
+  fi
+  if [[ -e "$dst" && $FORCE -ne 1 ]]; then
+    echo "skip existing non-CTOS command: $dst (use --force to replace)" >&2
+    continue
+  fi
+  if ((DRY_RUN)); then
+    echo "link: $dst -> $src"
+  else
+    ln -sfn "$src" "$dst"
+    echo "linked: $dst -> $src"
+  fi
+done
+
+PATH_BLOCK='
+# CTOS user commands
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) ;;
+  *) export PATH="$HOME/.local/bin:$PATH" ;;
+esac
+'
+
+if [[ -f "$BASHRC" ]] && grep -q "CTOS user commands" "$BASHRC"; then
+  echo "ok: ~/.bashrc already exposes ~/.local/bin"
+elif ((DRY_RUN)); then
+  echo "append PATH block to ~/.bashrc"
+else
+  printf '%s\n' "$PATH_BLOCK" >> "$BASHRC"
+  echo "updated: ~/.bashrc exposes ~/.local/bin"
+fi
+
+echo
+echo "Open a new terminal or run:"
+echo '  source ~/.bashrc'
+echo
+echo "Then use:"
+echo "  ctos-ai brief"

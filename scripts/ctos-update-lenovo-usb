@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+device=/dev/sdb
+mountpoint_path=/mnt/ctos-link
+source_dir=/home/operator/T480/scripts
+
+if (( EUID != 0 )); then
+	printf 'run this helper with sudo\n' >&2
+	exit 1
+fi
+
+label=$(lsblk -dn -o LABEL "$device" | tr -d '[:space:]')
+transport=$(lsblk -dn -o TRAN "$device" | tr -d '[:space:]')
+removable=$(lsblk -dn -o RM "$device" | tr -d '[:space:]')
+model=$(lsblk -dn -o MODEL "$device" | sed 's/[[:space:]]*$//')
+
+if [[ "$label" != CTOS_LINK || "$transport" != usb || "$removable" != 1 || "$model" != UDisk ]]; then
+	printf 'refusing unexpected device: label=%s transport=%s removable=%s model=%s\n' \
+		"$label" "$transport" "$removable" "$model" >&2
+	exit 1
+fi
+
+mkdir -p "$mountpoint_path"
+if mountpoint -q "$mountpoint_path"; then
+	printf '%s is already mounted; refusing ambiguous state\n' "$mountpoint_path" >&2
+	exit 1
+fi
+
+mount -o uid=1000,gid=1000,umask=077 "$device" "$mountpoint_path"
+cleanup() {
+	if mountpoint -q "$mountpoint_path"; then
+		sync
+		umount "$mountpoint_path"
+	fi
+}
+trap cleanup EXIT
+
+cp -f "$source_dir/SETUP_LENOVO_REMOTE.bat" "$mountpoint_path/SETUP_LENOVO_REMOTE.bat"
+cp -f "$source_dir/SETUP_LENOVO_REMOTE.ps1" "$mountpoint_path/SETUP_LENOVO_REMOTE.ps1"
+sync
+
+printf 'Source and USB SHA-256 values must match in pairs:\n'
+sha256sum \
+	"$source_dir/SETUP_LENOVO_REMOTE.bat" \
+	"$mountpoint_path/SETUP_LENOVO_REMOTE.bat" \
+	"$source_dir/SETUP_LENOVO_REMOTE.ps1" \
+	"$mountpoint_path/SETUP_LENOVO_REMOTE.ps1"
+
+cleanup
+trap - EXIT
+printf 'CTOS_LINK updated and safely unmounted.\n'

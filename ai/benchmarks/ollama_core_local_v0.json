@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "updated": "2026-06-20",
+  "profile_id": "ollama-core-local",
+  "status": "prepared_not_active",
+  "target_node": "ctos-core",
+  "package_plan": {
+    "manager": "pacman",
+    "packages": [
+      "ollama"
+    ],
+    "defer_gpu_packages": [
+      "ollama-vulkan",
+      "ollama-rocm"
+    ],
+    "reason": "start with the smallest CPU-safe baseline; GPU path waits for the RX6600 hardware/driver decision"
+  },
+  "service_plan": {
+    "systemd_unit": "ollama.service",
+    "bind": "127.0.0.1:11434",
+    "lan_exposure": false,
+    "models_dir": "/srv/ctos/models/ollama",
+    "override": "/etc/systemd/system/ollama.service.d/ctos.conf"
+  },
+  "models": [
+    {
+      "id": "qwen2.5-coder:0.5b",
+      "role": "smoke",
+      "download_size": "398MB",
+      "parameters": "494M",
+      "quantization": "Q4_K_M"
+    },
+    {
+      "id": "qwen2.5-coder:1.5b",
+      "role": "first coding benchmark",
+      "download_size": "986MB",
+      "parameters": "1.54B",
+      "quantization": "Q4_K_M"
+    }
+  ],
+  "prompts": [
+    {
+      "id": "sanity",
+      "max_tokens": 32,
+      "prompt": "Return exactly CTOS_OK and nothing else."
+    },
+    {
+      "id": "python_small",
+      "max_tokens": 160,
+      "prompt": "Write a small Python function named clamp(value, low, high) and include three assert examples."
+    },
+    {
+      "id": "ops_reasoning",
+      "max_tokens": 180,
+      "prompt": "In five concise bullets, explain why a local AI runtime should bind to localhost by default."
+    }
+  ],
+  "metrics": [
+    "total_duration",
+    "load_duration",
+    "prompt_eval_count",
+    "prompt_eval_duration",
+    "eval_count",
+    "eval_duration",
+    "tokens_per_second"
+  ],
+  "sources": [
+    "https://archlinux.org/packages/extra/x86_64/ollama/",
+    "https://docs.ollama.com/linux",
+    "https://docs.ollama.com/api/introduction",
+    "https://docs.ollama.com/api/pull",
+    "https://docs.ollama.com/api/generate",
+    "https://docs.ollama.com/api/ps",
+    "https://ollama.com/library/qwen2.5-coder:0.5b",
+    "https://ollama.com/library/qwen2.5-coder:1.5b"
+  ]
+}

@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REMOTE_USER="${CTOS_CORE_USER:-ctos}"
+REMOTE_HOST="${CTOS_CORE_HOST:-10.42.0.2}"
+if [ -n "${CTOS_CORE_SSH_PORT:-}" ]; then
+	REMOTE_PORTS="${CTOS_CORE_SSH_PORT}"
+else
+	REMOTE_PORTS="${CTOS_CORE_SSH_PORTS:-22 2222}"
+fi
+REMOTE_PORT=""
+REMOTE="${REMOTE_USER}@${REMOTE_HOST}"
+PORT="${CTOS_CORE_VNC_PORT:-5902}"
+LOG="/tmp/ctos-x0vnc-viewer.log"
+SSH_OPTS=(-F /dev/null -o BatchMode=yes -o ConnectTimeout=5)
+DESK_MODE="${CTOS_DESK_MODE:-panorama}"
+WAIT_SECONDS="${CTOS_CORE_WAIT_SECONDS:-240}"
+NONINTERACTIVE="${CTOS_DESK_NONINTERACTIVE:-0}"
+layout_changed=0
+
+case "${1:-}" in
+	tiger|tigervnc)
+		;;
+	"")
+		;;
+	*)
+		printf 'usage: %s [tiger]\n' "$0" >&2
+		exit 2
+		;;
+esac
+
+say() {
+	printf '%s\n' "$*"
+}
+
+fail() {
+	printf '\nblocked: %s\n' "$*" >&2
+	if [ "$NONINTERACTIVE" = "1" ]; then
+		exit 1
+	fi
+	printf '\nDESK remote did not start. Press Enter to close this window.\n' >&2
+	read -r _ || true
+	exit 1
+}
+
+remote() {
+	ssh "${SSH_OPTS[@]}" "$REMOTE" "$@"
+}
+
+select_ssh_port() {
+	local candidate deadline
+	deadline=$((SECONDS + WAIT_SECONDS))
+	while :; do
+		for candidate in $REMOTE_PORTS; do
+			case "$candidate" in
+				''|*[!0-9]*)
+					continue
+					;;
+			esac
+			SSH_OPTS=(-F /dev/null -p "$candidate" -o BatchMode=yes -o ConnectTimeout=5)
+			if remote true >/dev/null 2>&1; then
+				REMOTE_PORT="$candidate"
+				say "ctos-core SSH ready on port ${REMOTE_PORT}"
+				return 0
+			fi
+			say "ctos-core SSH port ${candidate} not ready"
+		done
+		if [ "$SECONDS" -ge "$deadline" ]; then
+			break
+		fi
+		say "waiting for ctos-core SSH... $((deadline - SECONDS))s left"
+		sleep 5
+	done
+	fail "ctos-core is not reachable over SSH on ports: ${REMOTE_PORTS} after ${WAIT_SECONDS}s"
+}
+
+remote_x11() {
+	remote "XDG_RUNTIME_DIR=${xruntime} DBUS_SESSION_BUS_ADDRESS=${xbus} DISPLAY=${display} XAUTHORITY=${xauthority} $*"
+}
+
+require_local() {
+	command -v "$1" >/dev/null 2>&1 || fail "$1 not found on T480"
+}
+
+local_vnc_handshake_ready() {
+	command -v python3 >/dev/null 2>&1 || return 1
+	python3 - "$PORT" <<'PY'
+import socket
+import sys
+
+port = int(sys.argv[1])
+try:
+    with socket.create_connection(("127.0.0.1", port), timeout=1.5) as sock:
+        sock.settimeout(1.5)
+        banner = sock.recv(12)
+except OSError:
+    raise SystemExit(1)
+
+raise SystemExit(0 if banner.startswith(b"RFB ") else 1)
+PY
+}
+
+kill_local_tunnel() {
+	pkill -u "${USER}" -f "ssh .*127\\.0\\.0\\.1:${PORT}:127\\.0\\.0\\.1:${PORT}" >/dev/null 2>&1 || true
+}
+
+require_local ssh
+require_local ss
+require_local vncviewer
+
+say "CTOS DESK remote // ${REMOTE} // viewer=tigervnc"
+select_ssh_port
+
+session_env="$(
+	remote 'pid=$(pgrep -u "$USER" -x kwin_x11 | head -n1); if [ -z "$pid" ]; then exit 7; fi; tr "\0" "\n" < "/proc/$pid/environ" | grep -E "^(DISPLAY|XAUTHORITY|XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS)="'
+)" || fail "Plasma X11 is not active on ctos-core; log in with Plasma (X11)"
+
+display="$(printf '%s\n' "$session_env" | sed -n 's/^DISPLAY=//p' | tail -n1)"
+xauthority="$(printf '%s\n' "$session_env" | sed -n 's/^XAUTHORITY=//p' | tail -n1)"
+xruntime="$(printf '%s\n' "$session_env" | sed -n 's/^XDG_RUNTIME_DIR=//p' | tail -n1)"
+xbus="$(printf '%s\n' "$session_env" | sed -n 's/^DBUS_SESSION_BUS_ADDRESS=//p' | tail -n1)"
+
+[ -n "$display" ] || fail "missing DISPLAY from kwin_x11 environment"
+[ -n "$xauthority" ] || fail "missing XAUTHORITY from kwin_x11 environment"
+[ -n "$xruntime" ] || xruntime="/run/user/1000"
+[ -n "$xbus" ] || xbus="unix:path=/run/user/1000/bus"
+
+remote 'command -v x0vncserver >/dev/null' || fail "x0vncserver is not installed on ctos-core"
+
+apply_panorama_layout() {
+	[ "$DESK_MODE" = "panorama" ] || return 0
+	remote_x11 'command -v xrandr >/dev/null' || fail "xrandr is not installed on ctos-core"
+
+	local outputs first second current desired
+	outputs="$(remote_x11 "xrandr --query | awk '\$2 == \"connected\" {print \$1}'")" || fail "could not read ctos-core display outputs"
+	first="$(printf '%s\n' "$outputs" | sed -n '1p')"
+	second="$(printf '%s\n' "$outputs" | sed -n '2p')"
+	[ -n "$first" ] || fail "no connected X11 output found on ctos-core"
+	case "${first}${second}" in
+		*[!A-Za-z0-9_.-]*)
+			fail "unexpected ctos-core output name: ${outputs}"
+			;;
+	esac
+
+	if [ -n "$second" ]; then
+		desired="3840x1080"
+	else
+		desired="1920x1080"
+	fi
+	current="$(remote_x11 "xrandr --query | awk '/^Screen 0:/ {print \$8 \"x\" \$10}'" || true)"
+	if [ "$current" = "$desired" ]; then
+		say "remote layout already ${desired}"
+		return 0
+	fi
+
+	if [ -n "$second" ]; then
+		say "setting ctos-core panorama layout: ${first} + ${second} -> ${desired}"
+		remote_x11 "xrandr --output ${first} --mode 1920x1080 --primary --pos 0x0 --output ${second} --mode 1920x1080 --right-of ${first}" \
+			|| fail "could not set ctos-core dual-screen panorama layout"
+	else
+		say "setting ctos-core single-screen layout: ${first} -> ${desired}"
+		remote_x11 "xrandr --output ${first} --mode 1920x1080 --primary --pos 0x0" \
+			|| fail "could not set ctos-core single-screen layout"
+	fi
+	layout_changed=1
+}
+
+apply_panorama_layout
+
+if [ "$layout_changed" -eq 1 ]; then
+	say "restarting x0vncserver after display layout change"
+	remote "env XDG_RUNTIME_DIR=${xruntime} DBUS_SESSION_BUS_ADDRESS=${xbus} systemctl --user stop ctos-x0vnc.service >/dev/null 2>&1 || true"
+fi
+
+if ! remote "ss -lntp 2>/dev/null | grep -q '127.0.0.1:${PORT}.*x0vncserver'"; then
+	say "starting x0vncserver on ctos-core localhost:${PORT}"
+	remote "env XDG_RUNTIME_DIR=${xruntime} DBUS_SESSION_BUS_ADDRESS=${xbus} systemctl --user stop ctos-w0vnc.service >/dev/null 2>&1 || true"
+	remote "env XDG_RUNTIME_DIR=${xruntime} DBUS_SESSION_BUS_ADDRESS=${xbus} systemctl --user stop ctos-x0vnc.service >/dev/null 2>&1 || true"
+	remote "env XDG_RUNTIME_DIR=${xruntime} DBUS_SESSION_BUS_ADDRESS=${xbus} DISPLAY=${display} XAUTHORITY=${xauthority} systemd-run --user --unit=ctos-x0vnc --collect --setenv=XDG_RUNTIME_DIR=${xruntime} --setenv=DBUS_SESSION_BUS_ADDRESS=${xbus} --setenv=DISPLAY=${display} --setenv=XAUTHORITY=${xauthority} /usr/bin/x0vncserver -display ${display} -localhost -rfbport ${PORT} -SecurityTypes None -AlwaysShared -AcceptKeyEvents -AcceptPointerEvents -AcceptSetDesktopSize=0"
+	sleep 0.7
+fi
+
+remote "ss -lntp 2>/dev/null | grep -q '127.0.0.1:${PORT}.*x0vncserver'" || fail "x0vncserver is not listening on localhost:${PORT}"
+if remote "ss -lntp 2>/dev/null | grep -E '(^|[[:space:]])0\\.0\\.0\\.0:${PORT}|\\[::\\]:${PORT}'"; then
+	fail "x0vncserver exposed a non-localhost listener"
+fi
+
+if ss -lnt 2>/dev/null | grep -q "127.0.0.1:${PORT}" && ! local_vnc_handshake_ready; then
+	say "local SSH tunnel listener is stale; rebuilding localhost:${PORT}"
+	kill_local_tunnel
+	sleep 0.3
+fi
+
+if ! local_vnc_handshake_ready; then
+	say "opening SSH tunnel 127.0.0.1:${PORT} -> ctos-core:${PORT}"
+	ssh "${SSH_OPTS[@]}" -f -N -L "127.0.0.1:${PORT}:127.0.0.1:${PORT}" "$REMOTE"
+	sleep 0.3
+fi
+
+local_vnc_handshake_ready || fail "local SSH tunnel did not expose a VNC handshake on 127.0.0.1:${PORT}"
+
+if [ "${CTOS_DESK_RESTART_VIEWER:-0}" = "1" ]; then
+	pkill -u "${USER}" -f "vncviewer .*127\\.0\\.0\\.1:${PORT}" >/dev/null 2>&1 || true
+fi
+
+if pgrep -u "${USER}" -f "vncviewer .*127\\.0\\.0\\.1:${PORT}" >/dev/null 2>&1; then
+	say "TigerVNC viewer already running"
+else
+	say "opening TigerVNC viewer in panorama fullscreen mode"
+	rm -f "$LOG"
+	setsid vncviewer \
+		-FullScreen \
+		-FullScreenMode=Current \
+		-FullScreenSystemKeys=0 \
+		-RemoteResize=0 \
+		-PointerEventInterval=1 \
+		-Shared \
+		"127.0.0.1:${PORT}" >"$LOG" 2>&1 &
+fi
+
+sleep 1
+say "DESK remote ready"

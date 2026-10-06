@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; connect-src 'self'; script-src 'self'; style-src 'self'; media-src 'self' blob:;"
+    >
+    <title>CTOS Voice Console</title>
+    <link rel="stylesheet" href="/voice.css?v=2026-07-19.3">
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <h1>CTOS Voice</h1>
+          <p id="statusLine">Boot</p>
+        </div>
+        <div class="segmented" aria-label="Mode">
+          <button class="segment active" data-mode="chat" type="button">Chat</button>
+          <button class="segment" data-mode="brief" type="button">Brief</button>
+          <button class="segment" data-mode="codex" type="button">Codex</button>
+          <button class="segment" data-mode="action" type="button">Action</button>
+        </div>
+      </header>
+
+      <section class="control-band" aria-label="Voice controls">
+        <button id="recordBtn" class="primary" type="button">Record</button>
+        <button id="pauseBtn" type="button" disabled>Pause</button>
+        <button id="resumeBtn" type="button" disabled>Resume</button>
+        <button id="stopBtn" type="button" disabled>Stop + Send</button>
+        <button id="replayBtn" type="button" disabled>Replay</button>
+        <button id="speakBtn" type="button" disabled>Speak</button>
+        <label class="toggle">
+          <input id="autoSpeak" type="checkbox">
+          Auto speak
+        </label>
+      </section>
+
+      <section class="grid">
+        <article class="panel transcript-panel">
+          <h2>Transcript</h2>
+          <textarea id="transcript" spellcheck="false" placeholder=""></textarea>
+          <div class="text-row">
+            <input id="textInput" type="text" autocomplete="off" placeholder="Tape ici si le micro fatigue">
+            <button id="sendTextBtn" type="button">Send</button>
+          </div>
+        </article>
+
+        <article class="panel answer-panel">
+          <h2>Answer</h2>
+          <pre id="answer"></pre>
+        </article>
+      </section>
+
+      <section id="codexReviewPanel" class="panel codex-review-panel" hidden>
+        <div class="panel-head">
+          <div>
+            <h2>Codex read-only review</h2>
+            <p id="codexReviewMeta" class="action-meta">No validated preview.</p>
+          </div>
+          <div class="mini-actions">
+            <button id="revalidateCodexBtn" type="button" disabled>Revalidate edited spec</button>
+            <button id="runCodexBtn" type="button" disabled>Run Codex — read-only</button>
+          </div>
+        </div>
+        <textarea id="codexSpec" spellcheck="false" disabled></textarea>
+        <label class="review-check">
+          <input id="codexReviewed" type="checkbox" disabled>
+          I reviewed this exact canonical spec and SHA-256.
+        </label>
+      </section>
+
+      <section class="panel action-panel">
+        <div class="panel-head">
+          <h2>Action Queue</h2>
+          <div class="mini-actions">
+            <button id="queueActionBtn" type="button">Queue last</button>
+            <button id="refreshQueueBtn" type="button">Refresh</button>
+            <button id="approveActionBtn" type="button" disabled>Approve</button>
+            <button id="rejectActionBtn" type="button" disabled>Reject</button>
+          </div>
+        </div>
+        <div class="quick-actions" aria-label="Quick Kali actions">
+          <button type="button" data-action-text="demarre kali">Start Kali</button>
+          <button type="button" data-action-text="ouvre kali">Open Kali</button>
+          <button type="button" data-action-text="eteins kali">Stop Kali</button>
+          <button type="button" data-action-text="checkpoint kali">Checkpoint</button>
+        </div>
+        <div class="action-grid">
+          <ol id="actionList" class="action-list"></ol>
+          <pre id="actionPreview"></pre>
+        </div>
+      </section>
+
+      <section class="panel log-panel">
+        <h2>Session</h2>
+        <ol id="log"></ol>
+      </section>
+
+      <audio id="audioPlayer" controls hidden></audio>
+    </main>
+    <script src="/voice.js?v=2026-07-19.3"></script>
+  </body>
+</html>

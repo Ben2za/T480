@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CORE_HOST="${CTOS_CORE_HOST:-10.42.0.2}"
+CORE_USER="${CTOS_CORE_USER:-ctos}"
+LOCAL_PORT="${CTOS_AI_TUNNEL_PORT:-11435}"
+REMOTE_PORT="${CTOS_OLLAMA_PORT:-11434}"
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+if [[ ! -d "$RUNTIME_DIR" || ! -w "$RUNTIME_DIR" ]]; then
+  RUNTIME_DIR="/tmp"
+fi
+PIDFILE="${CTOS_AI_TUNNEL_PIDFILE:-${RUNTIME_DIR}/ctos-ai-ollama-tunnel.pid}"
+LOGFILE="${CTOS_AI_TUNNEL_LOG:-/tmp/ctos-ai-ollama-tunnel.log}"
+
+usage() {
+  cat <<'USAGE'
+Usage: ctos-ai-tunnel {ensure|start|stop|status}
+
+Maintains a localhost-only SSH tunnel:
+  127.0.0.1:11435 -> ctos-core:127.0.0.1:11434
+USAGE
+}
+
+pid_alive() {
+  [[ -f "$PIDFILE" ]] || return 1
+  local pid
+  pid="$(cat "$PIDFILE" 2>/dev/null || true)"
+  [[ -n "$pid" ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+api_alive() {
+  curl -fsS "http://127.0.0.1:${LOCAL_PORT}/api/version" >/dev/null 2>&1
+}
+
+status() {
+  if api_alive; then
+    printf 'ready local=127.0.0.1:%s remote=%s@%s:127.0.0.1:%s\n' "$LOCAL_PORT" "$CORE_USER" "$CORE_HOST" "$REMOTE_PORT"
+    return 0
+  fi
+  if pid_alive; then
+    echo "pid running but Ollama API not reachable; see $LOGFILE"
+    return 1
+  fi
+  echo "stopped"
+  return 1
+}
+
+start() {
+  if api_alive; then
+    status
+    return 0
+  fi
+  if pid_alive; then
+    kill "$(cat "$PIDFILE")" 2>/dev/null || true
+    rm -f "$PIDFILE"
+  fi
+  : >"$LOGFILE"
+  local ssh_cmd=(
+    ssh
+    -F /dev/null \
+    -N \
+    -L "127.0.0.1:${LOCAL_PORT}:127.0.0.1:${REMOTE_PORT}" \
+    -o ExitOnForwardFailure=yes \
+    -o BatchMode=yes \
+    -o PasswordAuthentication=no \
+    -o PreferredAuthentications=publickey \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=2 \
+    -o LogLevel=ERROR \
+    "${CORE_USER}@${CORE_HOST}"
+  )
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "${ssh_cmd[@]}" >>"$LOGFILE" 2>&1 &
+  else
+    nohup "${ssh_cmd[@]}" >>"$LOGFILE" 2>&1 &
+  fi
+  echo "$!" >"$PIDFILE"
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if api_alive; then
+      status
+      return 0
+    fi
+    sleep 0.3
+  done
+  echo "failed to open CTOS AI tunnel; see $LOGFILE" >&2
+  return 1
+}
+
+stop() {
+  if pid_alive; then
+    kill "$(cat "$PIDFILE")" 2>/dev/null || true
+  fi
+  rm -f "$PIDFILE"
+  echo "stopped"
+}
+
+case "${1:-}" in
+  ensure|start) start ;;
+  stop) stop ;;
+  status) status ;;
+  -h|--help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac

@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: ctos-netwatch COMMAND
+
+Commands:
+  status       Read-only interface, route, DNS, and listening socket snapshot
+  flows        Read-only current TCP/UDP socket snapshot
+  tools        Show local packet/flow tooling availability
+  plan         Print explicit capture/dashboard commands for later use
+USAGE
+}
+
+have() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+section() {
+  printf '\n%s\n' "$1"
+  printf '%s\n' "----------------------------------------"
+}
+
+cmd_tools() {
+  echo "CTOS netwatch tools"
+  echo "==================="
+  for cmd in ip ss nft tcpdump tshark wireshark termshark iftop nethogs bmon bandwhich ntopng vnstat; do
+    if have "$cmd"; then
+      printf '%-12s %s\n' "$cmd" "$(command -v "$cmd")"
+    else
+      printf '%-12s -\n' "$cmd"
+    fi
+  done
+}
+
+cmd_status() {
+  echo "CTOS netwatch status"
+  echo "===================="
+  date --iso-8601=seconds
+  section "Interfaces"
+  ip -br link || true
+  section "Addresses"
+  ip -br address || true
+  section "Routes"
+  ip route || true
+  section "DNS"
+  if have resolvectl; then
+    resolvectl dns 2>/dev/null || true
+  else
+    sed -n '1,80p' /etc/resolv.conf 2>/dev/null || true
+  fi
+  section "Listening TCP/UDP"
+  ss -tulpen 2>/dev/null || ss -tuln || true
+}
+
+cmd_flows() {
+  echo "CTOS netwatch flows"
+  echo "==================="
+  date --iso-8601=seconds
+  section "Established TCP"
+  ss -tanp state established 2>/dev/null || ss -tan state established || true
+  section "UDP"
+  ss -uanp 2>/dev/null || ss -uan || true
+}
+
+cmd_plan() {
+  cat <<'PLAN'
+CTOS network visibility plan
+============================
+
+Default posture:
+  metadata first; no payload capture unless explicit.
+
+Already useful, no new package:
+  ctos-netwatch status
+  ctos-netwatch flows
+
+Short live packet summary, explicit sudo:
+  sudo tcpdump -ni any -c 100
+
+DNS-only visibility:
+  sudo tcpdump -ni any -vv 'udp port 53 or tcp port 53'
+
+HTTP/TLS metadata without payload bodies:
+  sudo tshark -i any -f 'tcp port 80 or tcp port 443' \
+    -T fields -e frame.time -e ip.src -e ip.dst -e tcp.dstport -e tls.handshake.extensions_server_name
+
+Future local dashboard options:
+  1. CTOS cockpit panel from nftables counters + ss + conntrack/flow metadata.
+  2. termshark/TShark for temporary terminal inspection.
+  3. Wireshark GUI only when we want heavy packet inspection.
+  4. ntopng only after a separate privacy/storage/service decision.
+PLAN
+}
+
+command="${1:-}"
+case "$command" in
+  status) cmd_status ;;
+  flows) cmd_flows ;;
+  tools) cmd_tools ;;
+  plan) cmd_plan ;;
+  -h|--help|help) usage ;;
+  "") usage; exit 2 ;;
+  *) echo "unknown command: $command" >&2; usage >&2; exit 2 ;;
+esac

@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+usage() {
+	printf 'usage: %s /path/to/new-or-empty-kit-directory\n' "$0" >&2
+}
+
+if [ "${1:-}" = "" ]; then
+	usage
+	exit 2
+fi
+
+TARGET="$1"
+
+case "$TARGET" in
+	/|/home|/home/operator|"$ROOT")
+		printf 'refusing unsafe target: %s\n' "$TARGET" >&2
+		exit 2
+		;;
+esac
+
+if [ -e "$TARGET" ] && [ -n "$(find "$TARGET" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+	printf 'target exists and is not empty: %s\n' "$TARGET" >&2
+	exit 2
+fi
+
+mkdir -p "$TARGET"
+
+items=(
+	AGENTS.md
+	README.md
+	CTOS_HANDOVER.md
+	Assets
+	bootstrap
+	context
+	control
+	docs
+	fleet
+	hyprland
+	libvirt
+	scripts
+	waybar
+)
+
+for item in "${items[@]}"; do
+	if [ -e "$ROOT/$item" ]; then
+		tar -C "$ROOT" \
+			--exclude='.git' \
+			--exclude='__pycache__' \
+			--exclude='*.qcow2' \
+			--exclude='*.iso' \
+			--exclude='logs' \
+			-cf - "$item" | tar -C "$TARGET" -xf -
+	fi
+done
+
+find "$TARGET" -type f | sort >"$TARGET/MANIFEST.txt"
+printf 'CTOS USB kit staged at %s\n' "$TARGET"

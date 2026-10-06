@@ -1,0 +1,418 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
+
+OJ_ROOT = Path(os.environ.get("CTOS_OPENJARVIS_ROOT", Path.home() / ".local/share/ctos/openjarvis"))
+OJ_HOME = Path(os.environ.get("CTOS_OPENJARVIS_HOME", OJ_ROOT / "state"))
+OJ_CONFIG = OJ_HOME / "config.toml"
+OJ_JARVIS = OJ_ROOT / ".venv/bin/jarvis"
+
+OLLAMA_HOST = os.environ.get("CTOS_OPENJARVIS_OLLAMA", "http://127.0.0.1:11435")
+DEFAULT_MODEL = os.environ.get("CTOS_OPENJARVIS_MODEL", "qwen2.5-coder:1.5b")
+
+
+class CtosError(RuntimeError):
+    pass
+
+
+def run_capture(
+    cmd: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    timeout: float = 60.0,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        cmd,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=timeout,
+    )
+
+
+def run_passthrough(cmd: list[str], *, env: dict[str, str] | None = None) -> int:
+    return subprocess.run(cmd, check=False, env=env).returncode
+
+
+def oj_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["OPENJARVIS_HOME"] = str(OJ_HOME)
+    env["OPENJARVIS_CONFIG"] = str(OJ_CONFIG)
+    env["OPENJARVIS_NO_UPDATE_CHECK"] = "1"
+    env["OLLAMA_HOST"] = OLLAMA_HOST
+    env.setdefault("NO_COLOR", "1")
+    return env
+
+
+def require_install() -> None:
+    if not OJ_JARVIS.exists():
+        raise CtosError(
+            f"OpenJarvis CLI not found: {OJ_JARVIS}\n"
+            "Expected isolated install under ~/.local/share/ctos/openjarvis."
+        )
+
+
+def ensure_config() -> None:
+    OJ_HOME.mkdir(parents=True, exist_ok=True)
+    if OJ_CONFIG.exists():
+        content = OJ_CONFIG.read_text(encoding="utf-8")
+        if "[updates]" not in content:
+            with OJ_CONFIG.open("a", encoding="utf-8") as fh:
+                fh.write("\n[updates]\nauto_update = false\n")
+        return
+    OJ_CONFIG.write_text(
+        textwrap.dedent(
+            f"""\
+            # CTOS-managed OpenJarvis sandbox config.
+            # Do not give this layer host authority. CTOS remains the action gate.
+
+            [intelligence]
+            default_model = "{DEFAULT_MODEL}"
+            preferred_engine = "ollama"
+            provider = "local"
+            temperature = 0.2
+            max_tokens = 512
+
+            [agent]
+            default_agent = "simple"
+            max_turns = 2
+            tools = ""
+            context_from_memory = false
+
+            [engine]
+            default = "ollama"
+
+            [engine.ollama]
+            host = "{OLLAMA_HOST}"
+
+            [tools.mcp]
+            enabled = false
+
+            [telemetry]
+            enabled = false
+            gpu_metrics = false
+            db_path = "{OJ_HOME / 'telemetry.db'}"
+
+            [analytics]
+            enabled = false
+
+            [updates]
+            auto_update = false
+
+            [traces]
+            enabled = false
+            db_path = "{OJ_HOME / 'traces.db'}"
+
+            [server]
+            host = "127.0.0.1"
+            port = 8768
+            agent = "simple"
+            """
+        ),
+        encoding="utf-8",
+    )
+
+
+def ensure_tunnel() -> bool:
+    tunnel = SCRIPTS / "ctos-ai-tunnel"
+    if not tunnel.exists():
+        return False
+    proc = run_capture([str(tunnel), "ensure"], timeout=20.0)
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr or proc.stdout or "ctos-ai-tunnel failed\n")
+        return False
+    return True
+
+
+def ollama_version() -> str:
+    proc = run_capture(["curl", "-fsS", f"{OLLAMA_HOST}/api/version"], timeout=5.0)
+    if proc.returncode != 0:
+        return "unreachable"
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return "unknown"
+    return str(payload.get("version") or "unknown")
+
+
+def model_available(model: str) -> bool:
+    proc = run_capture(["curl", "-fsS", f"{OLLAMA_HOST}/api/tags"], timeout=8.0)
+    if proc.returncode != 0:
+        return False
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return False
+    models = payload.get("models")
+    if not isinstance(models, list):
+        return False
+    names = {str(item.get("name") or "") for item in models if isinstance(item, dict)}
+    return model in names
+
+
+def local_prompt(text: str) -> str:
+    return (
+        "Tu es CTOS Jarvis local. Reponds en francais simple et court. "
+        "Tu peux aider a reflechir, organiser, resumer. "
+        "Tu ne pretends pas executer des commandes. "
+        "Pour modifier le systeme, propose un handoff Codex/CTOS explicite.\n\n"
+        f"Demande utilisateur: {text}"
+    )
+
+
+def ask_openjarvis(text: str, *, model: str, max_tokens: int, no_context: bool = True) -> int:
+    require_install()
+    ensure_config()
+    ensure_tunnel()
+    cmd = [
+        str(OJ_JARVIS),
+        "--quiet",
+        "ask",
+        "-e",
+        "ollama",
+        "-m",
+        model,
+        "--max-tokens",
+        str(max_tokens),
+        "--no-stream",
+        "--agent",
+        "simple",
+    ]
+    if no_context:
+        cmd.append("--no-context")
+    cmd.append(local_prompt(text))
+    return run_passthrough(cmd, env=oj_env())
+
+
+def extract_transcript(payload: object) -> str:
+    paths = [
+        ("transcribe", "recognition", "transcript"),
+        ("recognition", "transcript"),
+        ("transcript",),
+        ("text",),
+    ]
+    for path in paths:
+        current = payload
+        for key in path:
+            if not isinstance(current, dict):
+                current = None
+                break
+            current = current.get(key)
+        if isinstance(current, str) and current.strip():
+            return current.strip()
+    return ""
+
+
+def codex_handoff(text: str) -> str:
+    return textwrap.dedent(
+        f"""\
+        CTOS VOICE -> CODEX HANDOFF
+        ===========================
+        User said:
+        {text}
+
+        Suggested Codex handling:
+        - Read repo context before changing files.
+        - Prefer existing CTOS scripts and documented flows.
+        - Execute only safe/reversible actions by default.
+        - Ask before destructive, privileged, secret, or network-exposed changes.
+
+        Compact request for Codex:
+        {text}
+        """
+    ).rstrip()
+
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    require_install()
+    ensure_config()
+    if args.tunnel:
+        ensure_tunnel()
+    print(f"openjarvis={OJ_JARVIS}")
+    print(f"home={OJ_HOME}")
+    print(f"config={OJ_CONFIG}")
+    print(f"ollama={OLLAMA_HOST}")
+    print(f"model={DEFAULT_MODEL}")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    installed = OJ_JARVIS.exists()
+    ensure_config()
+    tunnel_ok = ensure_tunnel() if args.tunnel else False
+    version = ollama_version() if args.tunnel else "not_checked"
+    model_ok = model_available(args.model) if args.tunnel else False
+    payload = {
+        "openjarvis_cli": str(OJ_JARVIS),
+        "installed": installed,
+        "home": str(OJ_HOME),
+        "config": str(OJ_CONFIG),
+        "ollama_host": OLLAMA_HOST,
+        "ollama_version": version,
+        "tunnel_ok": tunnel_ok,
+        "model": args.model,
+        "model_available": model_ok,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2))
+    else:
+        print("CTOS OpenJarvis")
+        print("================")
+        for key, value in payload.items():
+            print(f"{key:16} {value}")
+    return 0 if installed and (not args.tunnel or (tunnel_ok and model_ok)) else 1
+
+
+def cmd_ask(args: argparse.Namespace) -> int:
+    text = " ".join(args.prompt).strip()
+    if not text:
+        raise CtosError("empty prompt")
+    return ask_openjarvis(
+        text,
+        model=args.model,
+        max_tokens=args.max_tokens,
+        no_context=not args.context,
+    )
+
+
+def cmd_chat(args: argparse.Namespace) -> int:
+    require_install()
+    ensure_config()
+    ensure_tunnel()
+    cmd = [str(OJ_JARVIS), "--quiet", "chat", "-e", "ollama", "-m", args.model]
+    return run_passthrough(cmd, env=oj_env())
+
+
+def cmd_codex_brief(args: argparse.Namespace) -> int:
+    text = " ".join(args.prompt).strip()
+    if not text:
+        raise CtosError("empty prompt")
+    print(codex_handoff(text))
+    return 0
+
+
+def cmd_voice_once(args: argparse.Namespace) -> int:
+    listen_cmd = [
+        str(SCRIPTS / "ctos-jarvis"),
+        "listen",
+        "--seconds",
+        str(args.seconds),
+        "--keep-backend",
+        "--no-speak",
+        "--json",
+    ]
+    if args.no_start:
+        listen_cmd.append("--no-start")
+    if args.plan:
+        print(" ".join(listen_cmd))
+        return 0
+
+    proc = run_capture(listen_cmd, timeout=max(120.0, args.seconds + 90.0))
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr or proc.stdout or "voice capture failed\n")
+        return proc.returncode
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        sys.stderr.write(proc.stdout)
+        return 1
+    transcript = extract_transcript(payload)
+    if not transcript:
+        print(json.dumps({"ok": False, "reason": "no_transcript", "raw": payload}, indent=2))
+        return 1
+
+    if args.json:
+        print(json.dumps({"ok": True, "mode": args.mode, "transcript": transcript}, indent=2))
+
+    if args.mode == "codex":
+        print(codex_handoff(transcript))
+        return 0
+
+    rc = ask_openjarvis(
+        transcript,
+        model=args.model,
+        max_tokens=args.max_tokens,
+        no_context=not args.context,
+    )
+    if rc == 0 and args.speak:
+        # Keep speech best-effort and local; failed TTS must not hide the answer.
+        subprocess.run(
+            [str(SCRIPTS / "ctos-voice"), "say", "Reponse OpenJarvis affichee."],
+            check=False,
+        )
+    return rc
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="CTOS wrapper for isolated OpenJarvis voice/chat experiments."
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    setup = sub.add_parser("setup", help="write CTOS OpenJarvis config")
+    setup.add_argument("--no-tunnel", dest="tunnel", action="store_false")
+    setup.set_defaults(func=cmd_setup, tunnel=True)
+
+    status = sub.add_parser("status", help="show install/model/tunnel status")
+    status.add_argument("--model", default=DEFAULT_MODEL)
+    status.add_argument("--json", action="store_true")
+    status.add_argument("--no-tunnel", dest="tunnel", action="store_false")
+    status.set_defaults(func=cmd_status, tunnel=True)
+
+    ask = sub.add_parser("ask", help="ask OpenJarvis through local Ollama")
+    ask.add_argument("prompt", nargs="+")
+    ask.add_argument("--model", default=DEFAULT_MODEL)
+    ask.add_argument("--max-tokens", type=int, default=180)
+    ask.add_argument("--context", action="store_true", help="allow OpenJarvis memory context")
+    ask.set_defaults(func=cmd_ask)
+
+    chat = sub.add_parser("chat", help="start OpenJarvis chat mode")
+    chat.add_argument("--model", default=DEFAULT_MODEL)
+    chat.set_defaults(func=cmd_chat)
+
+    brief = sub.add_parser("codex-brief", help="turn text into a Codex handoff brief")
+    brief.add_argument("prompt", nargs="+")
+    brief.set_defaults(func=cmd_codex_brief)
+
+    voice = sub.add_parser("voice-once", help="listen once, then answer or create Codex handoff")
+    voice.add_argument("--seconds", type=float, default=5.0)
+    voice.add_argument("--mode", choices=("chat", "codex"), default="chat")
+    voice.add_argument("--model", default=DEFAULT_MODEL)
+    voice.add_argument("--max-tokens", type=int, default=180)
+    voice.add_argument("--context", action="store_true")
+    voice.add_argument("--speak", action="store_true")
+    voice.add_argument("--json", action="store_true")
+    voice.add_argument("--no-start", action="store_true", help="do not start STT backend")
+    voice.add_argument("--plan", action="store_true", help="print lower-level voice command")
+    voice.set_defaults(func=cmd_voice_once)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.func(args))
+    except CtosError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except subprocess.TimeoutExpired as exc:
+        print(f"error: command timed out: {' '.join(exc.cmd)}", file=sys.stderr)
+        return 124
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

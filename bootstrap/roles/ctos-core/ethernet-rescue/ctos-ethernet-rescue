@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OUT_ROOT="$SCRIPT_DIR/outputs"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+OUT_DIR="$OUT_ROOT/ethernet-$STAMP"
+mkdir -p "$OUT_DIR"
+
+usage() {
+	cat <<'USAGE'
+usage:
+  ./ctos-ethernet-rescue diag
+  sudo ./ctos-ethernet-rescue dhcp
+  sudo ./ctos-ethernet-rescue static
+  sudo ./ctos-ethernet-rescue auto
+
+diag    Collect a network report into outputs/
+dhcp    Ask the T480 shared Ethernet link for an IP address
+static  Force the tower to 10.42.0.2/24 via T480 10.42.0.1
+auto    Try dhcp first, then static if needed
+
+Expected T480 side:
+  T480 Ethernet IP: 10.42.0.1/24
+  T480 shares Wi-Fi Internet through Ethernet
+USAGE
+}
+
+log() {
+	printf '\n== %s ==\n' "$*"
+}
+
+run() {
+	printf '\n$ %s\n' "$*"
+	"$@" 2>&1 || true
+}
+
+need_root() {
+	if [ "$(id -u)" -ne 0 ]; then
+		printf 'This action needs sudo.\n' >&2
+		exit 1
+	fi
+}
+
+eth_iface() {
+	if [ "${CTOS_ETH_IFACE:-}" != "" ]; then
+		printf '%s\n' "$CTOS_ETH_IFACE"
+		return 0
+	fi
+	if command -v nmcli >/dev/null 2>&1; then
+		nmcli -t -f DEVICE,TYPE dev status 2>/dev/null |
+			awk -F: '$2 == "ethernet" { print $1; exit }'
+		return 0
+	fi
+	ip -o link show |
+		awk -F': ' '$2 !~ /^(lo|wl|virbr|docker|br-|veth)/ { print $2; exit }'
+}
+
+ping_ok() {
+	ping -c 1 -W 2 "$1" >/dev/null 2>&1
+}
+
+checks() {
+	log "Connectivity checks"
+	run ip -brief addr
+	run ip route
+	run ping -c 3 -W 2 10.42.0.1
+	run ping -c 3 -W 2 1.1.1.1
+	run ping -c 3 -W 2 endeavouros.com
+}
+
+diag() {
+	exec > >(tee "$OUT_DIR/report.txt") 2>&1
+	log "CTOS Ethernet rescue diagnostic"
+	printf 'Output: %s\n' "$OUT_DIR"
+	run date -Iseconds
+	run hostnamectl
+	run uname -a
+	run cat /etc/os-release
+	run systemctl --no-pager status NetworkManager
+	run nmcli general status
+	run nmcli dev status
+	run nmcli con show
+	run ip -brief link
+	run ip -brief addr
+	run ip route
+	run resolvectl status
+	run cat /etc/resolv.conf
+	run rfkill list
+	run lspci -nnk
+	run lsusb
+	run journalctl -u NetworkManager -b --no-pager -n 250
+	checks
+	printf '\nReport written to: %s/report.txt\n' "$OUT_DIR"
+}
+
+dhcp() {
+	need_root
+	exec > >(tee "$OUT_DIR/dhcp.txt") 2>&1
+	iface="$(eth_iface)"
+	if [ "$iface" = "" ]; then
+		printf 'No Ethernet interface found.\n'
+		exit 1
+	fi
+	log "Using Ethernet interface $iface"
+	run systemctl enable --now NetworkManager
+	run nmcli networking on
+	run nmcli dev disconnect "$iface"
+	run nmcli con delete t480-dhcp
+	run nmcli con delete t480-link
+	run nmcli con add type ethernet ifname "$iface" con-name t480-dhcp ipv4.method auto ipv6.method ignore connection.autoconnect yes
+	run nmcli con up t480-dhcp
+	sleep 3
+	checks
+}
+
+static_link() {
+	need_root
+	exec > >(tee "$OUT_DIR/static.txt") 2>&1
+	iface="$(eth_iface)"
+	if [ "$iface" = "" ]; then
+		printf 'No Ethernet interface found.\n'
+		exit 1
+	fi
+	log "Using Ethernet interface $iface"
+	run systemctl enable --now NetworkManager
+	run nmcli networking on
+	run nmcli dev disconnect "$iface"
+	run nmcli con delete t480-dhcp
+	run nmcli con delete t480-link
+	run nmcli con add type ethernet ifname "$iface" con-name t480-link ipv4.method manual ipv4.addresses 10.42.0.2/24 ipv4.gateway 10.42.0.1 ipv4.dns "10.42.0.1,1.1.1.1" ipv6.method ignore connection.autoconnect yes
+	run nmcli con up t480-link
+	sleep 2
+	checks
+}
+
+auto() {
+	need_root
+	dhcp
+	if ping_ok 10.42.0.1 && ping_ok 1.1.1.1; then
+		printf '\nDHCP path works.\n'
+		exit 0
+	fi
+	printf '\nDHCP did not fully work; trying static fallback.\n'
+	static_link
+}
+
+case "${1:-}" in
+	diag)
+		diag
+		;;
+	dhcp)
+		dhcp
+		;;
+	static)
+		static_link
+		;;
+	auto)
+		auto
+		;;
+	-h|--help|"")
+		usage
+		;;
+	*)
+		printf 'unknown action: %s\n' "$1" >&2
+		usage
+		exit 2
+		;;
+esac

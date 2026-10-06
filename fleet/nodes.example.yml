@@ -1,0 +1,23 @@
+all:
+  children:
+    controllers:
+      hosts:
+        ctos-t480:
+          role: godfather
+          status: active
+          os: EndeavourOS
+    cores:
+      hosts:
+        ctos-core:
+          role: core
+          status: active
+          os: EndeavourOS
+          install_runbook: docs/TOWER_CTOS_CORE_INSTALL.md
+          bootstrap: bootstrap/ctos-apply-role ctos-core apply
+          service_root: /srv/ctos
+    workers:
+      hosts:
+        ctos-worker-01:
+          role: worker
+          status: planned
+          os: EndeavourOS-target

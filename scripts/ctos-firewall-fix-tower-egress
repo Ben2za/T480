@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+LAN_IF="${LAN_IF:-enp0s31f6}"
+WAN_IF="${WAN_IF:-wlan0}"
+LAN_NET="${LAN_NET:-10.42.0.0/24}"
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "ctos-firewall-fix-tower-egress must run as root" >&2
+  echo "usage: sudo $0" >&2
+  exit 1
+fi
+
+echo "CTOS tower egress fix"
+echo "LAN_IF=$LAN_IF WAN_IF=$WAN_IF LAN_NET=$LAN_NET"
+
+if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
+  echo "firewalld active; adding runtime direct rules"
+
+  firewall-cmd --direct --add-rule ipv4 filter FORWARD 0 -i "$LAN_IF" -o "$WAN_IF" -j ACCEPT >/dev/null || true
+  firewall-cmd --direct --add-rule ipv4 filter FORWARD 0 -i "$WAN_IF" -o "$LAN_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null || true
+  firewall-cmd --direct --add-rule ipv4 nat POSTROUTING 0 -s "$LAN_NET" -o "$WAN_IF" -j MASQUERADE >/dev/null || true
+else
+  echo "firewalld not active; skipping firewalld direct rules"
+fi
+
+if command -v nft >/dev/null 2>&1; then
+  echo "adding nft forward/NAT rules"
+
+  if nft list chain inet filter forward >/dev/null 2>&1; then
+    if ! nft list chain inet filter forward | grep -Fq 'ctos tower egress'; then
+      rules_file="$(mktemp)"
+      trap 'rm -f "$rules_file"' EXIT
+      cat >"$rules_file" <<NFT
+add rule inet filter forward iifname "$LAN_IF" oifname "$WAN_IF" ct state { new, established, related } counter accept comment "ctos tower egress"
+add rule inet filter forward iifname "$WAN_IF" oifname "$LAN_IF" ct state established,related counter accept comment "ctos tower egress return"
+NFT
+      nft -f "$rules_file"
+    else
+      echo "inet filter forward already has CTOS tower egress rules"
+    fi
+  else
+    echo "missing nft chain inet filter forward; skipping direct forward-chain insert"
+  fi
+
+  nft add table inet ctos_tower_rescue 2>/dev/null || true
+  nft "add chain inet ctos_tower_rescue forward { type filter hook forward priority -50; policy accept; }" 2>/dev/null || true
+  nft add rule inet ctos_tower_rescue forward iifname "$LAN_IF" oifname "$WAN_IF" counter accept comment "ctos tower egress" 2>/dev/null || true
+  nft add rule inet ctos_tower_rescue forward iifname "$WAN_IF" oifname "$LAN_IF" ct state established,related counter accept comment "ctos tower egress return" 2>/dev/null || true
+
+  nft add table ip ctos_tower_nat 2>/dev/null || true
+  nft "add chain ip ctos_tower_nat postrouting { type nat hook postrouting priority srcnat; policy accept; }" 2>/dev/null || true
+  nft add rule ip ctos_tower_nat postrouting ip saddr "$LAN_NET" oifname "$WAN_IF" counter masquerade comment "ctos tower masquerade" 2>/dev/null || true
+fi
+
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+echo "runtime tower egress rules applied"
+echo
+echo "Now test on the tower:"
+echo "  ping -c 3 10.42.0.1"
+echo "  ping -c 3 1.1.1.1"
+echo "  ping -c 3 endeavouros.com"

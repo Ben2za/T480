@@ -1,0 +1,575 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_HOST = "10.42.0.2"
+DEFAULT_USER = "ctos"
+DEFAULT_TIMEOUT = "6"
+SERVICE_ROOT = "/srv/ctos"
+REPO_SYNC_TARGET = "/srv/ctos/repo/t480"
+LAYOUT_DIRS = [
+    "repo",
+    "repo/t480",
+    "packages/pacman/pkg",
+    "packages/incoming",
+    "cache/git",
+    "cache/python",
+    "cache/node",
+    "models/ollama",
+    "models/huggingface",
+    "workers/queue",
+    "workers/active",
+    "workers/done",
+    "workers/failed",
+    "state",
+]
+SYNC_PATHS = [
+    "AGENTS.md",
+    "README.md",
+    "CTOS_HANDOVER.md",
+    "Assets",
+    "bootstrap",
+    "context",
+    "control",
+    "docs",
+    "fleet",
+    "hyprland",
+    "libvirt",
+    "scripts",
+    "waybar",
+]
+SYNC_EXCLUDES = [
+    ".git",
+    ".codex",
+    ".agents",
+    "__pycache__",
+    "*.pyc",
+    "*.qcow2",
+    "*.iso",
+    "*.img",
+    "*.raw",
+    "logs",
+    "*.log",
+]
+
+REMOTE_SNAPSHOT = r'''
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+from pathlib import Path
+
+
+def read(path: str, default: str = "") -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return default
+
+
+def run(args: list[str], timeout: float = 1.5) -> dict[str, object]:
+    try:
+        proc = subprocess.run(args, capture_output=True, check=False, text=True, timeout=timeout)
+        return {"rc": proc.returncode, "stdout": proc.stdout.strip(), "stderr": proc.stderr.strip()}
+    except FileNotFoundError:
+        return {"rc": 127, "stdout": "", "stderr": f"{args[0]} not found"}
+    except subprocess.TimeoutExpired:
+        return {"rc": 124, "stdout": "", "stderr": "timeout"}
+
+
+def bytes_fmt(value: int) -> str:
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    size = float(value)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} {unit}"
+        size /= 1024
+    return f"{value} B"
+
+
+def meminfo() -> dict[str, int]:
+    data: dict[str, int] = {}
+    for line in read("/proc/meminfo").splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        parts = value.strip().split()
+        if parts and parts[0].isdigit():
+            data[key] = int(parts[0]) * 1024
+    return data
+
+
+def role() -> dict[str, str]:
+    data: dict[str, str] = {}
+    for line in read("/etc/ctos-role").splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            data[key] = value
+    return data
+
+
+def service(name: str) -> dict[str, str]:
+    active = run(["systemctl", "is-active", name], timeout=0.8)
+    enabled = run(["systemctl", "is-enabled", name], timeout=0.8)
+    return {
+        "name": name.replace(".service", ""),
+        "active": str(active["stdout"]) if active["rc"] == 0 else "unknown",
+        "enabled": str(enabled["stdout"]) if enabled["rc"] == 0 else "unknown",
+    }
+
+
+def parse_findmnt() -> dict[str, object]:
+    result = run(["findmnt", "-no", "SOURCE,FSTYPE,OPTIONS", "/srv/ctos"], timeout=1.0)
+    if result["rc"] != 0:
+        return {"mounted": False, "error": result["stderr"] or result["stdout"]}
+    parts = str(result["stdout"]).split(maxsplit=2)
+    return {
+        "mounted": True,
+        "source": parts[0] if len(parts) > 0 else "",
+        "fstype": parts[1] if len(parts) > 1 else "",
+        "options": parts[2] if len(parts) > 2 else "",
+    }
+
+
+def parse_df(path: str) -> dict[str, object]:
+    usage = shutil.disk_usage(path)
+    used_percent = round((usage.used / usage.total) * 100, 1) if usage.total else 0
+    return {
+        "total": usage.total,
+        "used": usage.used,
+        "free": usage.free,
+        "used_percent": used_percent,
+        "total_text": bytes_fmt(usage.total),
+        "used_text": bytes_fmt(usage.used),
+        "free_text": bytes_fmt(usage.free),
+    }
+
+
+def lsblk() -> list[dict[str, object]]:
+    result = run(
+        [
+            "lsblk",
+            "-J",
+            "-e7",
+            "-o",
+            "NAME,PATH,SIZE,MODEL,SERIAL,TYPE,FSTYPE,LABEL,UUID,MOUNTPOINTS",
+        ],
+        timeout=2.0,
+    )
+    if result["rc"] != 0:
+        return []
+    try:
+        return json.loads(str(result["stdout"])).get("blockdevices", [])
+    except json.JSONDecodeError:
+        return []
+
+
+def ping(label: str, target: str) -> dict[str, object]:
+    result = run(["ping", "-c", "1", "-W", "2", target], timeout=3.0)
+    return {"name": label, "target": target, "ok": result["rc"] == 0}
+
+
+def layout() -> dict[str, object]:
+    root = Path("/srv/ctos")
+    dirs = [
+        "repo",
+        "repo/t480",
+        "packages/pacman/pkg",
+        "packages/incoming",
+        "cache/git",
+        "cache/python",
+        "cache/node",
+        "models/ollama",
+        "models/huggingface",
+        "workers/queue",
+        "workers/active",
+        "workers/done",
+        "workers/failed",
+        "state",
+    ]
+    entries = []
+    for rel in dirs:
+        path = root / rel
+        entries.append({"path": str(path), "exists": path.is_dir(), "writable": os.access(path, os.W_OK)})
+    marker = root / "state" / "layout-v1.json"
+    return {
+        "root": str(root),
+        "complete": all(item["exists"] and item["writable"] for item in entries),
+        "entries": entries,
+        "marker": str(marker),
+        "marker_exists": marker.is_file(),
+    }
+
+
+mem = meminfo()
+total = mem.get("MemTotal", 0)
+available = mem.get("MemAvailable", 0)
+used = max(total - available, 0)
+uptime_seconds = int(float(read("/proc/uptime", "0").split()[0]))
+srv_mount = parse_findmnt()
+srv_disk = parse_df("/srv/ctos") if srv_mount.get("mounted") else {}
+root_disk = parse_df("/")
+home_disk = parse_df(str(Path.home()))
+display_manager = run(["readlink", "-f", "/etc/systemd/system/display-manager.service"], timeout=1.0)
+failed = run(["systemctl", "--failed", "--no-legend", "--no-pager"], timeout=1.0)
+sudo_check = run(["sudo", "-n", "true"], timeout=1.0)
+
+data = {
+    "available": True,
+    "hostname": read("/proc/sys/kernel/hostname", "unknown"),
+    "kernel": os.uname().release,
+    "uptime_seconds": uptime_seconds,
+    "load": [round(item, 2) for item in os.getloadavg()],
+    "role": role(),
+    "memory": {
+        "total": total,
+        "used": used,
+        "available": available,
+        "used_percent": round((used / total) * 100, 1) if total else 0,
+        "total_text": bytes_fmt(total),
+        "used_text": bytes_fmt(used),
+        "available_text": bytes_fmt(available),
+    },
+    "storage": {
+        "root": root_disk,
+        "home": home_disk,
+        "srv": {
+            **srv_mount,
+            **srv_disk,
+            "writable": os.access("/srv/ctos", os.W_OK),
+        },
+    },
+    "layout": layout(),
+    "disks": lsblk(),
+    "network": {
+        "addresses": run(["ip", "-br", "addr", "show"], timeout=1.0)["stdout"],
+        "routes": run(["ip", "route"], timeout=1.0)["stdout"],
+        "checks": [
+            ping("t480", "10.42.0.1"),
+            ping("dns", "endeavouros.com"),
+        ],
+    },
+    "services": [
+        service("NetworkManager.service"),
+        service("sshd.service"),
+        service("avahi-daemon.service"),
+        service("display-manager.service"),
+    ],
+    "display_manager": str(display_manager["stdout"]) if display_manager["rc"] == 0 else "",
+    "failed_units": [line for line in str(failed["stdout"]).splitlines() if line.strip()] if failed["rc"] == 0 else [],
+    "sudo_password_required": sudo_check["rc"] != 0,
+}
+
+print(json.dumps(data, sort_keys=True))
+'''
+
+
+def ssh_base(args: argparse.Namespace) -> list[str]:
+    return [
+        "ssh",
+        "-F",
+        "/dev/null",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "PasswordAuthentication=no",
+        "-o",
+        "PreferredAuthentications=publickey",
+        "-o",
+        f"ConnectTimeout={args.timeout}",
+        "-o",
+        "LogLevel=ERROR",
+        f"{args.user}@{args.host}",
+    ]
+
+
+def run_remote(args: argparse.Namespace, command: str) -> subprocess.CompletedProcess[str]:
+    proc = subprocess.run(
+        [*ssh_base(args), command],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=float(args.timeout) + 4,
+    )
+    return proc
+
+
+def load_snapshot(args: argparse.Namespace) -> tuple[int, dict[str, Any] | None, str]:
+    command = "python3 -c " + shlex.quote(REMOTE_SNAPSHOT)
+    try:
+        proc = run_remote(args, command)
+    except subprocess.TimeoutExpired:
+        return 124, None, "ssh timeout"
+    if proc.returncode != 0:
+        return proc.returncode, None, (proc.stderr or proc.stdout or "remote snapshot failed").strip()
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError as error:
+        return 1, None, f"invalid remote JSON: {error}"
+    data["target"] = {"host": args.host, "user": args.user}
+    return 0, data, ""
+
+
+def repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def uptime_text(seconds: int) -> str:
+    minutes, _ = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+    if days:
+        return f"{days}d {hours}h {minutes}m"
+    return f"{hours}h {minutes}m"
+
+
+def tone(value: bool) -> str:
+    return "ok" if value else "bad"
+
+
+def render(data: dict[str, Any]) -> None:
+    role = data.get("role") or {}
+    memory = data.get("memory") or {}
+    storage = data.get("storage") or {}
+    srv = storage.get("srv") or {}
+    layout = data.get("layout") or {}
+    network = data.get("network") or {}
+    checks = network.get("checks") or []
+
+    print(f"CTOS core: {data.get('hostname')} ({data['target']['user']}@{data['target']['host']})")
+    print(f"role: {role.get('role', 'unknown')}  kernel: {data.get('kernel')}  uptime: {uptime_text(int(data.get('uptime_seconds', 0)))}")
+    print(f"load: {' '.join(str(item) for item in data.get('load', []))}")
+    print(f"memory: {memory.get('used_text')} / {memory.get('total_text')} ({memory.get('used_percent')}%)")
+    print(
+        "srv: "
+        f"{srv.get('source', 'missing')} {srv.get('fstype', '')} "
+        f"{srv.get('used_percent', '--')}% used, free {srv.get('free_text', '--')}, "
+        f"writable={srv.get('writable')}"
+    )
+    print(f"layout: complete={layout.get('complete')} marker={layout.get('marker_exists')}")
+    print(f"display manager: {data.get('display_manager') or 'unknown'}")
+    print("services:")
+    for service in data.get("services") or []:
+        print(f"  {service['name']:<16} active {service['active']:<8} enabled {service['enabled']}")
+    print("network:")
+    for check in checks:
+        print(f"  {check['name']:<8} {tone(bool(check.get('ok'))):<3} {check.get('target')}")
+    if data.get("failed_units"):
+        print("failed units:")
+        for unit in data["failed_units"]:
+            print(f"  {unit}")
+    else:
+        print("failed units: none")
+    print(f"passwordless sudo: {'closed' if data.get('sudo_password_required') else 'present'}")
+
+
+def render_services_plan() -> None:
+    print("CTOS core services v1 plan")
+    print()
+    print(f"Root:        {SERVICE_ROOT}")
+    print(f"Repo target: {REPO_SYNC_TARGET}")
+    print()
+    print("Creates only user-writable directories under /srv/ctos:")
+    for item in LAYOUT_DIRS:
+        print(f"  - {SERVICE_ROOT}/{item}")
+    print()
+    print("Does not:")
+    print("  - install packages")
+    print("  - enable daemons")
+    print("  - open LAN ports")
+    print("  - run sudo")
+    print("  - change system services")
+
+
+def remote_apply_layout_script() -> str:
+    dirs_json = json.dumps(LAYOUT_DIRS)
+    return f"""
+from __future__ import annotations
+import json
+import os
+from pathlib import Path
+
+root = Path({SERVICE_ROOT!r})
+dirs = json.loads({dirs_json!r})
+
+if not root.is_dir():
+    raise SystemExit(f"missing service root: {{root}}")
+if not os.access(root, os.W_OK):
+    raise SystemExit(f"service root is not writable: {{root}}")
+
+created = []
+for rel in dirs:
+    path = root / rel
+    path.mkdir(parents=True, exist_ok=True)
+    os.chmod(path, 0o2775)
+    created.append(str(path))
+
+marker = root / "state" / "layout-v1.json"
+marker.write_text(json.dumps({{
+    "version": 1,
+    "root": str(root),
+    "dirs": created,
+}}, indent=2, sort_keys=True) + "\\n", encoding="utf-8")
+
+print(json.dumps({{"ok": True, "root": str(root), "created": created, "marker": str(marker)}}))
+"""
+
+
+def cmd_plan_services(args: argparse.Namespace) -> int:
+    render_services_plan()
+    return 0
+
+
+def cmd_apply_layout(args: argparse.Namespace) -> int:
+    command = "python3 -c " + shlex.quote(remote_apply_layout_script())
+    proc = run_remote(args, command)
+    if proc.returncode != 0:
+        if proc.stdout:
+            print(proc.stdout.rstrip())
+        if proc.stderr:
+            print(proc.stderr.rstrip(), file=sys.stderr)
+        return proc.returncode
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        print(proc.stdout.rstrip())
+        return 0
+    print(f"ctos-core layout applied under {data.get('root')}")
+    print(f"marker: {data.get('marker')}")
+    print(f"directories: {len(data.get('created', []))}")
+    return 0
+
+
+def tar_command(paths: list[str]) -> list[str]:
+    command = ["tar", "-C", str(repo_root()), "-cf", "-"]
+    for pattern in SYNC_EXCLUDES:
+        command.extend(["--exclude", pattern])
+    command.extend(paths)
+    return command
+
+
+def cmd_sync_repo(args: argparse.Namespace) -> int:
+    root = repo_root()
+    paths = [path for path in SYNC_PATHS if (root / path).exists()]
+    missing = [path for path in SYNC_PATHS if not (root / path).exists()]
+    if args.dry_run:
+        print(f"repo root: {root}")
+        print(f"target:    {args.target}")
+        print("paths:")
+        for path in paths:
+            print(f"  - {path}")
+        if missing:
+            print("missing/skipped:")
+            for path in missing:
+                print(f"  - {path}")
+        print("excludes:")
+        for pattern in SYNC_EXCLUDES:
+            print(f"  - {pattern}")
+        return 0
+
+    remote = (
+        f"mkdir -p {shlex.quote(args.target)} && "
+        f"tar -xf - -C {shlex.quote(args.target)}"
+    )
+    tar_proc = subprocess.Popen(tar_command(paths), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    ssh_proc = subprocess.run(
+        [*ssh_base(args), remote],
+        stdin=tar_proc.stdout,
+        capture_output=True,
+        text=True,
+        timeout=float(args.timeout) + 30,
+    )
+    if tar_proc.stdout:
+        tar_proc.stdout.close()
+    _, tar_stderr = tar_proc.communicate()
+
+    if tar_proc.returncode != 0:
+        print(tar_stderr.decode("utf-8", errors="replace").rstrip(), file=sys.stderr)
+        return tar_proc.returncode
+    if ssh_proc.returncode != 0:
+        if ssh_proc.stdout:
+            print(ssh_proc.stdout.rstrip())
+        if ssh_proc.stderr:
+            print(ssh_proc.stderr.rstrip(), file=sys.stderr)
+        return ssh_proc.returncode
+
+    print(f"synced repo subset to {args.user}@{args.host}:{args.target}")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    rc, data, error = load_snapshot(args)
+    if args.json:
+        if data is not None:
+            print(json.dumps(data, indent=2, sort_keys=True))
+        else:
+            print(json.dumps({"available": False, "target": {"host": args.host, "user": args.user}, "error": error}, indent=2))
+        return rc
+    if data is None:
+        print(f"ctos-core unavailable: {error}", file=sys.stderr)
+        return rc
+    render(data)
+    return 0
+
+
+def cmd_ssh(args: argparse.Namespace) -> int:
+    command = ["ssh", "-F", "/dev/null", f"{args.user}@{args.host}"]
+    os.execvp(command[0], command)
+    return 127
+
+
+def cmd_ping(args: argparse.Namespace) -> int:
+    proc = subprocess.run(["ping", "-c", "3", "-W", "2", args.host], check=False)
+    return proc.returncode
+
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="T480-side helper for the EndeavourOS ctos-core tower.")
+    p.add_argument("--host", default=os.environ.get("CTOS_CORE_HOST", DEFAULT_HOST))
+    p.add_argument("--user", default=os.environ.get("CTOS_CORE_USER", DEFAULT_USER))
+    p.add_argument("--timeout", default=os.environ.get("CTOS_CORE_TIMEOUT", DEFAULT_TIMEOUT))
+
+    sub = p.add_subparsers(dest="command", required=True)
+
+    status = sub.add_parser("status", help="read host, service, network, and /srv/ctos state")
+    status.add_argument("--json", action="store_true", help="emit JSON for the cockpit")
+    status.set_defaults(func=cmd_status)
+
+    plan_services = sub.add_parser("plan-services", help="show the first /srv/ctos service layout plan")
+    plan_services.set_defaults(func=cmd_plan_services)
+
+    apply_layout = sub.add_parser("apply-layout", help="create the first user-writable /srv/ctos service layout")
+    apply_layout.set_defaults(func=cmd_apply_layout)
+
+    sync_repo = sub.add_parser("sync-repo", help="copy a safe repo subset to /srv/ctos/repo/t480")
+    sync_repo.add_argument("--target", default=REPO_SYNC_TARGET)
+    sync_repo.add_argument("--dry-run", action="store_true")
+    sync_repo.set_defaults(func=cmd_sync_repo)
+
+    ssh_cmd = sub.add_parser("ssh", help="open an interactive SSH shell")
+    ssh_cmd.set_defaults(func=cmd_ssh)
+
+    ping_cmd = sub.add_parser("ping", help="ping the ctos-core host")
+    ping_cmd.set_defaults(func=cmd_ping)
+
+    return p
+
+
+def main() -> int:
+    args = parser().parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

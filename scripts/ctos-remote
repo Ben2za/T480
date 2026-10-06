@@ -1,0 +1,880 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_HOST = "10.42.0.2"
+DEFAULT_USER = "ctos"
+DEFAULT_TIMEOUT = 7.0
+
+REMOTE_PACKAGES = [
+    "krdp",
+    "krfb",
+    "tigervnc",
+    "wayvnc",
+    "waypipe",
+]
+LOCAL_PACKAGES = [
+    "freerdp",
+    "remmina",
+    "krdc",
+    "tigervnc",
+    "waypipe",
+]
+COMMANDS = [
+    "krdp",
+    "krfb",
+    "xfreerdp",
+    "xfreerdp3",
+    "wlfreerdp3",
+    "remmina",
+    "krdc",
+    "vncviewer",
+    "waypipe",
+    "wayvnc",
+    "ssh",
+]
+PORTS = {
+    "rdp": {"local": 3390, "remote": 3389},
+    "vnc": {"local": 5901, "remote": 5900},
+    "w0vnc": {"local": 5902, "remote": 5902},
+    "x0vnc": {"local": 5902, "remote": 5902},
+}
+KRDP_SERVICE = "app-org.kde.krdpserver.service"
+KRDP_OVERRIDE = """[Service]
+ExecStart=
+ExecStart=/usr/bin/krdpserver --address 127.0.0.1 --plasma
+"""
+
+REMOTE_PROBE = r'''
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import time
+from pathlib import Path
+
+packages = __PACKAGES__
+commands = __COMMANDS__
+
+
+def read(path: str, default: str = "") -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return default
+
+
+def run(args: list[str], timeout: float = 2.0, env: dict[str, str] | None = None) -> dict[str, object]:
+    try:
+        proc = subprocess.run(args, capture_output=True, check=False, text=True, timeout=timeout, env=env)
+        return {"rc": proc.returncode, "stdout": proc.stdout.strip(), "stderr": proc.stderr.strip()}
+    except FileNotFoundError:
+        return {"rc": 127, "stdout": "", "stderr": f"{args[0]} not found"}
+    except subprocess.TimeoutExpired:
+        return {"rc": 124, "stdout": "", "stderr": "timeout"}
+
+
+def package_state(name: str) -> dict[str, object]:
+    result = run(["pacman", "-Q", name], timeout=1.5)
+    return {
+        "name": name,
+        "installed": result["rc"] == 0,
+        "version": str(result["stdout"]).split(maxsplit=1)[1] if result["rc"] == 0 and len(str(result["stdout"]).split(maxsplit=1)) == 2 else "",
+    }
+
+
+def command_state(name: str) -> dict[str, object]:
+    path = shutil.which(name)
+    return {"name": name, "available": path is not None, "path": path or ""}
+
+
+def unit_files() -> list[dict[str, str]]:
+    result = run(["systemctl", "list-unit-files", "--no-legend"], timeout=2.5)
+    if result["rc"] != 0:
+        return []
+    needles = ("krdp", "krfb", "rdp", "vnc", "xrdp", "sunshine")
+    units = []
+    for line in str(result["stdout"]).splitlines():
+        if any(needle in line.lower() for needle in needles):
+            parts = line.split()
+            units.append({
+                "unit": parts[0] if parts else line,
+                "state": parts[1] if len(parts) > 1 else "",
+            })
+    return units
+
+
+def user_service(name: str) -> dict[str, object]:
+    uid = os.getuid()
+    env = dict(os.environ)
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{uid}")
+    env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{uid}/bus")
+    exists = run(["systemctl", "--user", "cat", name], timeout=1.5, env=env)
+    if exists["rc"] != 0:
+        return {
+            "name": name,
+            "active": "not-found",
+            "enabled": "not-found",
+            "active_rc": exists["rc"],
+            "enabled_rc": exists["rc"],
+            "error": exists["stderr"] or exists["stdout"],
+        }
+    active = run(["systemctl", "--user", "is-active", name], timeout=1.5, env=env)
+    enabled = run(["systemctl", "--user", "is-enabled", name], timeout=1.5, env=env)
+    return {
+        "name": name,
+        "active": active["stdout"] if active["rc"] == 0 else "inactive",
+        "enabled": enabled["stdout"] if enabled["rc"] == 0 else "disabled",
+        "active_rc": active["rc"],
+        "enabled_rc": enabled["rc"],
+        "error": active["stderr"] or enabled["stderr"],
+    }
+
+
+def sessions() -> list[dict[str, str]]:
+    listed = run(["loginctl", "list-sessions", "--no-legend"], timeout=2.0)
+    items = []
+    if listed["rc"] != 0:
+        return items
+    for line in str(listed["stdout"]).splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        sid = parts[0]
+        shown = run(["loginctl", "show-session", sid, "-p", "Name", "-p", "User", "-p", "Type", "-p", "State", "-p", "Remote", "-p", "Desktop", "-p", "Display"], timeout=1.5)
+        data = {"id": sid, "raw": line}
+        if shown["rc"] == 0:
+            for entry in str(shown["stdout"]).splitlines():
+                if "=" in entry:
+                    key, value = entry.split("=", 1)
+                    data[key.lower()] = value
+        items.append(data)
+    return items
+
+
+def listeners() -> list[str]:
+    result = run(["ss", "-lnt"], timeout=1.5)
+    if result["rc"] != 0:
+        return []
+    targets = (":3389", ":3390", ":5900", ":5901", ":5902")
+    return [line for line in str(result["stdout"]).splitlines() if any(target in line for target in targets)]
+
+
+display_manager = run(["readlink", "-f", "/etc/systemd/system/display-manager.service"], timeout=1.0)
+data = {
+    "available": True,
+    "hostname": read("/proc/sys/kernel/hostname", "unknown"),
+    "kernel": os.uname().release,
+    "display_manager": display_manager["stdout"] if display_manager["rc"] == 0 else "",
+    "packages": {name: package_state(name) for name in packages},
+    "commands": {name: command_state(name) for name in commands},
+    "unit_files": unit_files(),
+    "user_services": {
+        "app-org.kde.krdpserver.service": user_service("app-org.kde.krdpserver.service"),
+    },
+    "krdp": {
+        "override": read(str(Path.home() / ".config/systemd/user/app-org.kde.krdpserver.service.d/override.conf")),
+        "config": read(str(Path.home() / ".config/krdpserverrc")),
+    },
+    "sessions": sessions(),
+    "listeners": listeners(),
+}
+print(json.dumps(data, sort_keys=True))
+'''
+
+REMOTE_KRDP_LOCALHOST = r'''
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import time
+from pathlib import Path
+
+start_service = __START__
+service = "app-org.kde.krdpserver.service"
+override_text = __OVERRIDE__
+
+
+def run(args: list[str], timeout: float = 8.0, env: dict[str, str] | None = None) -> dict[str, object]:
+    try:
+        proc = subprocess.run(args, capture_output=True, check=False, text=True, timeout=timeout, env=env)
+        return {"rc": proc.returncode, "stdout": proc.stdout.strip(), "stderr": proc.stderr.strip()}
+    except FileNotFoundError:
+        return {"rc": 127, "stdout": "", "stderr": f"{args[0]} not found"}
+    except subprocess.TimeoutExpired:
+        return {"rc": 124, "stdout": "", "stderr": "timeout"}
+
+
+def fail(message: str, detail: object | None = None) -> None:
+    print(json.dumps({"ok": False, "message": message, "detail": detail}, sort_keys=True))
+    raise SystemExit(1)
+
+
+def user_env() -> dict[str, str]:
+    uid = os.getuid()
+    env = dict(os.environ)
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{uid}")
+    env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{uid}/bus")
+    return env
+
+
+if shutil.which("krdpserver") is None:
+    fail("krdpserver is not installed")
+if shutil.which("kwriteconfig6") is None:
+    fail("kwriteconfig6 is not installed; refusing to rewrite KDE config manually")
+if shutil.which("openssl") is None:
+    fail("openssl is not installed; refusing to start KRDP without a TLS certificate")
+
+override_dir = Path.home() / ".config/systemd/user/app-org.kde.krdpserver.service.d"
+override_dir.mkdir(parents=True, exist_ok=True)
+override_path = override_dir / "override.conf"
+before_override = override_path.read_text(encoding="utf-8") if override_path.exists() else ""
+changed_override = before_override != override_text
+if changed_override:
+    override_path.write_text(override_text, encoding="utf-8")
+
+cert_dir = Path.home() / ".local/share/krdpserver"
+cert_dir.mkdir(parents=True, exist_ok=True)
+cert_path = cert_dir / "krdp.crt"
+cert_key_path = cert_dir / "krdp.key"
+generated_cert = False
+if not cert_path.exists() or not cert_key_path.exists():
+    cert_result = run(
+        [
+            "openssl",
+            "req",
+            "-nodes",
+            "-new",
+            "-x509",
+            "-keyout",
+            str(cert_key_path),
+            "-out",
+            str(cert_path),
+            "-days",
+            "365",
+            "-subj",
+            "/CN=ctos-core-krdp",
+        ],
+        timeout=8.0,
+    )
+    if cert_result["rc"] != 0:
+        fail("failed to generate KRDP TLS certificate", cert_result)
+    cert_key_path.chmod(0o600)
+    cert_path.chmod(0o644)
+    generated_cert = True
+
+config_writes = [
+    ["kwriteconfig6", "--file", "krdpserverrc", "--group", "General", "--key", "SystemUserEnabled", "true"],
+    ["kwriteconfig6", "--file", "krdpserverrc", "--group", "General", "--key", "Autostart", "false"],
+    ["kwriteconfig6", "--file", "krdpserverrc", "--group", "General", "--key", "AutogenerateCertificates", "false"],
+    ["kwriteconfig6", "--file", "krdpserverrc", "--group", "General", "--key", "Certificate", str(cert_path)],
+    ["kwriteconfig6", "--file", "krdpserverrc", "--group", "General", "--key", "CertificateKey", str(cert_key_path)],
+    ["kwriteconfig6", "--file", "krdpserverrc", "--group", "General", "--key", "ListenPort", "3389"],
+]
+write_results = [run(cmd, timeout=4.0) for cmd in config_writes]
+failed_writes = [item for item in write_results if item["rc"] != 0]
+if failed_writes:
+    fail("failed to write krdpserverrc", failed_writes)
+
+env = user_env()
+daemon_reload = run(["systemctl", "--user", "daemon-reload"], timeout=4.0, env=env)
+if daemon_reload["rc"] != 0:
+    fail("failed to reload user systemd manager", daemon_reload)
+
+started = None
+if start_service:
+    started = run(["systemctl", "--user", "restart", service], timeout=8.0, env=env)
+    time.sleep(1.0)
+
+active = run(["systemctl", "--user", "is-active", service], timeout=2.0, env=env)
+enabled = run(["systemctl", "--user", "is-enabled", service], timeout=2.0, env=env)
+listeners = run(["ss", "-lnt"], timeout=2.0)
+rdp_listeners = [line for line in str(listeners["stdout"]).splitlines() if ":3389" in line]
+unsafe = [line for line in rdp_listeners if "127.0.0.1:3389" not in line and "[::1]:3389" not in line]
+
+if start_service and active["rc"] != 0:
+    journal = run(["journalctl", "--user", "-u", service, "-n", "60", "--no-pager", "-o", "short-iso"], timeout=4.0, env=env)
+    fail("krdp service failed to become active", {"active": active, "started": started, "journal": journal})
+
+if unsafe:
+    run(["systemctl", "--user", "stop", service], timeout=4.0, env=env)
+    fail("krdp started with a non-localhost listener and was stopped", unsafe)
+
+if start_service and not rdp_listeners:
+    journal = run(["journalctl", "--user", "-u", service, "-n", "60", "--no-pager", "-o", "short-iso"], timeout=4.0, env=env)
+    fail("krdp service is active but no RDP listener is visible", {"active": active, "started": started, "journal": journal})
+
+print(json.dumps(
+    {
+        "ok": True,
+        "changed_override": changed_override,
+        "generated_cert": generated_cert,
+        "certificate": str(cert_path),
+        "certificate_key": str(cert_key_path),
+        "override_path": str(override_path),
+        "service": service,
+        "started": started,
+        "active": active,
+        "enabled": enabled,
+        "rdp_listeners": rdp_listeners,
+    },
+    sort_keys=True,
+))
+'''
+
+
+def run(args: list[str], timeout: float = DEFAULT_TIMEOUT, input_text: str | None = None) -> dict[str, Any]:
+    try:
+        proc = subprocess.run(
+            args,
+            capture_output=True,
+            check=False,
+            input=input_text,
+            text=True,
+            timeout=timeout,
+        )
+        return {"rc": proc.returncode, "stdout": proc.stdout.strip(), "stderr": proc.stderr.strip()}
+    except FileNotFoundError:
+        return {"rc": 127, "stdout": "", "stderr": f"{args[0]} not found"}
+    except subprocess.TimeoutExpired:
+        return {"rc": 124, "stdout": "", "stderr": "timeout"}
+
+
+def ssh_target(args: argparse.Namespace) -> str:
+    return f"{args.user}@{args.host}"
+
+
+def ssh_args(args: argparse.Namespace, remote_command: list[str]) -> list[str]:
+    return [
+        "ssh",
+        "-F",
+        "/dev/null",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=5",
+        ssh_target(args),
+        *remote_command,
+    ]
+
+
+def local_package_state(name: str) -> dict[str, object]:
+    result = run(["pacman", "-Q", name], timeout=1.5)
+    return {
+        "name": name,
+        "installed": result["rc"] == 0,
+        "version": str(result["stdout"]).split(maxsplit=1)[1] if result["rc"] == 0 and len(str(result["stdout"]).split(maxsplit=1)) == 2 else "",
+    }
+
+
+def local_command_state(name: str) -> dict[str, object]:
+    path = shutil.which(name)
+    return {"name": name, "available": path is not None, "path": path or ""}
+
+
+def local_probe() -> dict[str, Any]:
+    return {
+        "hostname": read_text(Path("/proc/sys/kernel/hostname"), "unknown"),
+        "packages": {name: local_package_state(name) for name in LOCAL_PACKAGES},
+        "commands": {name: local_command_state(name) for name in COMMANDS},
+    }
+
+
+def read_text(path: Path, default: str = "") -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return default
+
+
+def remote_probe(args: argparse.Namespace) -> dict[str, Any]:
+    script = REMOTE_PROBE.replace("__PACKAGES__", json.dumps(REMOTE_PACKAGES)).replace("__COMMANDS__", json.dumps(COMMANDS))
+    result = run(ssh_args(args, ["python3", "-"]), timeout=12.0, input_text=script)
+    if result["rc"] != 0:
+        return {
+            "available": False,
+            "target": ssh_target(args),
+            "error": result["stderr"] or result["stdout"] or "remote probe failed",
+            "rc": result["rc"],
+        }
+    try:
+        data = json.loads(result["stdout"])
+    except json.JSONDecodeError as error:
+        return {
+            "available": False,
+            "target": ssh_target(args),
+            "error": f"invalid remote JSON: {error}",
+            "raw": result["stdout"][:800],
+        }
+    data["target"] = ssh_target(args)
+    return data
+
+
+def package_installed(section: dict[str, Any], name: str) -> bool:
+    packages = section.get("packages") or {}
+    item = packages.get(name) if isinstance(packages, dict) else None
+    return bool(isinstance(item, dict) and item.get("installed"))
+
+
+def command_available(section: dict[str, Any], name: str) -> bool:
+    commands = section.get("commands") or {}
+    item = commands.get(name) if isinstance(commands, dict) else None
+    return bool(isinstance(item, dict) and item.get("available"))
+
+
+def capability_summary(data: dict[str, Any]) -> dict[str, Any]:
+    local = data.get("local") or {}
+    remote = data.get("remote") or {}
+    local_rdp = any(command_available(local, name) for name in ("wlfreerdp3", "xfreerdp3", "xfreerdp", "remmina", "krdc"))
+    local_vnc = any(command_available(local, name) for name in ("vncviewer", "remmina", "krdc"))
+    remote_rdp = package_installed(remote, "krdp") or command_available(remote, "krdp")
+    remote_vnc = package_installed(remote, "krfb") or package_installed(remote, "tigervnc") or command_available(remote, "wayvnc")
+    listeners = remote.get("listeners") if isinstance(remote, dict) else []
+    return {
+        "ssh": bool(remote.get("available")),
+        "rdp_client": local_rdp,
+        "vnc_client": local_vnc,
+        "rdp_server": remote_rdp,
+        "vnc_server": remote_vnc,
+        "desktop_listener": bool(listeners),
+        "ready": bool(remote.get("available") and ((local_rdp and remote_rdp) or (local_vnc and remote_vnc))),
+    }
+
+
+def collect(args: argparse.Namespace) -> dict[str, Any]:
+    data = {
+        "target": ssh_target(args),
+        "local": local_probe(),
+        "remote": remote_probe(args),
+    }
+    data["capabilities"] = capability_summary(data)
+    return data
+
+
+def render_packages(title: str, section: dict[str, Any], names: list[str]) -> None:
+    print(title)
+    packages = section.get("packages") or {}
+    commands = section.get("commands") or {}
+    for name in names:
+        pkg = packages.get(name) if isinstance(packages, dict) else {}
+        cmd = commands.get(name) if isinstance(commands, dict) else {}
+        installed = "yes" if isinstance(pkg, dict) and pkg.get("installed") else "no"
+        version = f" {pkg.get('version')}" if isinstance(pkg, dict) and pkg.get("version") else ""
+        available = " cmd" if isinstance(cmd, dict) and cmd.get("available") else ""
+        print(f"  {name:<10} package {installed:<3}{version}{available}")
+
+
+def render_status(data: dict[str, Any]) -> None:
+    remote = data.get("remote") or {}
+    caps = data.get("capabilities") or {}
+    print("CTOS remote control")
+    print(f"target: {data.get('target')}")
+    print(f"ssh:    {'ok' if caps.get('ssh') else 'failed'}")
+    if not remote.get("available"):
+        print(f"error:  {remote.get('error', 'remote unavailable')}")
+        return
+    print(f"host:   {remote.get('hostname')}  kernel {remote.get('kernel')}")
+    display = str(remote.get("display_manager") or "").replace("/usr/lib/systemd/system/", "")
+    print(f"dm:     {display or 'unknown'}")
+    print()
+    render_packages("tower server candidates:", remote, REMOTE_PACKAGES)
+    print()
+    render_packages("t480 client candidates:", data.get("local") or {}, LOCAL_PACKAGES)
+    print()
+    sessions = remote.get("sessions") or []
+    print("tower sessions:")
+    if sessions:
+        for session in sessions:
+            if not isinstance(session, dict):
+                continue
+            text = f"{session.get('id')} user={session.get('name', '')} type={session.get('type', '')} state={session.get('state', '')}"
+            desktop = session.get("desktop")
+            if desktop:
+                text += f" desktop={desktop}"
+            print(f"  {text}")
+    else:
+        print("  none visible")
+    listeners = remote.get("listeners") or []
+    print()
+    services = remote.get("user_services") or {}
+    print("tower user services:")
+    if services:
+        for service in services.values():
+            if isinstance(service, dict):
+                print(f"  {service.get('name')} active={service.get('active')} enabled={service.get('enabled')}")
+    else:
+        print("  none visible")
+    print()
+    krdp = remote.get("krdp") or {}
+    override = str(krdp.get("override") or "").strip()
+    config = str(krdp.get("config") or "").strip()
+    print("tower krdp config:")
+    if override:
+        first_line = override.splitlines()[0] if override.splitlines() else "override present"
+        localhost = "--address 127.0.0.1" in override
+        print(f"  override present ({first_line}); localhost_only={'yes' if localhost else 'no'}")
+    else:
+        print("  override absent")
+    if config:
+        keys = []
+        for key in ("SystemUserEnabled=true", "Autostart=false", "ListenPort=3389"):
+            if key in config:
+                keys.append(key)
+        print(f"  krdpserverrc present; {', '.join(keys) if keys else 'expected keys not visible'}")
+    else:
+        print("  krdpserverrc absent")
+    print()
+    print("desktop listeners:")
+    if listeners:
+        for line in listeners:
+            print(f"  {line}")
+    else:
+        print("  none on 3389/3390/5900/5901/5902")
+    print()
+    if caps.get("ready"):
+        print("summary: client and server pieces appear present; a tunnel can be tested.")
+    else:
+        print("summary: SSH is ready, but desktop-control pieces are not complete yet.")
+        print("next: use `scripts/ctos-remote plan` before installing/activating anything.")
+
+
+def render_plan(args: argparse.Namespace, data: dict[str, Any] | None = None) -> None:
+    if data is None:
+        data = collect(args)
+    remote = data.get("remote") or {}
+    caps = data.get("capabilities") or {}
+    print("CTOS remote-control V1 plan")
+    print()
+    print("boundary:")
+    print("  - keep SSH as the control root")
+    print("  - expose no permanent desktop port on the LAN in V1")
+    print("  - prefer localhost SSH tunnels for RDP/VNC")
+    print("  - keep sudo/manual confirmation for package/service changes")
+    print()
+    if not remote.get("available"):
+        print(f"current blocker: SSH probe failed for {ssh_target(args)}")
+        print(f"detail: {remote.get('error', 'unknown error')}")
+        return
+    print("current state:")
+    print(f"  - tower: {remote.get('hostname')} reachable over SSH")
+    print(f"  - display manager: {str(remote.get('display_manager') or 'unknown').replace('/usr/lib/systemd/system/', '')}")
+    print(f"  - RDP server present: {'yes' if caps.get('rdp_server') else 'no'}")
+    print(f"  - VNC server present: {'yes' if caps.get('vnc_server') else 'no'}")
+    print(f"  - T480 RDP client present: {'yes' if caps.get('rdp_client') else 'no'}")
+    print(f"  - T480 VNC client present: {'yes' if caps.get('vnc_client') else 'no'}")
+    print()
+    print("preferred lane for next request:")
+    print("  1. Keep KRDP/KRFB as tested current-session KDE candidates.")
+    print("  2. If KRFB Wayland/PipeWire is not interactive, test TigerVNC w0vncserver.")
+    print("  3. If Wayland remains unreliable, switch the tower session to Plasma X11 and use x0vncserver.")
+    print("  4. Bind/test through an SSH tunnel before opening any firewall rule.")
+    print("  5. Only after tunnel validation, decide whether this remains tunnel-only or becomes a controlled LAN service.")
+    print()
+    print("tunnel commands, once a server is intentionally enabled:")
+    print(f"  RDP: {tunnel_command(args, 'rdp', PORTS['rdp']['local'], PORTS['rdp']['remote'], '127.0.0.1')}")
+    print(f"  VNC: {tunnel_command(args, 'vnc', PORTS['vnc']['local'], PORTS['vnc']['remote'], '127.0.0.1')}")
+    print(f"  w0vnc/x0vnc: {tunnel_command(args, 'x0vnc', PORTS['x0vnc']['local'], PORTS['x0vnc']['remote'], '127.0.0.1')}")
+    print()
+    print("operator install commands for RDP:")
+    for line in install_commands(args, "rdp"):
+        print(f"  {line}")
+    print()
+    print("operator install commands for VNC fallback:")
+    for line in install_commands(args, "vnc"):
+        print(f"  {line}")
+    print()
+    print("operator install commands for TigerVNC attached-screen fallback:")
+    for line in install_commands(args, "x0vnc"):
+        print(f"  {line}")
+    print()
+    print("client command after RDP tunnel is running:")
+    print(f"  {client_command('rdp')}")
+    print("client command after VNC tunnel is running:")
+    print(f"  {client_command('vnc')}")
+    print("client command after w0vnc/x0vnc tunnel is running:")
+    print(f"  {client_command('x0vnc')}")
+    print()
+    print("not chosen for V1:")
+    print("  - xrdp: not visible in the official pacman repo check on this host; keep AUR out until explicitly approved")
+    print("  - Sunshine/Moonlight: good future high-performance path, not the first admin-control primitive")
+
+
+def tunnel_command(args: argparse.Namespace, protocol: str, local_port: int, remote_port: int, remote_bind: str) -> str:
+    return " ".join(
+        shlex_quote(part)
+        for part in [
+            "ssh",
+            "-F",
+            "/dev/null",
+            "-N",
+            "-L",
+            f"127.0.0.1:{local_port}:{remote_bind}:{remote_port}",
+            ssh_target(args),
+        ]
+    )
+
+
+def user_service_command(args: argparse.Namespace, action: str) -> str:
+    service = "app-org.kde.krdpserver.service"
+    user_env = "XDG_RUNTIME_DIR=/run/user/$(id -u) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus"
+    remote = f"{user_env} systemctl --user {action} {service}"
+    return f"ssh -tt -F /dev/null {shlex_quote(ssh_target(args))} {shlex_quote(remote)}"
+
+
+def attached_vnc_server_command(args: argparse.Namespace, protocol: str) -> str:
+    target = shlex_quote(ssh_target(args))
+    if protocol == "w0vnc":
+        remote = (
+            "env XDG_RUNTIME_DIR=/run/user/1000 "
+            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus "
+            "WAYLAND_DISPLAY=wayland-0 "
+            "nohup w0vncserver -localhost -rfbport 5902 -SecurityTypes None -AlwaysShared "
+            ">/tmp/ctos-w0vnc.log 2>&1 &"
+        )
+        return f"ssh -F /dev/null {target} {shlex_quote(remote)}"
+    if protocol == "x0vnc":
+        remote = (
+            "env DISPLAY=:0 XAUTHORITY=/home/ctos/.Xauthority "
+            "nohup x0vncserver -display :0 -localhost -rfbport 5902 "
+            "-SecurityTypes None -AlwaysShared -AcceptKeyEvents -AcceptPointerEvents "
+            ">/tmp/ctos-x0vnc.log 2>&1 &"
+        )
+        return f"ssh -F /dev/null {target} {shlex_quote(remote)}"
+    raise ValueError(protocol)
+
+
+def shlex_quote(value: str) -> str:
+    import shlex
+
+    return shlex.quote(value)
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    data = collect(args)
+    if args.json:
+        print(json.dumps(data, indent=2, sort_keys=True))
+    else:
+        render_status(data)
+    return 0 if data.get("remote", {}).get("available") else 2
+
+
+def cmd_plan(args: argparse.Namespace) -> int:
+    render_plan(args)
+    return 0
+
+
+def cmd_tunnel_command(args: argparse.Namespace) -> int:
+    ports = PORTS[args.protocol]
+    local_port = args.local_port or ports["local"]
+    remote_port = args.remote_port or ports["remote"]
+    print(tunnel_command(args, args.protocol, local_port, remote_port, args.remote_bind))
+    return 0
+
+
+def install_commands(args: argparse.Namespace, protocol: str) -> list[str]:
+    target = shlex_quote(ssh_target(args))
+    if protocol == "rdp":
+        return [
+            "sudo pacman -S --needed freerdp remmina",
+            f"ssh -tt -F /dev/null {target} 'sudo pacman -S --needed krdp'",
+        ]
+    if protocol == "vnc":
+        return [
+            "sudo pacman -S --needed tigervnc remmina libvncserver",
+            f"ssh -tt -F /dev/null {target} 'sudo pacman -S --needed krfb'",
+        ]
+    if protocol in {"w0vnc", "x0vnc"}:
+        return [
+            "sudo pacman -S --needed tigervnc",
+            f"ssh -tt -F /dev/null {target} 'sudo pacman -S --needed tigervnc'",
+        ]
+    raise ValueError(protocol)
+
+
+def client_command(protocol: str, profile: str = "stable") -> str:
+    if protocol == "rdp":
+        commands = {
+            "stable": (
+                "xfreerdp3 /v:127.0.0.1:3390 /u:ctos /cert:ignore "
+                "/gfx:AVC420:on,AVC444:on /network:lan "
+                "-dynamic-resolution /w:1280 /h:720 +clipboard"
+            ),
+            "sdl": (
+                "sdl-freerdp3 /v:127.0.0.1:3390 /u:ctos /cert:ignore "
+                "/gfx:AVC420:on,AVC444:on /network:lan "
+                "-dynamic-resolution /w:1280 /h:720 +clipboard"
+            ),
+            "remmina": "remmina -c rdp://ctos@127.0.0.1:3390",
+            "wayland": "wlfreerdp3 /v:127.0.0.1:3390 /u:ctos /cert:ignore +clipboard /dynamic-resolution",
+        }
+        return commands[profile]
+    if protocol == "vnc":
+        commands = {
+            "stable": "vncviewer 127.0.0.1:5901",
+            "tigervnc": "vncviewer 127.0.0.1:5901",
+            "remmina": "remmina -c vnc://127.0.0.1:5901",
+        }
+        return commands[profile]
+    if protocol in {"w0vnc", "x0vnc"}:
+        commands = {
+            "stable": "vncviewer -RemoteResize=0 -Shared 127.0.0.1:5902",
+            "tigervnc": "vncviewer -RemoteResize=0 -Shared 127.0.0.1:5902",
+            "remmina": "remmina -c vnc://127.0.0.1:5902",
+        }
+        return commands[profile]
+    raise ValueError(protocol)
+
+
+def cmd_install_commands(args: argparse.Namespace) -> int:
+    for line in install_commands(args, args.protocol):
+        print(line)
+    return 0
+
+
+def cmd_client_command(args: argparse.Namespace) -> int:
+    try:
+        print(client_command(args.protocol, args.profile))
+    except KeyError:
+        print(f"profile {args.profile!r} is not valid for protocol {args.protocol!r}", file=sys.stderr)
+        return 2
+    return 0
+
+
+def cmd_server_command(args: argparse.Namespace) -> int:
+    print(attached_vnc_server_command(args, args.protocol))
+    return 0
+
+
+def cmd_krdp_localhost(args: argparse.Namespace) -> int:
+    script = (
+        REMOTE_KRDP_LOCALHOST
+        .replace("__START__", "True" if args.start else "False")
+        .replace("__OVERRIDE__", json.dumps(KRDP_OVERRIDE))
+    )
+    result = run(ssh_args(args, ["python3", "-"]), timeout=18.0, input_text=script)
+    if result["rc"] != 0:
+        print(result["stderr"] or result["stdout"] or "krdp localhost apply failed", file=sys.stderr)
+        return result["rc"]
+    if args.json:
+        print(result["stdout"])
+        return 0
+    try:
+        data = json.loads(result["stdout"])
+    except json.JSONDecodeError:
+        print(result["stdout"])
+        return 0
+    print("KRDP localhost profile")
+    print(f"ok:       {data.get('ok')}")
+    print(f"override: {data.get('override_path')}")
+    print(f"changed:  {data.get('changed_override')}")
+    active = data.get("active") or {}
+    enabled = data.get("enabled") or {}
+    if isinstance(active, dict):
+        print(f"active:   {active.get('stdout') or 'inactive'}")
+    if isinstance(enabled, dict):
+        print(f"enabled:  {enabled.get('stdout') or 'disabled'}")
+    listeners = data.get("rdp_listeners") or []
+    print("listeners:")
+    if listeners:
+        for line in listeners:
+            print(f"  {line}")
+    else:
+        print("  none")
+    return 0
+
+
+def cmd_service_command(args: argparse.Namespace) -> int:
+    print(user_service_command(args, args.action))
+    return 0
+
+
+def cmd_ssh(args: argparse.Namespace) -> int:
+    command = ["ssh", "-F", "/dev/null", ssh_target(args)]
+    if args.remote_command:
+        command.extend(args.remote_command)
+    os.execvp(command[0], command)
+    return 127
+
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="CTOS remote-control helper for the T480 -> ctos-core path.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent(
+            """\
+            Examples:
+              scripts/ctos-remote status
+              scripts/ctos-remote plan
+              scripts/ctos-remote tunnel-command --protocol rdp
+            """
+        ),
+    )
+    p.add_argument("--host", default=os.environ.get("CTOS_CORE_HOST", DEFAULT_HOST), help="ctos-core SSH host")
+    p.add_argument("--user", default=os.environ.get("CTOS_CORE_USER", DEFAULT_USER), help="ctos-core SSH user")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    status = sub.add_parser("status", help="probe local viewer and remote server capabilities")
+    status.add_argument("--json", action="store_true", help="emit JSON")
+    status.set_defaults(func=cmd_status)
+
+    plan = sub.add_parser("plan", help="show the tunnel-first remote control plan")
+    plan.set_defaults(func=cmd_plan)
+
+    tunnel = sub.add_parser("tunnel-command", help="print an SSH local-forward command, but do not run it")
+    tunnel.add_argument("--protocol", choices=sorted(PORTS), default="rdp")
+    tunnel.add_argument("--local-port", type=int, default=0)
+    tunnel.add_argument("--remote-port", type=int, default=0)
+    tunnel.add_argument("--remote-bind", default="127.0.0.1")
+    tunnel.set_defaults(func=cmd_tunnel_command)
+
+    install = sub.add_parser("install-commands", help="print operator install commands for RDP or VNC")
+    install.add_argument("--protocol", choices=sorted(PORTS), default="rdp")
+    install.set_defaults(func=cmd_install_commands)
+
+    client = sub.add_parser("client-command", help="print the local viewer command for an already running tunnel")
+    client.add_argument("--protocol", choices=sorted(PORTS), default="rdp")
+    client.add_argument("--profile", choices=["stable", "sdl", "wayland", "tigervnc", "remmina"], default="stable")
+    client.set_defaults(func=cmd_client_command)
+
+    server = sub.add_parser("server-command", help="print a tower-side server start command for attached VNC fallbacks")
+    server.add_argument("--protocol", choices=["w0vnc", "x0vnc"], default="w0vnc")
+    server.set_defaults(func=cmd_server_command)
+
+    service = sub.add_parser("service-command", help="print a KRDP user-service command for ctos-core")
+    service.add_argument("action", choices=["status", "start", "stop", "restart"])
+    service.set_defaults(func=cmd_service_command)
+
+    krdp_localhost = sub.add_parser("krdp-localhost", help="apply a localhost-only KRDP user-service profile on ctos-core")
+    krdp_localhost.add_argument("--start", action="store_true", help="restart the KRDP user service after applying the profile")
+    krdp_localhost.add_argument("--json", action="store_true", help="emit JSON")
+    krdp_localhost.set_defaults(func=cmd_krdp_localhost)
+
+    ssh = sub.add_parser("ssh", help="open a normal SSH session to ctos-core")
+    ssh.add_argument("remote_command", nargs=argparse.REMAINDER)
+    ssh.set_defaults(func=cmd_ssh)
+
+    return p
+
+
+def main() -> int:
+    args = parser().parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

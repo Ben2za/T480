@@ -1,0 +1,12 @@
+# Daily development baseline for ctos-core.
+python
+python-pip
+python-pipx
+nodejs
+npm
+go
+rustup
+ripgrep
+fd
+fzf
+bat

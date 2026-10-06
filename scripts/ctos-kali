@@ -1,0 +1,1003 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+URI = "qemu:///system"
+DOMAIN = "ctos-kali"
+XML_PATH = ROOT / "libvirt/domains/ctos-kali.install.xml"
+INSTALLED_XML_PATH = ROOT / "libvirt/domains/ctos-kali.xml"
+INFRA_SCRIPT = ROOT / "scripts/ctos-libvirt-infra"
+VOLUME_POOL = "ctos-images"
+VOLUME_NAME = "ctos-kali.qcow2"
+VOLUME_SIZE = "40G"
+DISK_PATH = "/var/lib/libvirt/ctos/images/ctos-kali.qcow2"
+ISO_SOURCE_PATH = "/home/operator/iso/kali-linux-2025.4-installer-amd64.iso"
+ISO_POOL = "ctos-iso"
+ISO_VOLUME_NAME = "kali-linux-2025.4-installer-amd64.iso"
+ISO_PATH = "/var/lib/libvirt/ctos/iso/kali-linux-2025.4-installer-amd64.iso"
+SNAPSHOT_POOL = "ctos-snapshots"
+SNAPSHOT_DIR = "/var/lib/libvirt/ctos/snapshots"
+VIEWER = "virt-manager"
+SNAPSHOT_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}$")
+
+
+@dataclass
+class CommandResult:
+    rc: int
+    stdout: str
+    stderr: str
+
+
+def run(args: list[str], timeout: float = 20.0) -> CommandResult:
+    try:
+        proc = subprocess.run(
+            args,
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=timeout,
+        )
+    except FileNotFoundError:
+        return CommandResult(127, "", f"{args[0]} not found")
+    except subprocess.TimeoutExpired:
+        return CommandResult(124, "", "command timed out")
+    return CommandResult(proc.returncode, proc.stdout.strip(), proc.stderr.strip())
+
+
+def virsh(args: list[str], readonly: bool = False, timeout: float = 20.0) -> CommandResult:
+    command = ["virsh", "-c", URI]
+    if readonly:
+        command.append("--readonly")
+    command.extend(args)
+    return run(command, timeout=timeout)
+
+
+def parse_info(stdout: str) -> dict[str, str]:
+    data = {}
+    for line in stdout.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        data[key.strip().lower().replace(" ", "_")] = value.strip()
+    return data
+
+
+def load_xml(path: Path) -> ET.Element:
+    return ET.fromstring(path.read_text(encoding="utf-8"))
+
+
+def xml_signature(root: ET.Element) -> dict[str, Any]:
+    disk = None
+    cdrom = None
+    for item in root.findall("./devices/disk"):
+        if item.attrib.get("device") == "disk":
+            disk = item
+        elif item.attrib.get("device") == "cdrom":
+            cdrom = item
+
+    interface = root.find("./devices/interface/source")
+    graphics = root.find("./devices/graphics")
+    os_type = root.find("./os/type")
+    cpu = root.find("./cpu")
+    network = interface.attrib.get("network", "") if interface is not None else ""
+    graphics_type = graphics.attrib.get("type", "") if graphics is not None else ""
+    machine = os_type.attrib.get("machine", "") if os_type is not None else ""
+    cpu_mode = cpu.attrib.get("mode", "") if cpu is not None else ""
+
+    return {
+        "name": text(root, "name"),
+        "memory": text(root, "memory"),
+        "vcpu": text(root, "vcpu"),
+        "machine": machine,
+        "cpu_mode": cpu_mode,
+        "disk": disk.find("source").attrib.get("file", "") if disk is not None and disk.find("source") is not None else "",
+        "disk_bus": disk.find("target").attrib.get("bus", "") if disk is not None and disk.find("target") is not None else "",
+        "cdrom": cdrom.find("source").attrib.get("file", "") if cdrom is not None and cdrom.find("source") is not None else "",
+        "network": network,
+        "graphics": graphics_type,
+    }
+
+
+def text(root: ET.Element, path: str) -> str:
+    item = root.find(path)
+    if item is None or item.text is None:
+        return ""
+    return item.text.strip()
+
+
+def validate_repo_xml() -> dict[str, Any]:
+    if not XML_PATH.exists():
+        return {"ok": False, "message": f"missing XML: {XML_PATH}"}
+    try:
+        expected_signature()
+    except (ET.ParseError, ValueError) as error:
+        return {"ok": False, "message": str(error)}
+
+    validator = shutil.which("virt-xml-validate")
+    if not validator:
+        return {"ok": False, "message": "virt-xml-validate not found"}
+    result = run([validator, str(XML_PATH), "domain"])
+    return {"ok": result.rc == 0, "message": result.stdout or result.stderr}
+
+
+def validate_xml_file(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"ok": False, "message": f"missing XML: {path}"}
+    try:
+        ET.fromstring(path.read_text(encoding="utf-8"))
+    except ET.ParseError as error:
+        return {"ok": False, "message": f"{path} parse failed: {error}"}
+
+    validator = shutil.which("virt-xml-validate")
+    if not validator:
+        return {"ok": False, "message": "virt-xml-validate not found"}
+    result = run([validator, str(path), "domain"])
+    return {"ok": result.rc == 0, "message": result.stdout or result.stderr}
+
+
+def expected_signature() -> dict[str, Any]:
+    signature = xml_signature(load_xml(XML_PATH))
+    required = {
+        "name": DOMAIN,
+        "memory": "6291456",
+        "vcpu": "2",
+        "disk": DISK_PATH,
+        "disk_bus": "virtio",
+        "cdrom": ISO_PATH,
+        "network": "ctos-nat",
+        "graphics": "spice",
+    }
+    for key, value in required.items():
+        if signature.get(key) != value:
+            raise ValueError(f"{XML_PATH} {key}={signature.get(key)!r}, expected {value!r}")
+    return signature
+
+
+def infra_state() -> dict[str, Any]:
+    result = run([str(INFRA_SCRIPT), "--json", "status"])
+    if result.rc != 0:
+        return {
+            "ok": False,
+            "available": False,
+            "error": result.stderr or result.stdout or "ctos-libvirt-infra status failed",
+        }
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        return {"ok": False, "available": False, "error": f"invalid infra JSON: {error}"}
+    data["available"] = True
+    return data
+
+
+def iso_state() -> dict[str, Any]:
+    source = Path(ISO_SOURCE_PATH)
+    errors = []
+    if not source.exists():
+        return {
+            "exists": False,
+            "source_exists": False,
+            "path": ISO_PATH,
+            "source": ISO_SOURCE_PATH,
+            "errors": ["installer ISO source missing"],
+        }
+    stat = source.stat()
+    if stat.st_size <= 0:
+        errors.append("installer ISO source is empty")
+
+    info = virsh(["vol-info", "--pool", ISO_POOL, ISO_VOLUME_NAME], readonly=True)
+    state: dict[str, Any] = {
+        "exists": info.rc == 0,
+        "source_exists": True,
+        "path": ISO_PATH,
+        "source": ISO_SOURCE_PATH,
+        "source_size": stat.st_size,
+        "pool": ISO_POOL,
+        "volume": ISO_VOLUME_NAME,
+        "compatible": False,
+        "errors": errors,
+    }
+    if info.rc != 0:
+        return state
+
+    path = virsh(["vol-path", "--pool", ISO_POOL, ISO_VOLUME_NAME], readonly=True)
+    state["live_path"] = path.stdout if path.rc == 0 else ""
+    if state["live_path"] != ISO_PATH:
+        state["errors"].append(f"ISO volume path mismatch: {state['live_path']} != {ISO_PATH}")
+
+    dump = virsh(["vol-dumpxml", "--pool", ISO_POOL, ISO_VOLUME_NAME], readonly=True)
+    if dump.rc == 0:
+        try:
+            root = ET.fromstring(dump.stdout)
+            format_node = root.find("./target/format")
+            capacity_node = root.find("./capacity")
+            iso_xml = {
+                "format": format_node.attrib.get("type", "") if format_node is not None else "",
+                "capacity": int(capacity_node.text.strip()) if capacity_node is not None and capacity_node.text else 0,
+            }
+            state["volume_xml"] = iso_xml
+            if iso_xml["format"] not in {"raw", "iso"}:
+                state["errors"].append(f"unexpected ISO volume format: {iso_xml['format']}")
+            if iso_xml["capacity"] != stat.st_size:
+                state["errors"].append(f"unexpected ISO volume size: {iso_xml['capacity']} != {stat.st_size}")
+        except (ET.ParseError, ValueError) as error:
+            state["errors"].append(f"unable to parse ISO vol-dumpxml: {error}")
+    else:
+        state["errors"].append(dump.stderr or "ISO vol-dumpxml failed")
+
+    state["compatible"] = not state["errors"]
+    return state
+
+
+def volume_state() -> dict[str, Any]:
+    info = virsh(["vol-info", "--pool", VOLUME_POOL, VOLUME_NAME], readonly=True)
+    state: dict[str, Any] = {
+        "name": VOLUME_NAME,
+        "pool": VOLUME_POOL,
+        "path": DISK_PATH,
+        "exists": info.rc == 0,
+        "compatible": False,
+        "errors": [],
+    }
+    if info.rc != 0:
+        return state
+
+    path = virsh(["vol-path", "--pool", VOLUME_POOL, VOLUME_NAME], readonly=True)
+    info_data = parse_info(info.stdout)
+    state["info"] = info_data
+    state["live_path"] = path.stdout if path.rc == 0 else ""
+    if state["live_path"] != DISK_PATH:
+        state["errors"].append(f"volume path mismatch: {state['live_path']} != {DISK_PATH}")
+        return state
+    if info_data.get("type") not in {"file", ""}:
+        state["errors"].append(f"unexpected volume type: {info_data.get('type')}")
+        return state
+
+    dump = virsh(["vol-dumpxml", "--pool", VOLUME_POOL, VOLUME_NAME], readonly=True)
+    if dump.rc == 0:
+        try:
+            root = ET.fromstring(dump.stdout)
+            format_node = root.find("./target/format")
+            capacity_node = root.find("./capacity")
+            path_node = root.find("./target/path")
+            volume_xml = {
+                "format": format_node.attrib.get("type", "") if format_node is not None else "",
+                "capacity": int(capacity_node.text.strip()) if capacity_node is not None and capacity_node.text else 0,
+                "path": path_node.text.strip() if path_node is not None and path_node.text else "",
+            }
+            state["volume_xml"] = volume_xml
+            if volume_xml["format"] != "qcow2":
+                state["errors"].append(f"unexpected disk format: {volume_xml['format']}")
+            if volume_xml["capacity"] != 40 * 1024 * 1024 * 1024:
+                state["errors"].append(f"unexpected virtual size: {volume_xml['capacity']}")
+            if volume_xml["path"] != DISK_PATH:
+                state["errors"].append(f"volume XML path mismatch: {volume_xml['path']} != {DISK_PATH}")
+        except (ET.ParseError, ValueError) as error:
+            state["errors"].append(f"unable to parse vol-dumpxml: {error}")
+    else:
+        state["errors"].append(dump.stderr or "vol-dumpxml failed")
+    state["compatible"] = not state["errors"]
+    return state
+
+
+def domain_state() -> dict[str, Any]:
+    info = virsh(["dominfo", DOMAIN], readonly=True)
+    state: dict[str, Any] = {
+        "name": DOMAIN,
+        "exists": info.rc == 0,
+        "compatible": False,
+        "errors": [],
+    }
+    if info.rc != 0:
+        return state
+
+    state["info"] = parse_info(info.stdout)
+    dump = virsh(["dumpxml", "--inactive", DOMAIN], readonly=True)
+    if dump.rc != 0:
+        state["errors"].append(dump.stderr or "dumpxml failed")
+        return state
+    try:
+        live = xml_signature(ET.fromstring(dump.stdout))
+    except ET.ParseError as error:
+        state["errors"].append(f"live domain XML parse failed: {error}")
+        return state
+    expected = expected_signature()
+    state["live"] = live
+    state["expected"] = expected
+    for key in ["name", "memory", "vcpu", "disk", "disk_bus", "cdrom", "network", "graphics"]:
+        if live.get(key) != expected.get(key):
+            state["errors"].append(f"{key} mismatch: {live.get(key)!r} != {expected.get(key)!r}")
+    state["compatible"] = not state["errors"]
+    return state
+
+
+def kali_state() -> dict[str, Any]:
+    validation = validate_repo_xml()
+    infra = infra_state()
+    iso = iso_state()
+    volume = volume_state()
+    domain = domain_state()
+    actions = []
+    errors = []
+
+    if not validation["ok"]:
+        errors.append(validation["message"])
+    if not infra.get("ok"):
+        errors.append(infra.get("error", "CTOS libvirt infra is not ready"))
+    if iso["source_exists"] is False:
+        errors.extend(iso["errors"])
+    elif iso["exists"] and not iso["compatible"]:
+        errors.extend(iso["errors"])
+    if volume["exists"] and not volume["compatible"]:
+        errors.extend(volume["errors"])
+    if domain["exists"] and not domain["compatible"]:
+        if can_redefine_domain(domain):
+            actions.append("redefine-domain")
+        else:
+            errors.extend(domain["errors"])
+
+    if iso["source_exists"] and not iso["exists"]:
+        actions.append("prepare-media")
+    if not volume["exists"]:
+        actions.append("create-volume")
+    if not domain["exists"]:
+        actions.append("define-domain")
+
+    return {
+        "connection": URI,
+        "domain": DOMAIN,
+        "ok": not errors,
+        "validation": validation,
+        "infra": infra,
+        "iso": iso,
+        "volume": volume,
+        "domain_state": domain,
+        "actions": actions,
+        "errors": errors,
+    }
+
+
+def can_redefine_domain(domain: dict[str, Any]) -> bool:
+    errors = domain.get("errors", [])
+    if not errors:
+        return False
+    return all(error.startswith("cdrom mismatch:") for error in errors)
+
+
+def print_state(state: dict[str, Any], mode: str) -> None:
+    print(f"CTOS Kali {mode}")
+    print(f"connection: {state['connection']}")
+    print(f"domain: {state['domain']}")
+    print(f"xml: {XML_PATH}")
+    print()
+    marker = "ok" if state["validation"]["ok"] else "blocked"
+    print(f"xml validation: {marker} {state['validation']['message']}")
+    print(f"infra: {'ready' if state['infra'].get('ok') else 'blocked'}")
+    if state["iso"].get("compatible"):
+        iso_label = "ready"
+    elif state["iso"].get("source_exists"):
+        iso_label = "source-only" if not state["iso"].get("exists") else "blocked"
+    else:
+        iso_label = "missing"
+    print(f"iso: {iso_label} {ISO_PATH}")
+    if state["iso"].get("source"):
+        print(f"iso source: {state['iso']['source']}")
+    for error in state["iso"].get("errors", []):
+        print(f"iso error: {error}")
+    print(
+        f"volume: {'present' if state['volume']['exists'] else 'missing'} "
+        f"{VOLUME_POOL}/{VOLUME_NAME}"
+    )
+    if state["volume"].get("compatible"):
+        print("volume check: compatible")
+    for error in state["volume"].get("errors", []):
+        print(f"volume error: {error}")
+    print(f"domain: {'defined' if state['domain_state']['exists'] else 'missing'}")
+    if state["domain_state"].get("compatible"):
+        print("domain check: compatible")
+    for error in state["domain_state"].get("errors", []):
+        print(f"domain error: {error}")
+    print(f"actions: {', '.join(state['actions']) if state['actions'] else 'none'}")
+    for error in state["errors"]:
+        print(f"error: {error}")
+
+
+def command_status(args: argparse.Namespace) -> int:
+    state = kali_state()
+    if args.json:
+        print(json.dumps(state, indent=2, sort_keys=True))
+    else:
+        print_state(state, "status")
+    return 0 if state["ok"] else 1
+
+
+def command_plan(args: argparse.Namespace) -> int:
+    state = kali_state()
+    if args.json:
+        print(json.dumps(state, indent=2, sort_keys=True))
+    else:
+        print_state(state, "plan")
+    return 0 if state["ok"] else 1
+
+
+def command_define(args: argparse.Namespace) -> int:
+    state = kali_state()
+    if not state["ok"]:
+        if args.json:
+            print(json.dumps(state, indent=2, sort_keys=True))
+        else:
+            print_state(state, "define blocked")
+        return 1
+
+    messages = []
+    if "create-volume" in state["actions"]:
+        result = virsh(["vol-create-as", VOLUME_POOL, VOLUME_NAME, VOLUME_SIZE, "--format", "qcow2"])
+        if result.rc != 0:
+            print(result.stderr or result.stdout or "vol-create-as failed", file=sys.stderr)
+            return 1
+        messages.append(result.stdout or f"volume {VOLUME_NAME} created")
+
+    if "define-domain" in state["actions"] or "redefine-domain" in state["actions"]:
+        define_path = XML_PATH
+        temp_path = None
+        if "redefine-domain" in state["actions"]:
+            uuid = state.get("domain_state", {}).get("info", {}).get("uuid", "")
+            if not uuid:
+                print("cannot redefine existing domain without live UUID", file=sys.stderr)
+                return 1
+            temp_path = domain_xml_with_uuid(XML_PATH, uuid)
+            define_path = temp_path
+        result = virsh(["define", str(define_path)])
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        if result.rc != 0:
+            print(result.stderr or result.stdout or "virsh define failed", file=sys.stderr)
+            return 1
+        messages.append(result.stdout or f"domain {DOMAIN} defined")
+
+    final_state = kali_state()
+    if args.json:
+        print(json.dumps({"messages": messages, "state": final_state}, indent=2, sort_keys=True))
+    else:
+        for message in messages or ["no changes needed"]:
+            print(message)
+        print()
+        print_state(final_state, "post-define")
+    return 0 if final_state["ok"] and not final_state["actions"] else 1
+
+
+def domain_xml_with_uuid(path: Path, uuid: str) -> Path:
+    content = path.read_text(encoding="utf-8")
+    marker = f"  <name>{DOMAIN}</name>"
+    if marker not in content:
+        raise RuntimeError(f"{path} missing name marker for {DOMAIN}")
+    content = content.replace(marker, f"{marker}\n  <uuid>{uuid}</uuid>", 1)
+    handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        prefix="ctos-kali-",
+        suffix=".xml",
+        delete=False,
+    )
+    with handle:
+        handle.write(content)
+    return Path(handle.name)
+
+
+def command_prepare_media(args: argparse.Namespace) -> int:
+    state = kali_state()
+    if not state["ok"] and state["errors"]:
+        if args.json:
+            print(json.dumps(state, indent=2, sort_keys=True))
+        else:
+            print_state(state, "prepare-media blocked")
+        return 1
+
+    messages = []
+    iso = state["iso"]
+    if iso.get("compatible"):
+        messages.append("installer media already ready")
+    elif iso.get("source_exists") and not iso.get("exists"):
+        size = str(iso["source_size"])
+        create = virsh(["vol-create-as", ISO_POOL, ISO_VOLUME_NAME, size, "--format", "raw"], timeout=30.0)
+        if create.rc != 0:
+            print(create.stderr or create.stdout or "ISO vol-create-as failed", file=sys.stderr)
+            return 1
+        messages.append(create.stdout or f"ISO volume {ISO_VOLUME_NAME} created")
+        upload = virsh(["vol-upload", ISO_VOLUME_NAME, ISO_SOURCE_PATH, ISO_POOL], timeout=600.0)
+        if upload.rc != 0:
+            print(upload.stderr or upload.stdout or "ISO vol-upload failed", file=sys.stderr)
+            return 1
+        messages.append(f"ISO uploaded to {ISO_POOL}/{ISO_VOLUME_NAME}")
+    else:
+        print_state(state, "prepare-media blocked")
+        return 1
+
+    final_state = kali_state()
+    if args.json:
+        print(json.dumps({"messages": messages, "state": final_state}, indent=2, sort_keys=True))
+    else:
+        for message in messages:
+            print(message)
+        print()
+        print_state(final_state, "post-prepare-media")
+    return 0 if final_state["ok"] or final_state["actions"] == ["redefine-domain"] else 1
+
+
+def domain_run_state(state: dict[str, Any]) -> str:
+    return state.get("domain_state", {}).get("info", {}).get("state", "")
+
+
+def current_domain_state() -> str:
+    state = virsh(["domstate", DOMAIN], readonly=True)
+    if state.rc != 0:
+        raise RuntimeError(state.stderr or state.stdout or f"{DOMAIN} state unavailable")
+    return state.stdout.strip().lower()
+
+
+def parse_domblklist(stdout: str) -> dict[str, str]:
+    disks: dict[str, str] = {}
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("-") or stripped.lower().startswith("type "):
+            continue
+        parts = stripped.split()
+        if len(parts) >= 4 and parts[0] == "file" and parts[1] == "disk":
+            disks[parts[2]] = parts[3]
+    return disks
+
+
+def active_disk_source() -> str:
+    result = virsh(["domblklist", DOMAIN, "--details"], readonly=True)
+    if result.rc != 0:
+        raise RuntimeError(result.stderr or result.stdout or f"{DOMAIN} block list unavailable")
+    disks = parse_domblklist(result.stdout)
+    if "vda" not in disks:
+        raise RuntimeError(f"{DOMAIN} has no vda disk in domblklist")
+    return disks["vda"]
+
+
+def snapshot_names() -> set[str]:
+    result = virsh(["snapshot-list", DOMAIN, "--name"], readonly=True)
+    if result.rc != 0:
+        raise RuntimeError(result.stderr or result.stdout or f"{DOMAIN} snapshot list unavailable")
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
+def wait_for_shutoff(timeout: int) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state = current_domain_state()
+        if state in {"shut off", "shutoff"}:
+            return True
+        time.sleep(2)
+    return current_domain_state() in {"shut off", "shutoff"}
+
+
+def ensure_snapshot_label(label: str) -> None:
+    if not SNAPSHOT_LABEL_RE.match(label):
+        raise RuntimeError(
+            "snapshot label must start with an alphanumeric character and contain only "
+            "letters, numbers, '.', '_' or '-'"
+        )
+
+
+def ensure_snapshot_pool_ready() -> None:
+    info = virsh(["pool-info", SNAPSHOT_POOL], readonly=True)
+    if info.rc != 0:
+        raise RuntimeError(info.stderr or info.stdout or f"{SNAPSHOT_POOL} pool unavailable")
+    data = parse_info(info.stdout)
+    if data.get("state") != "running":
+        raise RuntimeError(f"{SNAPSHOT_POOL} pool state is {data.get('state')!r}, expected running")
+
+
+def ensure_snapshot_name_available(snapshot_name: str, overlay_name: str) -> None:
+    names = snapshot_names()
+    if snapshot_name in names:
+        raise RuntimeError(f"snapshot already exists: {snapshot_name}")
+
+    existing_overlay = virsh(["vol-info", "--pool", SNAPSHOT_POOL, overlay_name], readonly=True)
+    if existing_overlay.rc == 0:
+        raise RuntimeError(f"snapshot overlay already exists: {SNAPSHOT_POOL}/{overlay_name}")
+
+
+def ensure_managed_disk_source(source: str) -> None:
+    if source == DISK_PATH:
+        return
+    if source.startswith(f"{SNAPSHOT_DIR}/") and source.endswith(".qcow2"):
+        return
+    raise RuntimeError(f"{DOMAIN} active disk is outside CTOS-managed storage: {source}")
+
+
+def ensure_shutoff(args: argparse.Namespace, messages: list[str], label: str) -> None:
+    state = current_domain_state()
+    if state in {"shut off", "shutoff"}:
+        return
+    if not args.shutdown:
+        raise RuntimeError(f"{DOMAIN} is {state!r}; rerun with --shutdown for a clean {label} snapshot")
+    shutdown = virsh(["shutdown", DOMAIN, "--mode", "agent"])
+    if shutdown.rc != 0:
+        raise RuntimeError(shutdown.stderr or shutdown.stdout or "virsh shutdown --mode agent failed")
+    messages.append(shutdown.stdout or f"{DOMAIN} shutdown requested through guest agent")
+    if not wait_for_shutoff(args.timeout):
+        raise RuntimeError(f"{DOMAIN} did not reach shut off within {args.timeout}s")
+    messages.append(f"{DOMAIN} is shut off")
+
+
+def create_external_disk_snapshot(snapshot_name: str, overlay_path: str, description: str) -> str:
+    diskspec = f"vda,snapshot=external,file={overlay_path}"
+    create = virsh(
+        [
+            "snapshot-create-as",
+            DOMAIN,
+            "--name",
+            snapshot_name,
+            "--description",
+            description,
+            "--disk-only",
+            "--atomic",
+            "--diskspec",
+            diskspec,
+        ],
+        timeout=120.0,
+    )
+    if create.rc != 0:
+        raise RuntimeError(create.stderr or create.stdout or "snapshot-create-as failed")
+    return create.stdout or f"snapshot {snapshot_name} created"
+
+
+def command_snapshot_baseline(args: argparse.Namespace) -> int:
+    try:
+        ensure_snapshot_label(args.label)
+        ensure_snapshot_pool_ready()
+
+        snapshot_name = f"ctos-kali-{args.label}"
+        overlay_name = f"{snapshot_name}.overlay.qcow2"
+        overlay_path = f"{SNAPSHOT_DIR}/{overlay_name}"
+        ensure_snapshot_name_available(snapshot_name, overlay_name)
+
+        source = active_disk_source()
+        if source != DISK_PATH:
+            raise RuntimeError(f"{DOMAIN} active disk is {source}, expected baseline source {DISK_PATH}")
+
+        messages = []
+        ensure_shutoff(args, messages, "baseline")
+
+        description = (
+            "CTOS Kali post-install baseline: installed guest, egress/DNS verified, "
+            "voice accessibility autostart disabled."
+        )
+        messages.append(create_external_disk_snapshot(snapshot_name, overlay_path, description))
+
+        refresh = virsh(["pool-refresh", SNAPSHOT_POOL])
+        if refresh.rc != 0:
+            messages.append(refresh.stderr or refresh.stdout or f"{SNAPSHOT_POOL} pool refresh failed")
+
+        final_source = active_disk_source()
+        if final_source != overlay_path:
+            raise RuntimeError(f"snapshot created but active disk is {final_source}, expected {overlay_path}")
+
+        output = {
+            "ok": True,
+            "messages": messages,
+            "snapshot": snapshot_name,
+            "baseline_disk": DISK_PATH,
+            "active_overlay": overlay_path,
+            "domain_state": current_domain_state(),
+        }
+    except RuntimeError as error:
+        output = {"ok": False, "error": str(error)}
+        if args.json:
+            print(json.dumps(output, indent=2, sort_keys=True))
+        else:
+            print(str(error), file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(output, indent=2, sort_keys=True))
+    else:
+        for message in output["messages"]:
+            print(message)
+        print()
+        print(f"snapshot: {output['snapshot']}")
+        print(f"baseline disk: {output['baseline_disk']}")
+        print(f"active overlay: {output['active_overlay']}")
+        print(f"domain state: {output['domain_state']}")
+    return 0
+
+
+def command_snapshot_checkpoint(args: argparse.Namespace) -> int:
+    try:
+        ensure_snapshot_label(args.label)
+        ensure_snapshot_pool_ready()
+
+        snapshot_name = f"ctos-kali-{args.label}"
+        overlay_name = f"{snapshot_name}.overlay.qcow2"
+        overlay_path = f"{SNAPSHOT_DIR}/{overlay_name}"
+        ensure_snapshot_name_available(snapshot_name, overlay_name)
+
+        parent_source = active_disk_source()
+        ensure_managed_disk_source(parent_source)
+
+        messages: list[str] = []
+        ensure_shutoff(args, messages, "checkpoint")
+
+        description = args.description or f"CTOS Kali checkpoint snapshot: {args.label}"
+        messages.append(create_external_disk_snapshot(snapshot_name, overlay_path, description))
+
+        refresh = virsh(["pool-refresh", SNAPSHOT_POOL])
+        if refresh.rc != 0:
+            messages.append(refresh.stderr or refresh.stdout or f"{SNAPSHOT_POOL} pool refresh failed")
+
+        final_source = active_disk_source()
+        if final_source != overlay_path:
+            raise RuntimeError(f"snapshot created but active disk is {final_source}, expected {overlay_path}")
+
+        output = {
+            "ok": True,
+            "messages": messages,
+            "snapshot": snapshot_name,
+            "parent_disk": parent_source,
+            "active_overlay": overlay_path,
+            "domain_state": current_domain_state(),
+        }
+    except RuntimeError as error:
+        output = {"ok": False, "error": str(error)}
+        if args.json:
+            print(json.dumps(output, indent=2, sort_keys=True))
+        else:
+            print(str(error), file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(output, indent=2, sort_keys=True))
+    else:
+        for message in output["messages"]:
+            print(message)
+        print()
+        print(f"snapshot: {output['snapshot']}")
+        print(f"parent disk: {output['parent_disk']}")
+        print(f"active overlay: {output['active_overlay']}")
+        print(f"domain state: {output['domain_state']}")
+    return 0
+
+
+def launch_viewer() -> tuple[bool, str]:
+    virt_manager = shutil.which("virt-manager")
+    hyprctl = shutil.which("hyprctl")
+    if virt_manager and hyprctl:
+        result = run(
+            [
+                hyprctl,
+                "dispatch",
+                "exec",
+                f"{virt_manager} -c {URI} --show-domain-console {DOMAIN}",
+            ]
+        )
+        if result.rc == 0:
+            return True, f"virt-manager console launched for {DOMAIN}"
+        return False, result.stderr or result.stdout or "hyprctl dispatch exec failed"
+
+    viewer = shutil.which("virt-viewer")
+    if not viewer:
+        return False, "virt-manager and virt-viewer not found"
+    try:
+        subprocess.Popen(
+            [viewer, "--connect", URI, "--wait", DOMAIN],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as error:
+        return False, str(error)
+    return True, f"virt-viewer launched for {DOMAIN}"
+
+
+def command_start_install(args: argparse.Namespace) -> int:
+    state = kali_state()
+    if not state["ok"] or state["actions"]:
+        if args.json:
+            print(json.dumps(state, indent=2, sort_keys=True))
+        else:
+            print_state(state, "start-install blocked")
+        return 1
+
+    messages = []
+    run_state = domain_run_state(state)
+    managed_save = state.get("domain_state", {}).get("info", {}).get("managed_save", "")
+    if managed_save and managed_save != "no":
+        message = f"managed save exists for {DOMAIN}; refusing install boot"
+        if args.json:
+            print(json.dumps({"ok": False, "error": message, "state": state}, indent=2, sort_keys=True))
+        else:
+            print(message, file=sys.stderr)
+        return 1
+
+    if run_state == "shut off":
+        result = virsh(["start", DOMAIN])
+        if result.rc != 0:
+            print(result.stderr or result.stdout or "virsh start failed", file=sys.stderr)
+            return 1
+        messages.append(result.stdout or f"{DOMAIN} started")
+    elif run_state == "running":
+        messages.append(f"{DOMAIN} already running")
+    else:
+        message = f"{DOMAIN} state is {run_state!r}; refusing install boot"
+        if args.json:
+            print(json.dumps({"ok": False, "error": message, "state": state}, indent=2, sort_keys=True))
+        else:
+            print(message, file=sys.stderr)
+        return 1
+
+    viewer_ok = False
+    viewer_message = "viewer skipped"
+    if not args.no_viewer:
+        viewer_ok, viewer_message = launch_viewer()
+        messages.append(viewer_message)
+        if not viewer_ok:
+            messages.append(f"manual viewer command: virt-manager -c {URI} --show-domain-console {DOMAIN}")
+    else:
+        messages.append("viewer skipped by --no-viewer")
+
+    final_state = kali_state()
+    output = {
+        "ok": final_state["ok"],
+        "messages": messages,
+        "viewer_ok": viewer_ok,
+        "state": final_state,
+    }
+    if args.json:
+        print(json.dumps(output, indent=2, sort_keys=True))
+    else:
+        for message in messages:
+            print(message)
+        print()
+        print_state(final_state, "post-start-install")
+    return 0 if final_state["ok"] else 1
+
+
+def command_finalize_install(args: argparse.Namespace) -> int:
+    validation = validate_xml_file(INSTALLED_XML_PATH)
+    messages = []
+    if not validation["ok"]:
+        if args.json:
+            print(json.dumps({"ok": False, "validation": validation}, indent=2, sort_keys=True))
+        else:
+            print(f"installed XML blocked: {validation['message']}", file=sys.stderr)
+        return 1
+
+    state = virsh(["domstate", DOMAIN, "--reason"], readonly=True)
+    run_state = state.stdout.split(" ", 1)[0] if state.rc == 0 else "missing"
+    if run_state not in {"shut", "shutoff", "shut off"}:
+        if not args.force_stop:
+            message = f"{DOMAIN} state is {state.stdout or state.stderr!r}; use --force-stop to stop installer VM"
+            if args.json:
+                print(json.dumps({"ok": False, "error": message}, indent=2, sort_keys=True))
+            else:
+                print(message, file=sys.stderr)
+            return 1
+        stop = virsh(["destroy", DOMAIN])
+        if stop.rc != 0:
+            print(stop.stderr or stop.stdout or "virsh destroy failed", file=sys.stderr)
+            return 1
+        messages.append(stop.stdout or f"{DOMAIN} stopped")
+
+    info = virsh(["dominfo", DOMAIN], readonly=True)
+    uuid = ""
+    if info.rc == 0:
+        uuid = parse_info(info.stdout).get("uuid", "")
+
+    define_path = INSTALLED_XML_PATH
+    temp_path = None
+    if uuid:
+        temp_path = domain_xml_with_uuid(INSTALLED_XML_PATH, uuid)
+        define_path = temp_path
+    define = virsh(["define", str(define_path)])
+    if temp_path is not None:
+        temp_path.unlink(missing_ok=True)
+    if define.rc != 0:
+        print(define.stderr or define.stdout or "virsh define failed", file=sys.stderr)
+        return 1
+    messages.append(define.stdout or f"{DOMAIN} installed profile defined")
+
+    if args.start:
+        start = virsh(["start", DOMAIN])
+        if start.rc != 0:
+            print(start.stderr or start.stdout or "virsh start failed", file=sys.stderr)
+            return 1
+        messages.append(start.stdout or f"{DOMAIN} started")
+
+    viewer_ok = False
+    if args.start and not args.no_viewer:
+        viewer_ok, viewer_message = launch_viewer()
+        messages.append(viewer_message)
+        if not viewer_ok:
+            messages.append(f"manual viewer command: virt-manager -c {URI} --show-domain-console {DOMAIN}")
+    elif args.no_viewer:
+        messages.append("viewer skipped by --no-viewer")
+
+    final = {
+        "domstate": virsh(["domstate", DOMAIN], readonly=True).stdout,
+        "domblklist": virsh(["domblklist", DOMAIN, "--details"], readonly=True).stdout,
+    }
+    output = {
+        "ok": True,
+        "messages": messages,
+        "viewer_ok": viewer_ok,
+        "validation": validation,
+        "final": final,
+    }
+    if args.json:
+        print(json.dumps(output, indent=2, sort_keys=True))
+    else:
+        for message in messages:
+            print(message)
+        print()
+        print(f"installed xml: {INSTALLED_XML_PATH}")
+        print(f"domain state: {final['domstate']}")
+        print(final["domblklist"])
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Manage the CTOS Kali install-phase domain.")
+    parser.add_argument("--json", action="store_true", help="emit JSON")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("status", help="show ctos-kali domain/volume readiness")
+    subparsers.add_parser("plan", help="show actions needed before install")
+    subparsers.add_parser("prepare-media", help="import Kali ISO into ctos-iso pool")
+    subparsers.add_parser("define", help="create volume and define shutoff domain")
+    start_parser = subparsers.add_parser("start-install", help="start install-phase VM and open viewer")
+    start_parser.add_argument("--no-viewer", action="store_true", help="start VM without launching virt-viewer")
+    finalize_parser = subparsers.add_parser("finalize-install", help="switch ctos-kali to installed-disk boot")
+    finalize_parser.add_argument("--force-stop", action="store_true", help="stop a running or paused installer VM first")
+    finalize_parser.add_argument("--start", action="store_true", help="start the installed VM after defining it")
+    finalize_parser.add_argument("--no-viewer", action="store_true", help="start VM without launching virt-viewer")
+    snapshot_parser = subparsers.add_parser("snapshot-baseline", help="create a shutoff disk-only Kali baseline snapshot")
+    snapshot_parser.add_argument("label", help="explicit snapshot label, for example post-install-20260604")
+    snapshot_parser.add_argument("--shutdown", action="store_true", help="gracefully shut down the guest first through qemu-guest-agent")
+    snapshot_parser.add_argument("--timeout", type=int, default=120, help="seconds to wait for shutdown; default: 120")
+    checkpoint_parser = subparsers.add_parser("snapshot-checkpoint", help="create a shutoff disk-only Kali checkpoint snapshot")
+    checkpoint_parser.add_argument("label", help="explicit snapshot label, for example voice-fixed-20260605")
+    checkpoint_parser.add_argument("--description", help="snapshot description")
+    checkpoint_parser.add_argument("--shutdown", action="store_true", help="gracefully shut down the guest first through qemu-guest-agent")
+    checkpoint_parser.add_argument("--timeout", type=int, default=120, help="seconds to wait for shutdown; default: 120")
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    if args.command == "status":
+        return command_status(args)
+    if args.command == "plan":
+        return command_plan(args)
+    if args.command == "prepare-media":
+        return command_prepare_media(args)
+    if args.command == "define":
+        return command_define(args)
+    if args.command == "start-install":
+        return command_start_install(args)
+    if args.command == "finalize-install":
+        return command_finalize_install(args)
+    if args.command == "snapshot-baseline":
+        return command_snapshot_baseline(args)
+    if args.command == "snapshot-checkpoint":
+        return command_snapshot_checkpoint(args)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,718 @@
+#!/usr/bin/env python3
+"""Audit and enable the host IOMMU prerequisite for Apple recovery VM USB-C.
+
+This helper deliberately has a narrow remit.  It never reboots the host, binds
+or detaches a PCI device, starts a VM, or touches an Apple device.  The only
+mutating command is ``apply-iommu``: after conservative safety gates it backs
+up /etc/kernel/cmdline, appends intel_iommu=on when needed, and rebuilds the
+existing systemd-boot/dracut entries with reinstall-kernels.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import re
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable
+
+
+URI = "qemu:///system"
+KALI_DOMAIN = "ctos-kali"
+CANDIDATE_BDF = "0000:3c:00.0"
+CANDIDATE_VENDOR = "0x8086"
+CANDIDATE_DEVICE = "0x15c1"
+CANDIDATE_CLASS_PREFIX = "0x0c03"
+IOMMU_TOKEN = "intel_iommu=on"
+USB_VENDOR_RE = re.compile(r"^[0-9a-f]{4}$")
+
+CMDLINE_PATH = Path("/etc/kernel/cmdline")
+PROC_CMDLINE_PATH = Path("/proc/cmdline")
+TYPEC_ROOT = Path("/sys/class/typec")
+POWER_ROOT = Path("/sys/class/power_supply")
+USB_ROOT = Path("/sys/bus/usb/devices")
+IOMMU_GROUPS_ROOT = Path("/sys/kernel/iommu_groups")
+PCI_DEVICES_ROOT = Path("/sys/bus/pci/devices")
+MODULES_ROOT = Path("/usr/lib/modules")
+
+
+@dataclass
+class CommandResult:
+    rc: int
+    stdout: str
+    stderr: str
+
+
+def run(
+    args: list[str],
+    *,
+    timeout: float = 30.0,
+    input_text: str | None = None,
+) -> CommandResult:
+    try:
+        proc = subprocess.run(
+            args,
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=timeout,
+            input=input_text,
+        )
+    except FileNotFoundError:
+        return CommandResult(127, "", f"{args[0]} not found")
+    except subprocess.TimeoutExpired:
+        return CommandResult(124, "", "command timed out")
+    return CommandResult(proc.returncode, proc.stdout.strip(), proc.stderr.strip())
+
+
+def sudo(
+    args: list[str],
+    *,
+    timeout: float = 30.0,
+    input_text: str | None = None,
+) -> CommandResult:
+    """Run a root operation through sudo; never assume the helper is root."""
+
+    return run(["sudo", "--", *args], timeout=timeout, input_text=input_text)
+
+
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except (FileNotFoundError, PermissionError, OSError):
+        return ""
+
+
+def tokens(content: str) -> list[str]:
+    return content.split()
+
+
+def selected_role(content: str) -> str:
+    """Return the active Type-C role, denoted by brackets in sysfs."""
+
+    match = re.search(r"\[([^]]+)\]", content)
+    if match:
+        return match.group(1).strip().lower()
+    parts = content.strip().lower().split()
+    return parts[0] if len(parts) == 1 else "unknown"
+
+
+def cmdline_state(path: Path, *, runtime: bool = False) -> dict[str, Any]:
+    content = read_text(path)
+    args = tokens(content)
+    iommu_values = [item for item in args if item.startswith("intel_iommu=")]
+    on_count = args.count(IOMMU_TOKEN)
+    conflicting = [item for item in iommu_values if item != IOMMU_TOKEN]
+    acs = [item for item in args if item.startswith("pcie_acs_override")]
+    return {
+        "path": str(path),
+        "readable": bool(content),
+        "runtime": runtime,
+        "intel_iommu_on_count": on_count,
+        "configured": on_count == 1 and not conflicting,
+        "conflicting_iommu_tokens": conflicting,
+        "duplicate": on_count > 1,
+        "acs_override_tokens": acs,
+    }
+
+
+def updated_cmdline(content: str) -> tuple[str, bool]:
+    """Append IOMMU_TOKEN exactly once while retaining existing formatting."""
+
+    args = tokens(content)
+    on_count = args.count(IOMMU_TOKEN)
+    conflicting = [item for item in args if item.startswith("intel_iommu=") and item != IOMMU_TOKEN]
+    if conflicting:
+        raise ValueError(f"conflicting IOMMU option(s): {', '.join(conflicting)}")
+    if on_count > 1:
+        raise ValueError(f"{IOMMU_TOKEN} is already duplicated")
+    if on_count == 1:
+        return content, False
+
+    body = content.rstrip("\n")
+    separator = "" if not body or body[-1].isspace() else " "
+    return f"{body}{separator}{IOMMU_TOKEN}\n", True
+
+
+def ac_state() -> dict[str, Any]:
+    supplies: list[dict[str, Any]] = []
+    if POWER_ROOT.is_dir():
+        for item in sorted(POWER_ROOT.iterdir(), key=lambda path: path.name):
+            supply_type = read_text(item / "type").strip()
+            online_text = read_text(item / "online").strip()
+            if not supply_type:
+                continue
+            online = online_text == "1" if online_text else None
+            supplies.append({"name": item.name, "type": supply_type, "online": online})
+
+    # This T480 exposes its real charger as Mains.  USB source telemetry can
+    # instead describe the laptop powering a peripheral, so it is not accepted
+    # as proof that the host itself is externally powered.
+    external_types = {"mains"}
+    online_external = any(
+        item["online"] is True and str(item["type"]).lower() in external_types
+        for item in supplies
+    )
+    return {
+        "online": online_external,
+        "supplies": supplies,
+        "error": "no online Mains AC supply detected" if not online_external else "",
+    }
+
+
+def kali_state() -> dict[str, Any]:
+    result = run(["virsh", "-c", URI, "--readonly", "domstate", KALI_DOMAIN])
+    value = " ".join(result.stdout.lower().split())
+    shut_off = result.rc == 0 and value in {"shut off", "shutoff"}
+    return {
+        "domain": KALI_DOMAIN,
+        "state": value or "unknown",
+        "shut_off": shut_off,
+        "error": "" if result.rc == 0 else result.stderr or "virsh domstate failed",
+    }
+
+
+def typec_state() -> dict[str, Any]:
+    partners: list[dict[str, Any]] = []
+    errors: list[str] = []
+    if not TYPEC_ROOT.is_dir():
+        errors.append(f"cannot inspect Type-C inventory at {TYPEC_ROOT}")
+    else:
+        try:
+            partner_paths = sorted(TYPEC_ROOT.glob("port*-partner"), key=lambda path: path.name)
+        except OSError as error:
+            partner_paths = []
+            errors.append(f"cannot list Type-C partners: {type(error).__name__}")
+        for partner in partner_paths:
+            if not partner.exists():
+                continue
+            port_name = partner.name.removesuffix("-partner")
+            port = TYPEC_ROOT / port_name
+            power_text = read_text(port / "power_role")
+            data_text = read_text(port / "data_role")
+            power_role = selected_role(power_text)
+            data_role = selected_role(data_text)
+            roles_known_safe = power_role == "sink" and data_role == "device"
+            if not power_text or not data_text or "unknown" in {power_role, data_role}:
+                errors.append(f"{port_name} Type-C roles are unreadable or ambiguous")
+            partners.append(
+                {
+                    "port": port_name,
+                    "power_role": power_role,
+                    "data_role": data_role,
+                    "unsafe_source_or_host": not roles_known_safe,
+                }
+            )
+    return {
+        "partners": partners,
+        "unsafe": bool(errors) or any(item["unsafe_source_or_host"] for item in partners),
+        "errors": errors,
+    }
+
+
+def usb_inventory() -> dict[str, Any]:
+    devices: list[dict[str, Any]] = []
+    errors: list[str] = []
+    if not USB_ROOT.is_dir():
+        return {"devices": [], "errors": [f"cannot inspect USB inventory at {USB_ROOT}"]}
+    try:
+        vendor_paths = sorted(USB_ROOT.glob("*/idVendor"), key=lambda path: str(path))
+    except OSError as error:
+        return {"devices": [], "errors": [f"cannot list USB inventory: {type(error).__name__}"]}
+    for vendor_path in vendor_paths:
+        try:
+            vendor = vendor_path.read_text(encoding="utf-8", errors="replace").strip().lower()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            errors.append(f"{vendor_path.parent.name}: idVendor read {type(error).__name__}")
+            continue
+        if not USB_VENDOR_RE.fullmatch(vendor):
+            errors.append(f"{vendor_path.parent.name}: idVendor is empty or malformed")
+            continue
+        root = vendor_path.parent
+        devices.append(
+            {
+                "sysfs_name": root.name,
+                "sysfs_path": str(root),
+                "vendor": vendor,
+                "product": read_text(root / "idProduct").strip().lower(),
+                "manufacturer": read_text(root / "manufacturer").strip(),
+                "name": read_text(root / "product").strip(),
+                "apple": vendor == "05ac",
+            }
+        )
+    return {"devices": devices, "errors": errors}
+
+
+def usb_devices() -> list[dict[str, Any]]:
+    """Compatibility view; mutation gates use usb_inventory() with errors."""
+
+    return usb_inventory()["devices"]
+
+
+def candidate_usb_inventory(devices: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    candidate = PCI_DEVICES_ROOT / CANDIDATE_BDF
+    try:
+        candidate_real = candidate.resolve(strict=True)
+    except OSError as error:
+        return {
+            "children": [],
+            "errors": [f"cannot resolve candidate controller: {type(error).__name__}"],
+        }
+
+    children: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for item in devices:
+        # Linux exposes one virtual root hub per controller bus.  Those hubs
+        # are intrinsic to xHCI and are not a connected host peripheral.
+        if str(item.get("sysfs_name", "")).startswith("usb") and item.get("vendor") == "1d6b":
+            continue
+        try:
+            device_real = Path(str(item["sysfs_path"])).resolve(strict=True)
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            errors.append(
+                f"{item.get('sysfs_name', 'unknown')}: USB topology read {type(error).__name__}"
+            )
+            continue
+        if candidate_real == device_real or candidate_real in device_real.parents:
+            children.append(item)
+    return {"children": children, "errors": errors}
+
+
+def candidate_usb_children(devices: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Compatibility view; mutation gates use candidate_usb_inventory()."""
+
+    return candidate_usb_inventory(devices)["children"]
+
+
+def pci_identity(path: Path) -> dict[str, Any]:
+    driver = ""
+    try:
+        driver = (path / "driver").resolve(strict=True).name
+    except (FileNotFoundError, OSError):
+        pass
+    return {
+        "bdf": path.name,
+        "vendor": read_text(path / "vendor").strip().lower(),
+        "device": read_text(path / "device").strip().lower(),
+        "class": read_text(path / "class").strip().lower(),
+        "driver": driver,
+    }
+
+
+def iommu_inventory() -> dict[str, Any]:
+    groups: list[dict[str, Any]] = []
+    if IOMMU_GROUPS_ROOT.is_dir():
+        def group_key(path: Path) -> tuple[int, str]:
+            return (int(path.name), path.name) if path.name.isdigit() else (2**31, path.name)
+
+        for group in sorted(IOMMU_GROUPS_ROOT.iterdir(), key=group_key):
+            devices_dir = group / "devices"
+            if not devices_dir.is_dir():
+                continue
+            members = [pci_identity(path) for path in sorted(devices_dir.iterdir(), key=lambda p: p.name)]
+            groups.append({"group": group.name, "members": members})
+    return {"nonempty": bool(groups), "groups": groups}
+
+
+def installed_kernel_versions() -> list[str]:
+    if not MODULES_ROOT.is_dir():
+        return []
+    return sorted(
+        item.name
+        for item in MODULES_ROOT.iterdir()
+        if item.is_dir() and (item / "vmlinuz").is_file()
+    )
+
+
+def boot_entries() -> tuple[list[dict[str, Any]], str]:
+    result = sudo(["bootctl", "list", "--json=short", "--no-pager"], timeout=60.0)
+    if result.rc != 0:
+        return [], result.stderr or result.stdout or "bootctl list failed"
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        return [], f"bootctl returned invalid JSON: {error}"
+    if isinstance(data, dict):
+        data = data.get("entries", [])
+    if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
+        return [], "bootctl JSON does not contain an entry list"
+    return data, ""
+
+
+def inspect_kernel_entries() -> dict[str, Any]:
+    versions = installed_kernel_versions()
+    entries, error = boot_entries()
+    inspected: list[dict[str, Any]] = []
+    for version in versions:
+        matches = [item for item in entries if str(item.get("version", "")) == version]
+        valid = []
+        for entry in matches:
+            options = entry.get("options", "")
+            if isinstance(options, list):
+                option_tokens = [str(item) for item in options]
+            else:
+                option_tokens = tokens(str(options))
+            if option_tokens.count(IOMMU_TOKEN) == 1:
+                valid.append(entry)
+        inspected.append(
+            {
+                "version": version,
+                "matching_entries": len(matches),
+                "entries_with_iommu": len(valid),
+                "ok": bool(valid),
+            }
+        )
+    ok = len(versions) >= 2 and all(item["ok"] for item in inspected) and not error
+    return {
+        "installed_kernel_versions": versions,
+        "minimum_two_entries": len(versions) >= 2,
+        "inspected": inspected,
+        "ok": ok,
+        "error": error or ("fewer than two installed kernel entries" if len(versions) < 2 else ""),
+    }
+
+
+def safety_refusals(state: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    if not state["ac"]["online"]:
+        reasons.append("host is not confirmed on external AC power")
+    if not state["kali"]["shut_off"]:
+        reasons.append(f"{KALI_DOMAIN} is not confirmed shut off")
+    unsafe_ports = [
+        item["port"]
+        for item in state["typec"]["partners"]
+        if item["unsafe_source_or_host"]
+    ]
+    if unsafe_ports:
+        reasons.append("Type-C source/host partner present on " + ", ".join(unsafe_ports))
+    reasons.extend(f"Type-C inventory unsafe: {error}" for error in state["typec"].get("errors", []))
+    reasons.extend(f"USB inventory unsafe: {error}" for error in state.get("usb_errors", []))
+    reasons.extend(
+        f"candidate USB topology unsafe: {error}"
+        for error in state.get("candidate", {}).get("mapping_errors", [])
+    )
+    apple = [item["sysfs_name"] for item in state["usb"] if item["apple"]]
+    if apple:
+        reasons.append("Apple USB device present: " + ", ".join(apple))
+    return reasons
+
+
+def collect_status(*, include_groups: bool = True) -> dict[str, Any]:
+    inventory = usb_inventory()
+    usb = inventory["devices"]
+    candidate_inventory = candidate_usb_inventory(usb)
+    state: dict[str, Any] = {
+        "ac": ac_state(),
+        "kali": kali_state(),
+        "typec": typec_state(),
+        "usb": usb,
+        "usb_errors": inventory["errors"],
+        "configured_cmdline": cmdline_state(CMDLINE_PATH),
+        "runtime_cmdline": cmdline_state(PROC_CMDLINE_PATH, runtime=True),
+        "candidate": {
+            "bdf": CANDIDATE_BDF,
+            "identity": pci_identity(PCI_DEVICES_ROOT / CANDIDATE_BDF),
+            "usb_children": candidate_inventory["children"],
+            "mapping_errors": candidate_inventory["errors"],
+        },
+    }
+    if include_groups:
+        state["iommu"] = iommu_inventory()
+    state["refusals"] = safety_refusals(state)
+    configured = state["configured_cmdline"]
+    if not configured["readable"]:
+        state["refusals"].append(f"cannot read {CMDLINE_PATH}")
+    if configured["conflicting_iommu_tokens"]:
+        state["refusals"].append("conflicting intel_iommu option in configured cmdline")
+    if configured["duplicate"]:
+        state["refusals"].append(f"duplicate {IOMMU_TOKEN} in configured cmdline")
+    if configured["acs_override_tokens"] or state["runtime_cmdline"]["acs_override_tokens"]:
+        state["refusals"].append("ACS override is configured or active")
+    state["safe_for_apply"] = not state["refusals"]
+    return state
+
+
+def qualification(state: dict[str, Any]) -> dict[str, Any]:
+    reasons = list(state["refusals"])
+    runtime = state["runtime_cmdline"]
+    if not runtime["configured"]:
+        reasons.append(f"running kernel does not have exactly one {IOMMU_TOKEN}")
+    inventory = state["iommu"]
+    if not inventory["nonempty"]:
+        reasons.append("IOMMU group inventory is empty")
+
+    identity = state["candidate"]["identity"]
+    expected_identity = (
+        identity["vendor"] == CANDIDATE_VENDOR
+        and identity["device"] == CANDIDATE_DEVICE
+        and identity["class"].startswith(CANDIDATE_CLASS_PREFIX)
+    )
+    if not expected_identity:
+        reasons.append("candidate PCI identity is missing or differs from 8086:15c1 xHCI")
+    if identity.get("driver") != "xhci_hcd":
+        reasons.append(f"candidate controller is not host-bound to xhci_hcd: {identity.get('driver')!r}")
+
+    candidate_group: dict[str, Any] | None = None
+    for group in inventory["groups"]:
+        if any(item["bdf"] == CANDIDATE_BDF for item in group["members"]):
+            candidate_group = group
+            break
+    if candidate_group is None:
+        reasons.append(f"{CANDIDATE_BDF} is not present in an IOMMU group")
+    else:
+        member_bdfs = [item["bdf"] for item in candidate_group["members"]]
+        if member_bdfs != [CANDIDATE_BDF]:
+            reasons.append(
+                "candidate group is not isolated; no ACS override or automatic multi-device approval is allowed"
+            )
+
+    if state["candidate"]["usb_children"]:
+        reasons.append("candidate controller currently carries one or more host USB devices")
+
+    return {
+        "candidate_bdf": CANDIDATE_BDF,
+        "expected_identity": expected_identity,
+        "group": candidate_group,
+        "qualified": not reasons,
+        "reasons": reasons,
+        "acs_override_used": bool(
+            state["configured_cmdline"]["acs_override_tokens"]
+            or state["runtime_cmdline"]["acs_override_tokens"]
+        ),
+        "automatic_detach_performed": False,
+    }
+
+
+def file_metadata(path: Path) -> tuple[dict[str, int] | None, str]:
+    result = sudo(["stat", "--format=%a:%u:%g:%s", "--", str(path)])
+    if result.rc != 0:
+        return None, result.stderr or result.stdout or f"stat failed for {path}"
+    try:
+        mode, uid, gid, size = (int(item) for item in result.stdout.split(":"))
+    except (ValueError, TypeError):
+        return None, f"unexpected stat output for {path}: {result.stdout!r}"
+    return {"mode": mode, "uid": uid, "gid": gid, "size": size}, ""
+
+
+def backup_path(now: dt.datetime | None = None) -> Path:
+    timestamp = (now or dt.datetime.now(dt.timezone.utc)).strftime("%Y%m%dT%H%M%S.%fZ")
+    return CMDLINE_PATH.with_name(f"{CMDLINE_PATH.name}.ctos-apple-host.{timestamp}.bak")
+
+
+def apply_iommu() -> tuple[dict[str, Any], int]:
+    state = collect_status(include_groups=False)
+    result: dict[str, Any] = {
+        "operation": "apply-iommu",
+        "changed": False,
+        "backup": None,
+        "reinstall_kernels_run": False,
+        "boot_entries": None,
+        "reboot_required": False,
+        "reboot_performed": False,
+        "pci_detach_performed": False,
+        "refusals": state["refusals"],
+    }
+    if state["refusals"]:
+        return result, 2
+
+    current = read_text(CMDLINE_PATH)
+    try:
+        replacement, changed = updated_cmdline(current)
+    except ValueError as error:
+        result["refusals"] = [str(error)]
+        return result, 2
+
+    existing_entries = inspect_kernel_entries() if not changed else None
+    if not changed and existing_entries is not None and existing_entries["ok"]:
+        result["boot_entries"] = existing_entries
+        result["reboot_required"] = not state["runtime_cmdline"]["configured"]
+        result["message"] = (
+            "configured boot entries are already ready; operator reboot is required"
+            if result["reboot_required"]
+            else "IOMMU configuration is already active"
+        )
+        return result, 0
+
+    if changed:
+        destination = backup_path()
+        copy = sudo(
+            ["cp", "--archive", "--no-clobber", "--", str(CMDLINE_PATH), str(destination)]
+        )
+        if copy.rc != 0:
+            result["error"] = copy.stderr or copy.stdout or "cmdline backup failed"
+            return result, 1
+        original_meta, original_error = file_metadata(CMDLINE_PATH)
+        backup_meta, backup_error = file_metadata(destination)
+        if original_error or backup_error or original_meta != backup_meta:
+            result["error"] = original_error or backup_error or "backup metadata differs from source"
+            result["backup"] = str(destination)
+            return result, 1
+        result["backup"] = str(destination)
+        write = sudo(["tee", "--", str(CMDLINE_PATH)], input_text=replacement)
+        if write.rc != 0:
+            result["error"] = write.stderr or "cmdline update failed"
+            return result, 1
+        if read_text(CMDLINE_PATH) != replacement:
+            result["error"] = "cmdline verification after update failed"
+            return result, 1
+        updated_meta, updated_error = file_metadata(CMDLINE_PATH)
+        if updated_error or updated_meta is None or original_meta is None:
+            result["error"] = updated_error or "cmdline metadata verification failed"
+            return result, 1
+        protected_fields = ("mode", "uid", "gid")
+        if any(updated_meta[field] != original_meta[field] for field in protected_fields):
+            result["error"] = "cmdline permissions or ownership changed during update"
+            return result, 1
+        result["changed"] = True
+
+    rebuild = sudo(["reinstall-kernels"], timeout=900.0)
+    result["reinstall_kernels_run"] = True
+    if rebuild.rc != 0:
+        result["error"] = rebuild.stderr or rebuild.stdout or "reinstall-kernels failed"
+        return result, 1
+
+    entries = inspect_kernel_entries()
+    result["boot_entries"] = entries
+    if not entries["ok"]:
+        result["error"] = entries["error"] or "IOMMU option missing from one or more kernel entries"
+        return result, 1
+
+    result["reboot_required"] = True
+    result["message"] = "boot entries verified; an explicit operator-approved reboot is required"
+    return result, 0
+
+
+def plan_state() -> dict[str, Any]:
+    state = collect_status(include_groups=True)
+    return {
+        "operation": "plan",
+        "safe_for_apply": state["safe_for_apply"],
+        "refusals": state["refusals"],
+        "configured_cmdline": state["configured_cmdline"],
+        "runtime_cmdline": state["runtime_cmdline"],
+        "actions": [
+            "confirm AC power, ctos-kali shut off, and no source/host Type-C or Apple USB device",
+            f"sudo cp --archive {CMDLINE_PATH} <timestamped backup>",
+            f"append {IOMMU_TOKEN} exactly once through sudo when absent",
+            "sudo reinstall-kernels",
+            "inspect at least two installed-kernel boot entries for the exact option",
+            "stop and require explicit operator approval for reboot",
+            f"after reboot, inventory the complete group for {CANDIDATE_BDF} without ACS override",
+        ],
+        "automatic_reboot": False,
+        "automatic_pci_detach": False,
+    }
+
+
+def human(data: dict[str, Any]) -> str:
+    operation = str(data.get("operation", "status"))
+    lines = [f"ctos-apple-host {operation}"]
+    if operation == "status":
+        lines.extend(
+            [
+                f"  AC online: {data['ac']['online']}",
+                f"  {KALI_DOMAIN}: {data['kali']['state']}",
+                f"  Type-C partners: {len(data['typec']['partners'])}",
+                f"  Apple USB devices: {sum(1 for item in data['usb'] if item['apple'])}",
+                f"  configured {IOMMU_TOKEN}: {data['configured_cmdline']['configured']}",
+                f"  runtime {IOMMU_TOKEN}: {data['runtime_cmdline']['configured']}",
+                f"  IOMMU groups: {len(data['iommu']['groups'])}",
+                f"  safe for apply: {data['safe_for_apply']}",
+            ]
+        )
+    elif operation == "plan":
+        lines.append(f"  safe for apply: {data['safe_for_apply']}")
+        lines.extend(f"  - {item}" for item in data["actions"])
+    elif operation == "verify-iommu":
+        check = data["qualification"]
+        lines.append(f"  qualified: {check['qualified']}")
+        if check["group"]:
+            lines.append(
+                "  group: " + ", ".join(item["bdf"] for item in check["group"]["members"])
+            )
+    else:
+        lines.extend(
+            [
+                f"  changed: {data['changed']}",
+                f"  backup: {data['backup'] or 'not created'}",
+                f"  reinstall-kernels run: {data['reinstall_kernels_run']}",
+                f"  reboot required: {data['reboot_required']}",
+                "  reboot performed: False",
+                "  PCI detach performed: False",
+            ]
+        )
+    refusals = data.get("refusals", [])
+    if operation == "verify-iommu":
+        refusals = data["qualification"]["reasons"]
+    if refusals:
+        lines.append("  blockers:")
+        lines.extend(f"    - {item}" for item in refusals)
+    if data.get("error"):
+        lines.append(f"  error: {data['error']}")
+    if data.get("message"):
+        lines.append(f"  {data['message']}")
+    return "\n".join(lines)
+
+
+def output(data: dict[str, Any], json_mode: bool) -> None:
+    if json_mode:
+        print(json.dumps(data, indent=2, sort_keys=True))
+    else:
+        print(human(data))
+
+
+def parse_args(argv: list[str]) -> tuple[argparse.Namespace, bool]:
+    json_mode = "--json" in argv
+    cleaned = [item for item in argv if item != "--json"]
+    parser = argparse.ArgumentParser(
+        description="Conservative IOMMU preflight for ctos-apple-recovery",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="emit machine-readable JSON (accepted before or after the command)",
+    )
+    parser.add_argument(
+        "command",
+        choices=("status", "plan", "apply-iommu", "verify-iommu"),
+        nargs="?",
+        default="status",
+    )
+    return parser.parse_args(cleaned), json_mode
+
+
+def main(argv: list[str] | None = None) -> int:
+    args, json_mode = parse_args(list(argv if argv is not None else sys.argv[1:]))
+    if args.command == "status":
+        data = collect_status(include_groups=True)
+        data["operation"] = "status"
+        output(data, json_mode)
+        return 0
+    if args.command == "plan":
+        output(plan_state(), json_mode)
+        return 0
+    if args.command == "apply-iommu":
+        data, rc = apply_iommu()
+        output(data, json_mode)
+        return rc
+
+    state = collect_status(include_groups=True)
+    data = {
+        "operation": "verify-iommu",
+        "status": state,
+        "qualification": qualification(state),
+    }
+    output(data, json_mode)
+    return 0 if data["qualification"]["qualified"] else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

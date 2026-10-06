@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OUT_ROOT="$SCRIPT_DIR/outputs"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+OUT_DIR="$OUT_ROOT/netdiag-$STAMP"
+mkdir -p "$OUT_DIR"
+
+usage() {
+	cat <<'USAGE'
+usage:
+  ./ctos-core-netfix diag
+  ./ctos-core-netfix wifi
+  ./ctos-core-netfix iphone
+  ./ctos-core-netfix auto
+
+diag    writes a network report to outputs/
+wifi    recreates a WPA/WPA2/WPA3 Wi-Fi profile safely
+iphone  tries USB tethering through iPhone + NetworkManager
+auto    runs iphone, then diag
+
+No Wi-Fi password is written to the report.
+USAGE
+}
+
+log() {
+	printf '\n== %s ==\n' "$*"
+}
+
+run() {
+	printf '\n$ %s\n' "$*"
+	"$@" 2>&1 || true
+}
+
+need_root() {
+	if [ "$(id -u)" -ne 0 ]; then
+		printf 'This action needs sudo. Re-running through sudo...\n'
+		exec sudo bash "$0" "$@"
+	fi
+}
+
+wifi_iface() {
+	nmcli -t -f DEVICE,TYPE,STATE dev status 2>/dev/null |
+		awk -F: '$2 == "wifi" { print $1; exit }'
+}
+
+ether_ifaces() {
+	nmcli -t -f DEVICE,TYPE dev status 2>/dev/null |
+		awk -F: '$2 == "ethernet" && $1 != "lo" { print $1 }'
+}
+
+ping_check() {
+	log "Connectivity check"
+	run ping -c 3 -W 2 1.1.1.1
+	run ping -c 3 -W 2 endeavouros.com
+}
+
+diag() {
+	exec > >(tee "$OUT_DIR/report.txt") 2>&1
+
+	log "CTOS core network diagnostic"
+	printf 'Output: %s\n' "$OUT_DIR"
+	run date -Iseconds
+	run hostnamectl
+	run uname -a
+	run cat /etc/os-release
+
+	log "NetworkManager"
+	run systemctl --no-pager status NetworkManager
+	run nmcli general status
+	run nmcli radio all
+	run nmcli dev status
+	run nmcli con show
+
+	log "Wi-Fi scan"
+	run nmcli -f IN-USE,SSID,MODE,CHAN,SIGNAL,BARS,SECURITY dev wifi list --rescan yes
+
+	log "IP state"
+	run ip -brief link
+	run ip -brief addr
+	run ip route
+	run resolvectl status
+	run cat /etc/resolv.conf
+
+	log "Blocks and devices"
+	run rfkill list
+	run lsusb
+	run lspci -nnk
+
+	log "Kernel modules"
+	run sh -c "lsmod | grep -Ei 'ipheth|usbmux|rtl|mt76|iwlwifi|ath|brcm|cdc_ether|rndis|asix|r815|r816|wl' || true"
+
+	log "Relevant packages"
+	run pacman -Q networkmanager usbmuxd libimobiledevice ifuse iwd wpa_supplicant dhclient dhcpcd 2>/dev/null
+
+	log "Relevant services"
+	run systemctl --no-pager --type=service --state=running
+	run systemctl is-active NetworkManager usbmuxd iwd wpa_supplicant
+
+	log "Recent NetworkManager log"
+	run journalctl -u NetworkManager -b --no-pager -n 250
+
+	log "Recent kernel network/USB log"
+	run sh -c "dmesg | grep -Ei 'wifi|wlan|wireless|usb|ipheth|iphone|firmware|network|rtl|mt76|iwlwifi|ath|brcm|cdc_ether|rndis|r815|r816' | tail -300"
+
+	ping_check
+
+	cat <<EOF
+
+Report written to:
+$OUT_DIR/report.txt
+EOF
+}
+
+fix_wifi() {
+	need_root "$@"
+	exec > >(tee "$OUT_DIR/wifi-fix.txt") 2>&1
+
+	log "Wi-Fi fix"
+	run systemctl enable --now NetworkManager
+	run rfkill unblock all
+	run nmcli radio wifi on
+	run nmcli dev status
+	run nmcli dev wifi rescan
+	run nmcli -f IN-USE,SSID,MODE,CHAN,SIGNAL,BARS,SECURITY dev wifi list
+
+	iface="$(wifi_iface)"
+	if [ "$iface" = "" ]; then
+		printf 'No Wi-Fi interface found by NetworkManager.\n'
+		exit 1
+	fi
+	printf 'Wi-Fi interface: %s\n' "$iface"
+
+	printf 'SSID: '
+	read -r ssid
+	if [ "$ssid" = "" ]; then
+		printf 'SSID is required.\n'
+		exit 1
+	fi
+
+	printf 'Security key-mgmt [wpa-psk, sae, none] default=wpa-psk: '
+	read -r key_mgmt
+	key_mgmt="${key_mgmt:-wpa-psk}"
+
+	psk=""
+	if [ "$key_mgmt" != "none" ]; then
+		printf 'Password for %s: ' "$ssid"
+		stty -echo
+		read -r psk
+		stty echo
+		printf '\n'
+		if [ "$psk" = "" ]; then
+			printf 'Password is required for %s.\n' "$key_mgmt"
+			exit 1
+		fi
+	fi
+
+	log "Delete stale profile"
+	run nmcli con delete "$ssid"
+
+	log "Create clean profile"
+	run nmcli con add type wifi ifname "$iface" con-name "$ssid" ssid "$ssid"
+	run nmcli con modify "$ssid" 802-11-wireless.mode infrastructure
+	run nmcli con modify "$ssid" ipv4.method auto ipv6.method auto connection.autoconnect yes
+
+	if [ "$key_mgmt" = "none" ]; then
+		run nmcli con modify "$ssid" wifi-sec.key-mgmt ""
+	else
+		run nmcli con modify "$ssid" wifi-sec.key-mgmt "$key_mgmt"
+		nmcli con modify "$ssid" wifi-sec.psk "$psk" >/dev/null 2>&1 || {
+			printf 'Failed to set Wi-Fi password.\n'
+			exit 1
+		}
+	fi
+
+	log "Bring Wi-Fi up"
+	run nmcli con up "$ssid"
+	run nmcli dev status
+	run ip -brief addr
+	run ip route
+	ping_check
+
+	printf '\nWi-Fi fix log: %s/wifi-fix.txt\n' "$OUT_DIR"
+}
+
+fix_iphone() {
+	need_root "$@"
+	exec > >(tee "$OUT_DIR/iphone-fix.txt") 2>&1
+
+	log "iPhone USB tether attempt"
+	cat <<'EOF'
+On the iPhone:
+- Enable Personal Hotspot.
+- Keep the phone unlocked.
+- If prompted, tap "Trust This Computer".
+EOF
+
+	run systemctl enable --now NetworkManager
+	run rfkill unblock all
+	run modprobe ipheth
+	run modprobe cdc_ether
+	run modprobe rndis_host
+
+	if command -v usbmuxd >/dev/null 2>&1; then
+		run systemctl enable --now usbmuxd
+	else
+		printf 'usbmuxd is not installed. iPhone trust/pairing may not work until packages are installed.\n'
+	fi
+
+	if command -v idevicepair >/dev/null 2>&1; then
+		run idevicepair pair
+		run idevicepair validate
+	else
+		printf 'idevicepair is not installed. Package libimobiledevice is missing.\n'
+	fi
+
+	run systemctl restart NetworkManager
+	sleep 3
+	run nmcli dev status
+	run ip -brief link
+	run ip -brief addr
+
+	for dev in $(ether_ifaces); do
+		log "Trying ethernet-like device $dev"
+		run nmcli dev connect "$dev"
+	done
+
+	run nmcli dev status
+	run ip -brief addr
+	run ip route
+	ping_check
+
+	printf '\niPhone fix log: %s/iphone-fix.txt\n' "$OUT_DIR"
+}
+
+action="${1:-}"
+case "$action" in
+	diag)
+		diag
+		;;
+	wifi)
+		fix_wifi "$@"
+		;;
+	iphone)
+		fix_iphone "$@"
+		;;
+	auto)
+		fix_iphone "$@"
+		diag
+		;;
+	-h|--help|"")
+		usage
+		;;
+	*)
+		printf 'unknown action: %s\n' "$action" >&2
+		usage
+		exit 2
+		;;
+esac

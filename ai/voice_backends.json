@@ -1,0 +1,119 @@
+{
+  "schema": 1,
+  "selected_spike": "assist_wyoming_intents",
+  "updated": "2026-07-18",
+  "constraints": {
+    "mode": "push_to_talk_first",
+    "always_on_microphone": "deferred",
+    "cloud_stt": "blocked_by_default",
+    "voice_mutable_actions": "approval_required",
+    "primary_control_node": "ctos-t480",
+    "preferred_service_node": "ctos-core"
+  },
+  "backends": [
+    {
+      "id": "assist_wyoming_intents",
+      "label": "Home Assistant Assist + Wyoming intent backend",
+      "role": "primary_spike",
+      "status": "image_present_container_missing",
+      "fit": "Best candidate for a mature local voice assistant layer while CTOS keeps action permissions.",
+      "ctos_use": [
+        "fixed CTOS commands through explicit intents",
+        "future wake/satellite experiments",
+        "voice I/O separated from CTOS action authority"
+      ],
+      "risks": [
+        "full Home Assistant stack is heavier than current CTOS V1",
+        "EndeavourOS install path needs a container or venv decision",
+        "must not expose CTOS Tier 2/Tier 3 actions directly to voice"
+      ],
+      "next_probe": "Build an intent adapter from ai/voice_intents_fr.json before installing a long-lived service."
+    },
+    {
+      "id": "speech_to_phrase",
+      "label": "Speech-to-Phrase",
+      "role": "fixed_command_stt",
+      "status": "image_present_container_missing_token_gated",
+      "fit": "Better than free dictation for commands like brief, agenda, ouvre desk, ouvre vms. First live test should prefer the official Wyoming container before a local Kaldi/OpenFST toolchain build.",
+      "ctos_use": [
+        "recognize one of the known CTOS phrases",
+        "reduce Vosk-style transcription drift",
+        "keep push-to-talk command mode deterministic"
+      ],
+      "risks": [
+        "temporary Home Assistant/Wyoming websocket and token-file context still needs to be chosen",
+        "requires a generated phrase list and regression samples"
+      ],
+      "next_probe": "Run one localhost-only manual recognition loop through the inspected official container before any service."
+    },
+    {
+      "id": "piper_tts",
+      "label": "Piper / Wyoming Piper",
+      "role": "local_tts",
+      "status": "installed_ready",
+      "installed_version": "1.4.2",
+      "fit": "Current working local replacement for rough espeak-ng feedback, using fr_FR-siwis-medium on the T480.",
+      "ctos_use": [
+        "clearer spoken replies",
+        "local-only TTS service",
+        "future Assist/Wyoming pipeline component"
+      ],
+      "risks": [
+        "upstream 1.5.0 is newer than the installed runtime and must be reviewed before upgrade",
+        "voice model licensing and attribution are per voice",
+        "quality and latency still need an operator French benchmark"
+      ],
+      "next_probe": "Keep Piper as default; benchmark it first, then test Kokoro only as a heavier ctos-core quality challenger if needed."
+    },
+    {
+      "id": "whisper_dictation",
+      "label": "Whisper-class open STT",
+      "role": "open_ended_transcription",
+      "status": "image_present_runtime_stopped",
+      "candidate": "wyoming-faster-whisper",
+      "fit": "Use for natural French requests and dictation so CTOS is not limited to exact phrase matching.",
+      "ctos_use": [
+        "open-ended push-to-talk transcripts",
+        "natural agenda and planning requests",
+        "conversation transcripts when explicitly requested",
+        "larger models on ctos-core after hardware/RAM upgrade"
+      ],
+      "risks": [
+        "heavier CPU/RAM than phrase recognition",
+        "can create privacy-sensitive transcripts",
+        "must not execute transcript text directly"
+      ],
+      "next_probe": "Capture the real French corpus, then compare the existing Wyoming/faster-whisper path with current whisper.cpp using identical audio and native Silero VAD."
+    },
+    {
+      "id": "openvoiceos",
+      "label": "OpenVoiceOS",
+      "role": "inspiration_or_sandbox",
+      "status": "deferred",
+      "fit": "Interesting full assistant ecosystem, but broader than CTOS V2 needs.",
+      "ctos_use": [
+        "reference for skill architecture and voice UX"
+      ],
+      "risks": [
+        "too much platform surface for the current permission model",
+        "would duplicate CTOS action/tool boundaries"
+      ],
+      "next_probe": "Sandbox only after Assist/Wyoming phrase path is evaluated."
+    },
+    {
+      "id": "leon",
+      "label": "Leon",
+      "role": "inspiration_or_sandbox",
+      "status": "deferred",
+      "fit": "Useful reference for a personal-assistant product shape, not the immediate CTOS backend.",
+      "ctos_use": [
+        "study command/skill UX"
+      ],
+      "risks": [
+        "Node stack and assistant framework are not aligned with current CTOS Python tools",
+        "would not solve CTOS permission tiers by itself"
+      ],
+      "next_probe": "Read as product inspiration, not an install target for V2."
+    }
+  ]
+}

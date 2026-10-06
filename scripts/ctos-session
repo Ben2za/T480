@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+window_title_exists() {
+	local title="$1"
+	hyprctl clients 2>/dev/null | grep -Fq "title: ${title}"
+}
+
+window_class_exists() {
+	local class="$1"
+	hyprctl clients 2>/dev/null | grep -Fq "class: ${class}"
+}
+
+hypr_exec() {
+	local workspace="$1"
+	shift
+	hyprctl dispatch exec "[workspace ${workspace} silent] $*" >/dev/null
+}
+
+desk_guard_running() {
+	pgrep -u "$USER" -f "${ROOT}/scripts/ctos-desk-guard" >/dev/null 2>&1
+}
+
+start_desk_guard() {
+	if desk_guard_running; then
+		return
+	fi
+	setsid "$ROOT/scripts/ctos-desk-guard" >/tmp/ctos-desk-guard.log 2>&1 &
+}
+
+boot() {
+	"$ROOT/scripts/ctos-wallpaper" >/tmp/ctos-wallpaper-session.log 2>&1 || true
+	"$ROOT/scripts/ctos-control" serve >/tmp/ctos-control-session.log 2>&1 || true
+	start_desk_guard
+
+	sleep 0.7
+
+	if ! window_title_exists "CTOS_CONTROL"; then
+		hypr_exec 1 "kitty --class CTOS_CONTROL --title CTOS_CONTROL ${ROOT}/scripts/ctos-control tui"
+	fi
+
+	if ! window_title_exists "CTOS_VMS"; then
+		hypr_exec 4 "kitty --class CTOS_VMS --title CTOS_VMS ${ROOT}/scripts/ctos-vms-panel"
+	fi
+}
+
+status() {
+	printf 'CTOS session windows\n'
+	hyprctl clients | grep -E 'title: CTOS_CONTROL|title: CTOS_DESK|title: CTOS_VMS|title: ctos@ctos-core - TigerVNC|class: Vncviewer' || true
+	printf '\nservices\n'
+	"$ROOT/scripts/ctos-control" status || true
+	"$ROOT/scripts/ctos-desk-guard" status || true
+	pgrep -a -f "${ROOT}/scripts/ctos-desk-guard" || true
+	pgrep -a -f "vncviewer .*127\\.0\\.0\\.1:5902" || true
+	pgrep -a swaybg || true
+	pgrep -a waybar || true
+}
+
+case "${1:-boot}" in
+	boot)
+		boot
+		;;
+	status)
+		status
+		;;
+	wallpaper)
+		"$ROOT/scripts/ctos-wallpaper"
+		;;
+	*)
+		printf 'usage: %s [boot|status|wallpaper]\n' "$0" >&2
+		exit 2
+		;;
+esac

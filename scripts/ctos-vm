@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from dataclasses import dataclass
+from typing import Any
+
+
+CONNECTIONS = {
+    "system": "qemu:///system",
+    "session": "qemu:///session",
+}
+
+
+@dataclass
+class CommandResult:
+    rc: int
+    stdout: str
+    stderr: str
+
+
+def run_virsh(connection: str, args: list[str], timeout: float = 8.0) -> CommandResult:
+    uri = CONNECTIONS[connection]
+    command = ["virsh", "-c", uri, "--readonly", *args]
+    try:
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=timeout,
+        )
+    except FileNotFoundError:
+        return CommandResult(127, "", "virsh not found")
+    except subprocess.TimeoutExpired:
+        return CommandResult(124, "", "virsh command timed out")
+    return CommandResult(proc.returncode, proc.stdout.strip(), proc.stderr.strip())
+
+
+def table_rows(stdout: str) -> list[str]:
+    rows = []
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if set(stripped) <= {"-"}:
+            continue
+        lower = stripped.lower()
+        if lower.startswith("id ") or lower.startswith("name "):
+            continue
+        rows.append(stripped)
+    return rows
+
+
+def parse_domains(stdout: str, connection: str) -> list[dict[str, str]]:
+    domains = []
+    for row in table_rows(stdout):
+        parts = row.split()
+        if len(parts) < 3:
+            continue
+        domains.append(
+            {
+                "connection": connection,
+                "id": parts[0],
+                "name": parts[1],
+                "state": " ".join(parts[2:]),
+            }
+        )
+    return domains
+
+
+def parse_named_state(stdout: str) -> list[dict[str, str]]:
+    entries = []
+    for row in table_rows(stdout):
+        parts = row.split()
+        if len(parts) < 2:
+            continue
+        entry = {"name": parts[0], "state": parts[1]}
+        if len(parts) >= 3:
+            entry["autostart"] = parts[2]
+        if len(parts) >= 4:
+            entry["persistent"] = parts[3]
+        entries.append(entry)
+    return entries
+
+
+def parse_volumes(stdout: str) -> list[dict[str, str]]:
+    volumes = []
+    for row in table_rows(stdout):
+        parts = row.split()
+        if len(parts) < 6:
+            continue
+        volumes.append(
+            {
+                "name": parts[0],
+                "path": parts[1],
+                "type": parts[2],
+                "capacity": " ".join(parts[3:5]),
+                "allocation": " ".join(parts[5:7]) if len(parts) >= 7 else parts[5],
+            }
+        )
+    return volumes
+
+
+def selected_connections(name: str) -> list[str]:
+    if name == "both":
+        return ["system", "session"]
+    return [name]
+
+
+def inventory(connection_names: list[str]) -> dict[str, Any]:
+    data: dict[str, Any] = {"connections": [], "domains": []}
+    for name in connection_names:
+        entry: dict[str, Any] = {
+            "name": name,
+            "uri": CONNECTIONS[name],
+            "ok": True,
+            "errors": [],
+            "domains": [],
+            "networks": [],
+            "pools": [],
+        }
+
+        domain_result = run_virsh(name, ["list", "--all"])
+        if domain_result.rc == 0:
+            entry["domains"] = parse_domains(domain_result.stdout, name)
+            data["domains"].extend(entry["domains"])
+        else:
+            entry["ok"] = False
+            entry["errors"].append({"command": "list --all", "message": domain_result.stderr})
+
+        network_result = run_virsh(name, ["net-list", "--all"])
+        if network_result.rc == 0:
+            entry["networks"] = parse_named_state(network_result.stdout)
+        else:
+            entry["errors"].append({"command": "net-list --all", "message": network_result.stderr})
+
+        pool_result = run_virsh(name, ["pool-list", "--all"])
+        if pool_result.rc == 0:
+            pools = parse_named_state(pool_result.stdout)
+            for pool in pools:
+                volume_result = run_virsh(name, ["vol-list", pool["name"], "--details"])
+                if volume_result.rc == 0:
+                    pool["volumes"] = parse_volumes(volume_result.stdout)
+                else:
+                    pool["volumes"] = []
+                    pool["volume_error"] = volume_result.stderr
+                    entry["errors"].append(
+                        {
+                            "command": f"vol-list {pool['name']} --details",
+                            "message": volume_result.stderr,
+                        }
+                    )
+            entry["pools"] = pools
+        else:
+            entry["errors"].append({"command": "pool-list --all", "message": pool_result.stderr})
+
+        data["connections"].append(entry)
+    return data
+
+
+def has_connection_errors(data: dict[str, Any]) -> bool:
+    return any(connection["errors"] for connection in data["connections"])
+
+
+def render_errors(connection: dict[str, Any]) -> None:
+    if not connection["errors"]:
+        return
+    print("  read errors:")
+    for error in connection["errors"]:
+        print(f"    {error['command']}: {error['message'] or 'unknown error'}")
+
+
+def render_list(data: dict[str, Any]) -> None:
+    visible_domains = data["domains"]
+    for connection in data["connections"]:
+        if not connection["ok"]:
+            print(f"{connection['name']} ({connection['uri']}): blocked")
+            for error in connection["errors"]:
+                print(f"  {error['command']}: {error['message'] or 'unknown error'}")
+            continue
+        domains = connection["domains"]
+        if not domains:
+            print(f"{connection['name']} ({connection['uri']}): no domains")
+            render_errors(connection)
+            continue
+        print(f"{connection['name']} ({connection['uri']}):")
+        for domain in domains:
+            print(f"  {domain['name']:<24} {domain['state']:<12} id {domain['id']}")
+        render_errors(connection)
+
+    if not visible_domains:
+        print("No libvirt domains defined on selected connections.")
+
+
+def render_status(data: dict[str, Any]) -> None:
+    print("CTOS VM status")
+    for connection in data["connections"]:
+        print(f"\n{connection['name']} ({connection['uri']})")
+        if not connection["ok"]:
+            print("  state: blocked")
+            for error in connection["errors"]:
+                print(f"  {error['command']}: {error['message'] or 'unknown error'}")
+            continue
+
+        print("  state: ready")
+        render_errors(connection)
+        if connection["domains"]:
+            print("  domains:")
+            for domain in connection["domains"]:
+                print(f"    {domain['name']:<24} {domain['state']:<12} id {domain['id']}")
+        else:
+            print("  domains: none")
+
+        if connection["networks"]:
+            print("  networks:")
+            for network in connection["networks"]:
+                persistent = network.get("persistent", "?")
+                autostart = network.get("autostart", "?")
+                print(
+                    f"    {network['name']:<16} {network['state']:<8} "
+                    f"autostart={autostart} persistent={persistent}"
+                )
+        else:
+            print("  networks: none")
+
+        if connection["pools"]:
+            print("  pools:")
+            for pool in connection["pools"]:
+                print(
+                    f"    {pool['name']:<16} {pool['state']:<8} "
+                    f"autostart={pool.get('autostart', '?')}"
+                )
+                for volume in pool.get("volumes", []):
+                    print(
+                        f"      {volume['name']:<40} "
+                        f"{volume['capacity']:<10} allocated {volume['allocation']}"
+                    )
+                if pool.get("volume_error"):
+                    print(f"      volumes blocked: {pool['volume_error']}")
+        else:
+            print("  pools: none")
+
+
+def render_inspect_json(connection: str, name: str) -> dict[str, Any]:
+    sections = {}
+    commands = {
+        "dominfo": ["dominfo", name],
+        "blklist": ["domblklist", name, "--details"],
+        "iflist": ["domiflist", name],
+        "snapshots": ["snapshot-list", name, "--tree"],
+    }
+    ok = True
+    for label, command in commands.items():
+        result = run_virsh(connection, command)
+        sections[label] = {
+            "ok": result.rc == 0,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "return_code": result.rc,
+        }
+        ok = ok and result.rc == 0
+    return {"connection": connection, "domain": name, "ok": ok, "sections": sections}
+
+
+def render_inspect(connection: str, name: str) -> bool:
+    print(f"CTOS VM inspect: {name} on {connection} ({CONNECTIONS[connection]})")
+    data = render_inspect_json(connection, name)
+    for label, section in data["sections"].items():
+        print(f"\n[{label}]")
+        if section["ok"]:
+            print(section["stdout"] or "(empty)")
+        else:
+            print(f"blocked: {section['stderr'] or 'unknown error'}")
+    return bool(data["ok"])
+
+
+def command_list(args: argparse.Namespace) -> int:
+    data = inventory(selected_connections(args.connect))
+    if args.json:
+        print(json.dumps(data, indent=2, sort_keys=True))
+    else:
+        render_list(data)
+    return 1 if has_connection_errors(data) else 0
+
+
+def command_status(args: argparse.Namespace) -> int:
+    data = inventory(selected_connections(args.connect))
+    if args.json:
+        print(json.dumps(data, indent=2, sort_keys=True))
+    else:
+        render_status(data)
+    return 1 if has_connection_errors(data) else 0
+
+
+def command_inspect(args: argparse.Namespace) -> int:
+    data = inventory(selected_connections(args.connect))
+    matches = [
+        domain
+        for domain in data["domains"]
+        if domain["name"] == args.name
+    ]
+    if not matches:
+        if args.json:
+            print(json.dumps({"ok": False, "error": "domain not found", "inventory": data}, indent=2))
+        else:
+            render_list(data)
+            sys.stdout.flush()
+            print(f"Domain not found: {args.name}", file=sys.stderr)
+        return 1
+
+    results = []
+    all_ok = True
+    for match in matches:
+        connection = match["connection"]
+        if args.json:
+            result = render_inspect_json(connection, args.name)
+            results.append(result)
+            all_ok = all_ok and result["ok"]
+        else:
+            ok = render_inspect(connection, args.name)
+            all_ok = all_ok and ok
+
+    if args.json:
+        print(json.dumps({"ok": all_ok, "results": results}, indent=2, sort_keys=True))
+    return 0 if all_ok else 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Read-only CTOS libvirt inventory helper."
+    )
+    parser.add_argument(
+        "--connect",
+        choices=["system", "session", "both"],
+        default="both",
+        help="libvirt connection to inspect; default: both",
+    )
+    parser.add_argument("--json", action="store_true", help="emit JSON")
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("list", help="list defined domains")
+    subparsers.add_parser("status", help="show domains, networks, pools, and volumes")
+    inspect_parser = subparsers.add_parser("inspect", help="inspect one defined domain")
+    inspect_parser.add_argument("name", help="domain name")
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.command == "list":
+        return command_list(args)
+    if args.command == "status":
+        return command_status(args)
+    if args.command == "inspect":
+        return command_inspect(args)
+    parser.error("unknown command")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

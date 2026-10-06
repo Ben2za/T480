@@ -1,0 +1,6 @@
+<pool type="dir">
+  <name>ctos-iso</name>
+  <target>
+    <path>/var/lib/libvirt/ctos/iso</path>
+  </target>
+</pool>

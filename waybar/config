@@ -1,0 +1,57 @@
+{
+	"layer": "top",
+	"position": "top",
+	"height": 36,
+
+	"modules-left": ["hyprland/workspaces"],
+	"modules-center": ["clock"],
+	"modules-right": ["custom/audio", "cpu", "memory", "network", "battery"],
+
+	"hyprland/workspaces": {
+		"format": "{icon}",
+		"persistent-workspaces": {
+			"*": [1,2,3,4,5,6,7,8]
+		},
+		"format-icons": {
+			"1": "CTRL",
+			"2": "DESK",
+			"3": "STATION",
+			"4": "VMS",
+			"5": "AI",
+			"6": "VAULT",
+			"7": "COMMS",
+			"8": "GAME",
+			"urgent": "!"
+		}
+
+	},
+
+	"cpu": {
+		"format": "CPU {usage}%"
+	},
+	"memory": {
+		"format": "RAM {percentage}%"
+	},
+	"network": {
+		"format-wifi": "NET {essid}",
+		"format-ethernet": "ETH",
+		"format-disconnected": "OFF"
+	},
+	"battery": {
+		"format": "BAT {capacity}%"
+	},
+	"custom/audio": {
+		"exec": "/home/operator/T480/scripts/ctos-audio waybar",
+		"return-type": "json",
+		"interval": 2,
+		"on-scroll-up": "/home/operator/T480/scripts/ctos-audio up",
+		"on-scroll-down": "/home/operator/T480/scripts/ctos-audio down",
+		"on-click": "/home/operator/T480/scripts/ctos-audio panel",
+		"on-click-middle": "/home/operator/T480/scripts/ctos-audio mixer",
+		"on-click-right": "/home/operator/T480/scripts/ctos-audio mute",
+		"tooltip": true
+	},
+	"clock": {
+		"format": "{:%H:%M}"
+	}
+}

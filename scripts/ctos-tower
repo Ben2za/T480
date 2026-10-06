@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_HOST = "192.168.1.18"
+DEFAULT_USER = "Admin"
+DEFAULT_KEY = Path.home() / ".ssh/id_ed25519"
+DEFAULT_KNOWN_HOSTS = Path("/tmp/ctos_tower_known_hosts")
+
+
+def ssh_base(args: argparse.Namespace) -> list[str]:
+    return [
+        "ssh",
+        "-i",
+        str(args.key),
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "PasswordAuthentication=no",
+        "-o",
+        "PreferredAuthentications=publickey",
+        "-o",
+        f"ConnectTimeout={args.timeout}",
+        "-o",
+        "LogLevel=ERROR",
+        "-o",
+        f"UserKnownHostsFile={args.known_hosts}",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        f"{args.user}@{args.host}",
+    ]
+
+
+def encoded_powershell(script: str) -> str:
+    return base64.b64encode(script.encode("utf-16le")).decode("ascii")
+
+
+def run_remote(args: argparse.Namespace, command: str) -> subprocess.CompletedProcess[str]:
+    proc = subprocess.run(
+        [*ssh_base(args), command],
+        capture_output=True,
+        check=False,
+    )
+    return subprocess.CompletedProcess(
+        proc.args,
+        proc.returncode,
+        stdout=proc.stdout.decode("utf-8", errors="replace"),
+        stderr=proc.stderr.decode("utf-8", errors="replace"),
+    )
+
+
+def run_ps(args: argparse.Namespace, script: str) -> subprocess.CompletedProcess[str]:
+    script = "$ProgressPreference = 'SilentlyContinue';\n" + script
+    command = (
+        "powershell.exe -NoProfile -ExecutionPolicy Bypass "
+        f"-EncodedCommand {encoded_powershell(script)}"
+    )
+    return run_remote(args, command)
+
+
+def print_result(proc: subprocess.CompletedProcess[str]) -> int:
+    if proc.stdout:
+        print(proc.stdout.rstrip())
+    if proc.stderr:
+        print(proc.stderr.rstrip(), file=sys.stderr)
+    return proc.returncode
+
+
+def inventory_script() -> str:
+    return r"""
+$ErrorActionPreference = "Stop"
+$data = [ordered]@{}
+$data.Computer = $env:COMPUTERNAME
+$data.User = (whoami)
+$data.Time = (Get-Date).ToString("o")
+$data.OS = Get-CimInstance Win32_OperatingSystem |
+  Select-Object Caption,Version,BuildNumber,OSArchitecture,
+    @{n="TotalVisibleMemoryGiB";e={[math]::Round($_.TotalVisibleMemorySize / 1MB, 2)}},
+    @{n="FreePhysicalMemoryGiB";e={[math]::Round($_.FreePhysicalMemory / 1MB, 2)}}
+$data.CPU = Get-CimInstance Win32_Processor |
+  Select-Object Name,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed
+$data.RAM = Get-CimInstance Win32_PhysicalMemory |
+  Select-Object Manufacturer,PartNumber,
+    @{n="CapacityGiB";e={[math]::Round($_.Capacity / 1GB, 2)}},
+    Speed,ConfiguredClockSpeed,DeviceLocator
+$data.GPU = Get-CimInstance Win32_VideoController |
+  Select-Object Name,
+    @{n="AdapterRAMGiB";e={[math]::Round($_.AdapterRAM / 1GB, 2)}},
+    DriverVersion,CurrentHorizontalResolution,CurrentVerticalResolution
+$data.Disks = Get-Disk |
+  Select-Object Number,FriendlyName,BusType,PartitionStyle,
+    @{n="SizeGiB";e={[math]::Round($_.Size / 1GB, 2)}},
+    @{n="AllocatedGiB";e={[math]::Round($_.AllocatedSize / 1GB, 2)}},
+    HealthStatus,OperationalStatus,IsBoot,IsSystem,NumberOfPartitions
+$data.Volumes = Get-Volume |
+  Select-Object DriveLetter,FileSystemLabel,FileSystem,
+    @{n="SizeGiB";e={if ($_.Size) {[math]::Round($_.Size / 1GB, 2)} else {$null}}},
+    @{n="FreeGiB";e={if ($_.SizeRemaining) {[math]::Round($_.SizeRemaining / 1GB, 2)} else {$null}}},
+    HealthStatus
+$data.IPv4 = Get-NetIPAddress -AddressFamily IPv4 |
+  Where-Object { $_.IPAddress -notlike "169.254.*" } |
+  Select-Object InterfaceAlias,IPAddress,PrefixLength
+$data.DefaultRoutes = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix "0.0.0.0/0" |
+  Select-Object InterfaceAlias,NextHop,RouteMetric,InterfaceMetric
+$data.DNS = Get-DnsClientServerAddress -AddressFamily IPv4 |
+  Select-Object InterfaceAlias,ServerAddresses
+$data.SSHD = Get-Service sshd |
+  Select-Object Name,
+    @{n="Status";e={$_.Status.ToString()}},
+    @{n="StartType";e={$_.StartType.ToString()}}
+$data | ConvertTo-Json -Depth 6
+"""
+
+
+def cmd_test(args: argparse.Namespace) -> int:
+    script = '$env:COMPUTERNAME; whoami; (Get-Date).ToString("o")'
+    return print_result(run_ps(args, script))
+
+
+def cmd_inventory(args: argparse.Namespace) -> int:
+    proc = run_ps(args, inventory_script())
+    if proc.returncode != 0 or args.json:
+        return print_result(proc)
+
+    try:
+        data: dict[str, Any] = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return print_result(proc)
+
+    print(f"CTOS tower: {data.get('Computer')} ({data.get('User')})")
+    os_info = data.get("OS") or {}
+    print(f"OS: {os_info.get('Caption')} {os_info.get('Version')} build {os_info.get('BuildNumber')}")
+    cpu = data.get("CPU") or {}
+    print(
+        "CPU: "
+        f"{cpu.get('Name', '').strip()} "
+        f"({cpu.get('NumberOfCores')}C/{cpu.get('NumberOfLogicalProcessors')}T)"
+    )
+    ram = data.get("RAM")
+    if isinstance(ram, dict):
+        print(
+            "RAM: "
+            f"{ram.get('CapacityGiB')} GiB "
+            f"{ram.get('Manufacturer', '').strip()} {ram.get('PartNumber', '').strip()}"
+        )
+    print("Disks:")
+    for disk in data.get("Disks") or []:
+        flags = []
+        if disk.get("IsBoot"):
+            flags.append("boot")
+        if disk.get("IsSystem"):
+            flags.append("system")
+        flag_text = f" [{', '.join(flags)}]" if flags else ""
+        print(
+            f"  disk {disk.get('Number')}: {disk.get('FriendlyName')} "
+            f"{disk.get('SizeGiB')} GiB {disk.get('BusType')} "
+            f"parts={disk.get('NumberOfPartitions')}{flag_text}"
+        )
+    print("IPv4:")
+    for ip in data.get("IPv4") or []:
+        print(f"  {ip.get('InterfaceAlias')}: {ip.get('IPAddress')}/{ip.get('PrefixLength')}")
+    sshd = data.get("SSHD") or {}
+    print(f"sshd service: status={sshd.get('Status')} start={sshd.get('StartType')}")
+    return 0
+
+
+def cmd_ps(args: argparse.Namespace) -> int:
+    script = " ".join(args.script)
+    return print_result(run_ps(args, script))
+
+
+def cmd_raw(args: argparse.Namespace) -> int:
+    return print_result(run_remote(args, " ".join(args.command)))
+
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Temporary CTOS SSH helper for the Windows tower.")
+    p.add_argument("--host", default=os.environ.get("CTOS_TOWER_HOST", DEFAULT_HOST))
+    p.add_argument("--user", default=os.environ.get("CTOS_TOWER_USER", DEFAULT_USER))
+    p.add_argument("--key", type=Path, default=Path(os.environ.get("CTOS_TOWER_KEY", DEFAULT_KEY)))
+    p.add_argument(
+        "--known-hosts",
+        type=Path,
+        default=Path(os.environ.get("CTOS_TOWER_KNOWN_HOSTS", DEFAULT_KNOWN_HOSTS)),
+    )
+    p.add_argument("--timeout", default=os.environ.get("CTOS_TOWER_TIMEOUT", "8"))
+
+    sub = p.add_subparsers(dest="command", required=True)
+
+    test = sub.add_parser("test", help="verify key-based SSH access")
+    test.set_defaults(func=cmd_test)
+
+    inv = sub.add_parser("inventory", help="read concise tower inventory")
+    inv.add_argument("--json", action="store_true", help="print raw JSON")
+    inv.set_defaults(func=cmd_inventory)
+
+    ps = sub.add_parser("ps", help="run a PowerShell command")
+    ps.add_argument("script", nargs=argparse.REMAINDER)
+    ps.set_defaults(func=cmd_ps)
+
+    raw = sub.add_parser("raw", help="run a raw remote command")
+    raw.add_argument("command", nargs=argparse.REMAINDER)
+    raw.set_defaults(func=cmd_raw)
+    return p
+
+
+def main() -> int:
+    args = parser().parse_args()
+    if not args.key.exists():
+        print(f"missing SSH key: {args.key}", file=sys.stderr)
+        return 2
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

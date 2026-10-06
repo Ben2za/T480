@@ -1,0 +1,1363 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import unicodedata
+import wave
+import zipfile
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
+STATE_HOME = Path(os.environ.get("CTOS_AI_STATE_HOME", Path.home() / ".local/share/ctos-ai")).expanduser()
+STT_HOME = STATE_HOME / "stt"
+VOSK_VENV = STATE_HOME / "venvs" / "vosk"
+VOSK_MODEL_NAME = "vosk-model-small-fr-0.22"
+VOSK_MODEL_DIR = STT_HOME / VOSK_MODEL_NAME
+VOSK_MODEL_URL = f"https://alphacephei.com/vosk/models/{VOSK_MODEL_NAME}.zip"
+STT_RATE = 16000
+TTS_HOME = STATE_HOME / "tts"
+PIPER_HOME = TTS_HOME / "piper"
+PIPER_VENV = STATE_HOME / "venvs" / "piper"
+DEFAULT_PIPER_VOICE_ID = "fr_FR-siwis-medium"
+PIPER_VOICE_ID = os.environ.get("CTOS_VOICE_PIPER_VOICE", DEFAULT_PIPER_VOICE_ID)
+PIPER_VOICE_DIR = PIPER_HOME / PIPER_VOICE_ID
+PIPER_MODEL = PIPER_VOICE_DIR / f"{PIPER_VOICE_ID}.onnx"
+PIPER_CONFIG = PIPER_VOICE_DIR / f"{PIPER_VOICE_ID}.onnx.json"
+PIPER_MODEL_URL = os.environ.get(
+    "CTOS_VOICE_PIPER_MODEL_URL",
+    "https://huggingface.co/rhasspy/piper-voices/resolve/main/fr/fr_FR/siwis/medium/fr_FR-siwis-medium.onnx"
+    if PIPER_VOICE_ID == DEFAULT_PIPER_VOICE_ID
+    else "",
+)
+PIPER_CONFIG_URL = os.environ.get(
+    "CTOS_VOICE_PIPER_CONFIG_URL",
+    "https://huggingface.co/rhasspy/piper-voices/resolve/main/fr/fr_FR/siwis/medium/fr_FR-siwis-medium.onnx.json"
+    if PIPER_VOICE_ID == DEFAULT_PIPER_VOICE_ID
+    else "",
+)
+
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from ai.action_planner import format_plan, plan_text_action  # noqa: E402
+
+
+VOICE_COMMAND_HELP = [
+    ("sante / statut / brief", "affiche le brief CTOS"),
+    ("agenda / journee", "affiche le plan du jour"),
+    ("propositions agenda", "affiche les propositions agenda en attente"),
+    ("ouvre desk / bureau", "ouvre ou repare le bureau distant de la tour"),
+    ("ouvre vms / machines / kali", "ouvre le panneau VMS sans demarrer de VM"),
+    ("approbations / validations", "liste les actions en attente d'approbation"),
+    ("aide / commandes", "affiche cette liste"),
+]
+
+
+def venv_site_packages() -> Path:
+    return VOSK_VENV / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+
+
+def add_vosk_venv_to_path() -> None:
+    site = venv_site_packages()
+    if site.is_dir():
+        site_text = str(site)
+        if site_text not in sys.path:
+            sys.path.insert(0, site_text)
+
+
+add_vosk_venv_to_path()
+
+
+def which_many(names: list[str]) -> dict[str, str | None]:
+    return {name: shutil.which(name) for name in names}
+
+
+def module_available(name: str) -> bool:
+    return importlib.util.find_spec(name) is not None
+
+
+def shell_join(parts: list[str]) -> str:
+    return " ".join(shlex.quote(part) for part in parts)
+
+
+def vosk_model_ready(model_dir: Path = VOSK_MODEL_DIR) -> bool:
+    return (
+        model_dir.is_dir()
+        and (model_dir / "conf").is_dir()
+        and (model_dir / "am").is_dir()
+        and any(model_dir.glob("am/*"))
+    )
+
+
+def piper_binary() -> str | None:
+    system_binary = shutil.which("piper")
+    if system_binary:
+        return system_binary
+    venv_binary = PIPER_VENV / "bin" / "piper"
+    if venv_binary.exists():
+        return str(venv_binary)
+    return None
+
+
+def piper_ready() -> bool:
+    return piper_binary() is not None and PIPER_MODEL.exists() and PIPER_CONFIG.exists()
+
+
+def playback_commands(path: Path) -> list[list[str]]:
+    commands: list[list[str]] = []
+    if shutil.which("pw-play"):
+        commands.append(["pw-play", str(path)])
+    if shutil.which("paplay"):
+        commands.append(["paplay", str(path)])
+    if shutil.which("aplay"):
+        commands.append(["aplay", "-q", str(path)])
+    if shutil.which("ffplay"):
+        commands.append(["ffplay", "-nodisp", "-autoexit", "-loglevel", "error", str(path)])
+    return commands
+
+
+def play_wav(path: Path) -> int:
+    commands = playback_commands(path)
+    if not commands:
+        print("No WAV playback command found; install or expose pw-play, paplay, aplay, or ffplay.", file=sys.stderr)
+        return 3
+    for command in commands:
+        try:
+            proc = subprocess.run(command, check=False, timeout=15)
+            if proc.returncode == 0:
+                return 0
+        except subprocess.TimeoutExpired:
+            continue
+    return 1
+
+
+def voice_probe() -> dict[str, object]:
+    speakers = which_many(["spd-say", "espeak-ng", "espeak", "piper"])
+    playback = which_many(["pw-play", "paplay", "aplay", "ffplay"])
+    recorders = which_many(["pw-record", "parec", "arecord", "ffmpeg"])
+    transcribers = which_many(["whisper-cli", "whisper-cpp", "vosk-transcriber"])
+    py_vosk = module_available("vosk")
+    model_ready = vosk_model_ready()
+    recording_ready = any(recorders.values())
+    piper_bin = piper_binary()
+    return {
+        "voice_output_ready": any(speakers.values()),
+        "voice_input_ready": py_vosk and model_ready and recording_ready,
+        "recording_ready": recording_ready,
+        "speakers": speakers,
+        "playback": playback,
+        "recorders": recorders,
+        "transcribers": transcribers,
+        "python_modules": {"vosk": py_vosk},
+        "tts": {
+            "default_engine": os.environ.get("CTOS_VOICE_ENGINE", "auto"),
+            "piper": {
+                "binary": piper_bin,
+                "ready": piper_ready(),
+                "voice": PIPER_VOICE_ID,
+                "model": str(PIPER_MODEL),
+                "model_ready": PIPER_MODEL.exists(),
+                "config": str(PIPER_CONFIG),
+                "config_ready": PIPER_CONFIG.exists(),
+                "venv": str(PIPER_VENV),
+                "venv_ready": (PIPER_VENV / "bin" / "python").exists(),
+                "model_url": PIPER_MODEL_URL,
+                "config_url": PIPER_CONFIG_URL,
+            },
+        },
+        "vosk": {
+            "model": VOSK_MODEL_NAME,
+            "model_dir": str(VOSK_MODEL_DIR),
+            "model_ready": model_ready,
+            "model_url": VOSK_MODEL_URL,
+            "venv": str(VOSK_VENV),
+            "venv_ready": (VOSK_VENV / "bin" / "python").exists() and venv_site_packages().is_dir(),
+            "venv_site_packages": str(venv_site_packages()),
+        },
+        "note": "Voice input is push-to-talk only. It requires python-vosk plus the local French small model.",
+    }
+
+
+def render_piper_wav(text: str, wav_path: Path) -> int:
+    binary = piper_binary()
+    if not binary:
+        print("Piper is not installed. Run `ctos-voice setup-piper --print-commands`.", file=sys.stderr)
+        return 3
+    if not PIPER_MODEL.exists() or not PIPER_CONFIG.exists():
+        print(f"Piper voice is missing: {PIPER_MODEL} / {PIPER_CONFIG}", file=sys.stderr)
+        return 3
+    cleaned = " ".join(text.split())
+    if not cleaned:
+        print("Piper text is empty.", file=sys.stderr)
+        return 2
+    if len(cleaned) > 2000:
+        print("Piper text exceeds the 2000-character boundary.", file=sys.stderr)
+        return 2
+    if not wav_path.parent.is_dir():
+        print(f"Piper output parent is missing: {wav_path.parent}", file=sys.stderr)
+        return 2
+    if wav_path.is_symlink() or (wav_path.exists() and not wav_path.is_file()):
+        print("Piper output must be a regular non-symlink file.", file=sys.stderr)
+        return 2
+    command = [
+        binary,
+        "--model",
+        str(PIPER_MODEL),
+        "--config",
+        str(PIPER_CONFIG),
+        "--output_file",
+        str(wav_path),
+    ]
+    proc = subprocess.run(
+        command,
+        input=f"{cleaned}\n",
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip() or f"piper rc={proc.returncode}"
+        print(detail, file=sys.stderr)
+        return int(proc.returncode)
+    if not wav_path.is_file() or wav_path.is_symlink() or wav_path.stat().st_size < 44:
+        print("Piper did not produce a valid-sized regular WAV file.", file=sys.stderr)
+        return 1
+    return 0
+
+
+def speak_piper(text: str, quiet: bool = False) -> int:
+    if quiet:
+        return 0
+    handle = tempfile.NamedTemporaryFile(prefix="ctos-piper-", suffix=".wav", delete=False, dir="/tmp")
+    handle.close()
+    wav_path = Path(handle.name)
+    try:
+        rendered = render_piper_wav(text, wav_path)
+        if rendered != 0:
+            return rendered
+        return play_wav(wav_path)
+    finally:
+        wav_path.unlink(missing_ok=True)
+
+
+def speak(text: str, quiet: bool = False, engine: str | None = None) -> int:
+    text = text.strip()
+    if not text:
+        return 0
+    if quiet:
+        return 0
+    engine = engine or os.environ.get("CTOS_VOICE_ENGINE", "auto")
+    if engine == "piper":
+        return speak_piper(text, quiet=quiet)
+    if engine == "spd-say":
+        if not shutil.which("spd-say"):
+            print("spd-say not found.", file=sys.stderr)
+            return 3
+        return subprocess.run(["spd-say", text], check=False).returncode
+    if engine == "espeak-ng":
+        if not shutil.which("espeak-ng"):
+            print("espeak-ng not found.", file=sys.stderr)
+            return 3
+        voice = os.environ.get("CTOS_VOICE_ESPEAK_VOICE", "fr-fr")
+        speed = os.environ.get("CTOS_VOICE_ESPEAK_SPEED", "130")
+        amplitude = os.environ.get("CTOS_VOICE_ESPEAK_AMPLITUDE", "200")
+        return subprocess.run(["espeak-ng", "-v", voice, "-s", speed, "-a", amplitude, text], check=False).returncode
+    if engine == "espeak":
+        if not shutil.which("espeak"):
+            print("espeak not found.", file=sys.stderr)
+            return 3
+        speed = os.environ.get("CTOS_VOICE_ESPEAK_SPEED", "130")
+        amplitude = os.environ.get("CTOS_VOICE_ESPEAK_AMPLITUDE", "200")
+        return subprocess.run(["espeak", "-s", speed, "-a", amplitude, text], check=False).returncode
+    if engine != "auto":
+        print(f"Unknown TTS engine: {engine}", file=sys.stderr)
+        return 2
+    if shutil.which("spd-say"):
+        return subprocess.run(["spd-say", text], check=False).returncode
+    if shutil.which("espeak-ng"):
+        voice = os.environ.get("CTOS_VOICE_ESPEAK_VOICE", "fr-fr")
+        speed = os.environ.get("CTOS_VOICE_ESPEAK_SPEED", "130")
+        amplitude = os.environ.get("CTOS_VOICE_ESPEAK_AMPLITUDE", "200")
+        return subprocess.run(["espeak-ng", "-v", voice, "-s", speed, "-a", amplitude, text], check=False).returncode
+    if shutil.which("espeak"):
+        speed = os.environ.get("CTOS_VOICE_ESPEAK_SPEED", "130")
+        amplitude = os.environ.get("CTOS_VOICE_ESPEAK_AMPLITUDE", "200")
+        return subprocess.run(["espeak", "-s", speed, "-a", amplitude, text], check=False).returncode
+    print("No TTS command found; response left as text.", file=sys.stderr)
+    return 1
+
+
+def ask_ctos(prompt: str, model: str, max_tokens: int) -> tuple[int, str]:
+    proc = subprocess.run(
+        [
+            str(SCRIPTS / "ctos-ai-api"),
+            "ask",
+            prompt,
+            "--model",
+            model,
+            "--max-tokens",
+            str(max_tokens),
+            "--json",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=240,
+    )
+    if proc.returncode != 0:
+        return proc.returncode, proc.stderr.strip() or proc.stdout.strip()
+    try:
+        payload = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError:
+        return 1, proc.stdout.strip()
+    return 0, str(payload.get("response") or "").strip()
+
+
+def record_audio(seconds: float, out_path: Path) -> tuple[int, str]:
+    if seconds <= 0:
+        return 2, "seconds must be positive"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    sample_count = int(STT_RATE * seconds)
+    commands: list[list[str]] = []
+    if shutil.which("pw-record"):
+        commands.append([
+            "pw-record",
+            "--media-category",
+            "Capture",
+            "--rate",
+            str(STT_RATE),
+            "--channels",
+            "1",
+            "--format",
+            "s16",
+            "-n",
+            str(sample_count),
+            str(out_path),
+        ])
+    if shutil.which("ffmpeg"):
+        commands.append([
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "pulse",
+            "-i",
+            "default",
+            "-t",
+            str(seconds),
+            "-ar",
+            str(STT_RATE),
+            "-ac",
+            "1",
+            "-sample_fmt",
+            "s16",
+            str(out_path),
+        ])
+    if shutil.which("arecord"):
+        commands.append([
+            "arecord",
+            "-q",
+            "-t",
+            "wav",
+            "-f",
+            "S16_LE",
+            "-r",
+            str(STT_RATE),
+            "-c",
+            "1",
+            "-d",
+            str(max(1, int(round(seconds)))),
+            str(out_path),
+        ])
+    if not commands:
+        return 3, "No supported recorder found. Install or expose pw-record, arecord, or ffmpeg."
+    errors: list[str] = []
+    for command in commands:
+        out_path.unlink(missing_ok=True)
+        proc = subprocess.run(command, check=False, capture_output=True, text=True, timeout=max(15, int(seconds) + 10))
+        if proc.returncode == 0 or wav_file_ready(out_path):
+            return 0, " ".join(command)
+        errors.append(f"{command[0]} rc={proc.returncode}: {(proc.stderr.strip() or proc.stdout.strip() or 'no output')}")
+    return 1, "; ".join(errors)
+
+
+def wav_file_ready(path: Path) -> bool:
+    try:
+        with wave.open(str(path), "rb") as wav:
+            return wav.getnchannels() == 1 and wav.getsampwidth() == 2 and wav.getnframes() > 0
+    except Exception:
+        return False
+
+
+def transcribe_wav(path: Path, model_dir: Path = VOSK_MODEL_DIR) -> tuple[int, str]:
+    if not module_available("vosk"):
+        return 3, "python-vosk is not installed. Run `ctos-voice setup-vosk --yes`."
+    if not vosk_model_ready(model_dir):
+        return 3, f"Vosk model is missing: {model_dir}. Run `ctos-voice setup-vosk --yes`."
+    if not path.exists():
+        return 2, f"audio file not found: {path}"
+    try:
+        from vosk import KaldiRecognizer, Model, SetLogLevel  # type: ignore
+    except Exception as exc:  # pragma: no cover - depends on optional package
+        return 3, f"failed to import vosk: {exc}"
+    try:
+        SetLogLevel(-1)
+        with wave.open(str(path), "rb") as wav:
+            if wav.getnchannels() != 1 or wav.getsampwidth() != 2:
+                return 2, "audio must be mono 16-bit PCM WAV"
+            recognizer = KaldiRecognizer(Model(str(model_dir)), wav.getframerate())
+            recognizer.SetWords(False)
+            parts: list[str] = []
+            while True:
+                data = wav.readframes(4000)
+                if len(data) == 0:
+                    break
+                if recognizer.AcceptWaveform(data):
+                    result = json.loads(recognizer.Result() or "{}").get("text", "")
+                    if result:
+                        parts.append(str(result))
+            final = json.loads(recognizer.FinalResult() or "{}").get("text", "")
+            if final:
+                parts.append(str(final))
+    except wave.Error as exc:
+        return 2, f"invalid WAV file: {exc}"
+    except Exception as exc:  # pragma: no cover - optional native model path
+        return 1, f"transcription failed: {exc}"
+    return 0, " ".join(part.strip() for part in parts if part.strip()).strip()
+
+
+def command_matches(normalized: str, tokens: tuple[str, ...]) -> bool:
+    return any(token in normalized for token in tokens)
+
+
+def command_has_all(normalized: str, tokens: tuple[str, ...]) -> bool:
+    return all(token in normalized for token in tokens)
+
+
+def run_ctos_ai_command(args: list[str], summary: str, no_speak: bool, timeout: float = 30.0) -> int:
+    proc = subprocess.run([str(SCRIPTS / "ctos-ai"), *args], check=False, capture_output=True, text=True, timeout=timeout)
+    if proc.stdout.strip():
+        print(proc.stdout.strip())
+    if proc.stderr.strip():
+        print(proc.stderr.strip(), file=sys.stderr)
+    if proc.returncode != 0 and not proc.stdout.strip() and not proc.stderr.strip():
+        print(f"ctos-ai {' '.join(args)} failed with rc={proc.returncode}", file=sys.stderr)
+    if proc.returncode == 0:
+        speak(summary, quiet=no_speak)
+    return int(proc.returncode)
+
+
+def save_agenda_proposal_from_voice(text: str, *, json_output: bool = False) -> tuple[int, dict[str, object] | str]:
+    command = [str(SCRIPTS / "ctos-ai"), "agenda-propose", text, "--save", "--source", "voice"]
+    if json_output:
+        command.append("--json")
+    proc = subprocess.run(command, check=False, capture_output=True, text=True, timeout=8)
+    if json_output:
+        try:
+            payload: dict[str, object] = json.loads(proc.stdout or "{}")
+        except json.JSONDecodeError:
+            payload = {
+                "stdout": proc.stdout,
+                "stderr": proc.stderr,
+            }
+        payload["rc"] = proc.returncode
+        if proc.stderr.strip():
+            payload["stderr"] = proc.stderr.strip()
+        return int(proc.returncode), payload
+    output = proc.stdout.strip()
+    if proc.stderr.strip():
+        output = f"{output}\n{proc.stderr.strip()}" if output else proc.stderr.strip()
+    return int(proc.returncode), output
+
+
+def print_voice_command_help(no_speak: bool) -> int:
+    print("CTOS voice commands")
+    print("===================")
+    for phrase, detail in VOICE_COMMAND_HELP:
+        print(f"{phrase:<30} {detail}")
+    speak("Commandes vocales disponibles affichees.", quiet=no_speak)
+    return 0
+
+
+def run_catalog_command(phrase: str, no_speak: bool) -> int | None:
+    plan = plan_text_action(phrase, source="voice", threshold=0.72)
+    if not plan.get("matched"):
+        return None
+    command = plan.get("command")
+    if not isinstance(command, list) or not command or command[0] != "ctos-ai":
+        print(f"Intent {plan.get('intent_id')} is not routed to a supported CTOS command.", file=sys.stderr)
+        return 2
+    if not plan.get("safe_to_execute"):
+        print(f"Intent {plan.get('intent_id')} is outside the safe voice tier.", file=sys.stderr)
+        return 2
+    print(
+        f"intent: {plan.get('intent_id')} score={plan.get('score')} phrase={plan.get('matched_phrase')}",
+        file=sys.stderr,
+    )
+    summary = str(plan.get("spoken_reply") or "Commande CTOS affichee.")
+    timeout = 35.0 if command[1:2] == ["open-desk"] else 30.0
+    return run_ctos_ai_command(command[1:], summary, no_speak, timeout=timeout)
+
+
+def route_transcript(
+    text: str,
+    *,
+    no_speak: bool,
+    json_output: bool = False,
+    execute_safe: bool = False,
+    save_agenda: bool = False,
+    threshold: float = 0.72,
+) -> int:
+    text = " ".join(text.split())
+    if not text:
+        print("transcript text is required", file=sys.stderr)
+        return 2
+    if execute_safe and save_agenda:
+        print("choose --save-agenda or --execute-safe, not both", file=sys.stderr)
+        return 2
+
+    plan = plan_text_action(text, source="voice", threshold=threshold)
+    command = plan.get("command") if isinstance(plan.get("command"), list) else []
+
+    if execute_safe:
+        if not plan.get("safe_to_execute"):
+            plan["execution"] = {
+                "attempted": False,
+                "rc": 2,
+                "reason": "plan is not safe for direct execution",
+            }
+            if json_output:
+                print(json.dumps(plan, ensure_ascii=False, indent=2))
+            else:
+                print(format_plan(plan))
+                print()
+                print("execution refused: plan is not safe for direct execution", file=sys.stderr)
+            speak("Action refusee. Verification manuelle necessaire.", quiet=no_speak)
+            return 2
+        if not command or command[0] != "ctos-ai":
+            print("execution refused: command is not owned by ctos-ai", file=sys.stderr)
+            return 2
+        if json_output:
+            result = subprocess.run(
+                [str(SCRIPTS / "ctos-ai"), *command[1:]],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=35.0 if command[1:2] == ["open-desk"] else 30.0,
+            )
+            plan["execution"] = {
+                "attempted": True,
+                "rc": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+            }
+            print(json.dumps(plan, ensure_ascii=False, indent=2))
+            return int(result.returncode)
+        summary = str(plan.get("spoken_reply") or "Commande CTOS executee.")
+        return run_ctos_ai_command(command[1:], summary, no_speak, timeout=35.0 if command[1:2] == ["open-desk"] else 30.0)
+
+    proposal = plan.get("agenda_proposal")
+    save_result: tuple[int, dict[str, object] | str] | None = None
+    if save_agenda:
+        if not isinstance(proposal, dict) or not proposal.get("recognized"):
+            plan["agenda_save"] = {
+                "attempted": False,
+                "rc": 2,
+                "reason": "no recognized agenda proposal",
+            }
+            if json_output:
+                print(json.dumps(plan, ensure_ascii=False, indent=2))
+            else:
+                print(format_plan(plan))
+                print()
+                print("agenda save refused: no recognized agenda proposal", file=sys.stderr)
+            speak("Je n'ai pas assez compris la proposition agenda.", quiet=no_speak)
+            return 2
+        save_result = save_agenda_proposal_from_voice(text, json_output=json_output)
+        if json_output:
+            plan["agenda_save"] = save_result[1]
+
+    if json_output:
+        print(json.dumps(plan, ensure_ascii=False, indent=2))
+    else:
+        print(format_plan(plan))
+        if save_result is not None:
+            print()
+            print(save_result[1])
+
+    if save_result is not None and save_result[0] == 0:
+        speak("Proposition agenda sauvegardee. Confirme-la avant ecriture.", quiet=no_speak)
+    elif isinstance(proposal, dict) and proposal.get("recognized"):
+        speak("Proposition agenda prete. Confirme la commande avant ecriture.", quiet=no_speak)
+    elif plan.get("safe_to_execute"):
+        speak(str(plan.get("spoken_reply") or "Commande CTOS reconnue."), quiet=no_speak)
+    else:
+        speak("Demande transcrite, mais aucune action automatique.", quiet=no_speak)
+    return save_result[0] if save_result is not None else 0
+
+
+def assistant_turn(
+    text: str,
+    *,
+    no_speak: bool,
+    json_output: bool = False,
+    model: str = "qwen2.5-coder:0.5b",
+    max_tokens: int = 180,
+    threshold: float = 0.72,
+    no_actions: bool = False,
+    save_agenda: bool = False,
+) -> int:
+    text = " ".join(text.split())
+    if not text:
+        print("transcript text is required", file=sys.stderr)
+        return 2
+
+    plan = plan_text_action(text, source="voice", threshold=threshold)
+    command = plan.get("command") if isinstance(plan.get("command"), list) else []
+    proposal = plan.get("agenda_proposal")
+    payload: dict[str, object] = {
+        "mode": "assistant",
+        "transcript": text,
+        "route": plan,
+        "assistant": None,
+        "execution": None,
+    }
+
+    if plan.get("safe_to_execute") and command and command[0] == "ctos-ai" and not no_actions:
+        timeout = 35.0 if command[1:2] == ["open-desk"] else 30.0
+        summary = str(plan.get("spoken_reply") or "Commande CTOS executee.")
+        if json_output:
+            result = subprocess.run(
+                [str(SCRIPTS / "ctos-ai"), *command[1:]],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            payload["execution"] = {
+                "attempted": True,
+                "rc": result.returncode,
+                "command": command,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+            }
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return int(result.returncode)
+        print(f"transcript: {text}")
+        print(f"assistant mode: safe CTOS action {plan.get('intent_id')}")
+        return run_ctos_ai_command(command[1:], summary, no_speak, timeout=timeout)
+
+    if isinstance(proposal, dict) and proposal.get("recognized"):
+        save_result: tuple[int, dict[str, object] | str] | None = None
+        if save_agenda:
+            save_result = save_agenda_proposal_from_voice(text, json_output=json_output)
+            payload["execution"] = {
+                "attempted": True,
+                "kind": "agenda_save",
+                "rc": save_result[0],
+                "result": save_result[1],
+            }
+        if json_output:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print(f"transcript: {text}")
+            print(format_plan(plan))
+            if save_result is not None:
+                print()
+                print(save_result[1])
+        if save_result is not None and save_result[0] == 0:
+            speak("Proposition agenda sauvegardee. Confirme-la avant ecriture.", quiet=no_speak)
+            return 0
+        if save_result is not None:
+            speak("La proposition agenda est comprise, mais la sauvegarde a echoue.", quiet=no_speak)
+            return save_result[0]
+        speak("Proposition agenda prete. Confirme la commande avant ecriture.", quiet=no_speak)
+        return 0
+
+    assistant_prompt = (
+        "Transcription vocale de l'operateur:\n"
+        f"{text}\n\n"
+        "Reponds comme CTOS Local, en francais, court et pratique. "
+        "Tu ne peux pas executer d'action depuis cette reponse. "
+        "Si la demande implique une action systeme, ne pretends pas agir: propose une etape CTOS sure."
+    )
+    rc, response = ask_ctos(assistant_prompt, model, max_tokens)
+    payload["assistant"] = {
+        "attempted": True,
+        "rc": rc,
+        "model": model,
+        "response": response,
+    }
+    if json_output:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(f"transcript: {text}")
+        print()
+        print(response)
+    if rc == 0:
+        speak(response, quiet=no_speak)
+    return rc
+
+
+def run_readonly_command(phrase: str, no_speak: bool) -> int:
+    phrase = phrase.strip().lower()
+    if not phrase:
+        print("command phrase is required", file=sys.stderr)
+        return 2
+    catalog_rc = run_catalog_command(phrase, no_speak)
+    if catalog_rc is not None:
+        return catalog_rc
+    normalized = normalize_voice_text(phrase)
+
+    if command_matches(normalized, ("aide", "help", "commande", "commandes", "possible", "possibles")):
+        return print_voice_command_help(no_speak)
+
+    if command_matches(normalized, ("brief", "status", "statut", "etat", "sante", "systeme")):
+        return run_ctos_ai_command(["brief"], "Brief CTOS affiche. Aucun lancement de processus demande.", no_speak)
+
+    if command_matches(normalized, ("plan", "agenda", "journee", "calendrier")):
+        return run_ctos_ai_command(["plan-day"], "Plan agenda affiche. Aucun lancement de processus demande.", no_speak)
+
+    if (
+        command_matches(normalized, ("desk", "desktop", "bureau"))
+        or command_has_all(normalized, ("ouvre", "tour"))
+        or command_has_all(normalized, ("repare", "tour"))
+    ):
+        return run_ctos_ai_command(
+            ["open-desk", "--wait", "20"],
+            "Ouverture ou reparation du bureau distant demandee.",
+            no_speak,
+            timeout=35,
+        )
+
+    if (
+        command_matches(normalized, ("vms", "vm", "machines", "machine", "virtuel", "virtuelle", "virtualisation"))
+        or command_matches(normalized, ("kali",))
+    ):
+        return run_ctos_ai_command(["open-vms"], "Panneau VMS ouvert. Aucune machine virtuelle n'a ete demarree.", no_speak)
+
+    if command_matches(normalized, ("approbation", "approbations", "validation", "validations", "approval", "approvals")):
+        return run_ctos_ai_command(["approvals"], "Approbations en attente affichees.", no_speak)
+
+    if command_matches(normalized, ("capacite", "capacites", "capabilities", "permissions", "droits")):
+        return run_ctos_ai_command(["capabilities"], "Capacites CTOS AI affichees.", no_speak)
+
+    message = "Commande non reconnue en V1. Dis aide pour afficher les commandes vocales disponibles."
+    print(message)
+    speak(message, quiet=no_speak)
+    return 3
+
+
+def normalize_voice_text(text: str) -> str:
+    decomposed = unicodedata.normalize("NFD", text.casefold())
+    return "".join(ch for ch in decomposed if unicodedata.category(ch) != "Mn")
+
+
+def cmd_probe(args: argparse.Namespace) -> int:
+    payload = voice_probe()
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    print("CTOS voice probe")
+    print("================")
+    print(f"output ready  {payload['voice_output_ready']}")
+    print(f"input ready   {payload['voice_input_ready']}")
+    print("speakers:")
+    for name, path in payload["speakers"].items():  # type: ignore[union-attr]
+        print(f"  {name:<14} {path or '-'}")
+    print("transcribers:")
+    for name, path in payload["transcribers"].items():  # type: ignore[union-attr]
+        print(f"  {name:<14} {path or '-'}")
+    print("vosk:")
+    vosk = payload["vosk"]  # type: ignore[assignment]
+    print(f"  python module  {payload['python_modules']['vosk']}")  # type: ignore[index]
+    print(f"  model ready    {vosk['model_ready']}")  # type: ignore[index]
+    print(f"  model dir      {vosk['model_dir']}")  # type: ignore[index]
+    print(f"note          {payload['note']}")
+    return 0
+
+
+def cmd_say(args: argparse.Namespace) -> int:
+    text = " ".join(args.text)
+    print(text)
+    return speak(text, quiet=args.no_speak, engine=args.engine)
+
+
+def cmd_render_wav(args: argparse.Namespace) -> int:
+    if args.stdin:
+        if args.text:
+            print("Use either --stdin or positional text, not both.", file=sys.stderr)
+            return 2
+        text = sys.stdin.read(2001)
+        if len(text) > 2000:
+            print("Piper stdin exceeds the 2000-character boundary.", file=sys.stderr)
+            return 2
+    else:
+        text = " ".join(args.text)
+    if args.engine != "piper":
+        print("Browser WAV rendering requires the explicit Piper engine.", file=sys.stderr)
+        return 2
+    output = Path(args.output).expanduser()
+    return render_piper_wav(text, output)
+
+
+def cmd_tts_probe(args: argparse.Namespace) -> int:
+    payload = voice_probe()["tts"]  # type: ignore[index]
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    piper = payload["piper"]  # type: ignore[index]
+    print("CTOS TTS probe")
+    print("==============")
+    print(f"default engine  {payload['default_engine']}")  # type: ignore[index]
+    print(f"piper ready     {piper['ready']}")  # type: ignore[index]
+    print(f"piper binary    {piper['binary'] or '-'}")  # type: ignore[index]
+    print(f"piper voice     {piper['voice']}")  # type: ignore[index]
+    print(f"model ready     {piper['model_ready']}")  # type: ignore[index]
+    print(f"model path      {piper['model']}")  # type: ignore[index]
+    print(f"config ready    {piper['config_ready']}")  # type: ignore[index]
+    print(f"config path     {piper['config']}")  # type: ignore[index]
+    print("existing fallback engines:")
+    for name, path in voice_probe()["speakers"].items():  # type: ignore[union-attr]
+        print(f"  {name:<10} {path or '-'}")
+    return 0
+
+
+def piper_setup_commands() -> list[list[str]]:
+    return [
+        [sys.executable, "-m", "venv", str(PIPER_VENV)],
+        [str(PIPER_VENV / "bin" / "python"), "-m", "pip", "install", "--upgrade", "pip"],
+        [str(PIPER_VENV / "bin" / "python"), "-m", "pip", "install", "piper-tts"],
+        ["mkdir", "-p", str(PIPER_VOICE_DIR)],
+        ["curl", "-fL", "--retry", "3", "-o", str(PIPER_MODEL), PIPER_MODEL_URL],
+        ["curl", "-fL", "--retry", "3", "-o", str(PIPER_CONFIG), PIPER_CONFIG_URL],
+        [str(ROOT / "scripts" / "ctos-voice"), "tts-probe"],
+        [str(ROOT / "scripts" / "ctos-voice"), "tts-test", "--engine", "piper"],
+    ]
+
+
+def cmd_setup_piper(args: argparse.Namespace) -> int:
+    commands = piper_setup_commands()
+    if args.print_commands:
+        print("\n".join(shell_join(command) for command in commands))
+        return 0
+    if not args.yes:
+        print("This installs Piper in a local user venv and downloads a French voice outside the repo.")
+        print("Inspect first with `ctos-voice setup-piper --print-commands`.")
+        print("Run with `ctos-voice setup-piper --yes` only when ready.")
+        return 2
+    if not PIPER_MODEL_URL or not PIPER_CONFIG_URL:
+        print(
+            "Custom Piper voice requires CTOS_VOICE_PIPER_MODEL_URL and CTOS_VOICE_PIPER_CONFIG_URL.",
+            file=sys.stderr,
+        )
+        return 2
+    PIPER_VENV.parent.mkdir(parents=True, exist_ok=True)
+    PIPER_VOICE_DIR.mkdir(parents=True, exist_ok=True)
+    if not (PIPER_VENV / "bin" / "python").exists():
+        create = subprocess.run([sys.executable, "-m", "venv", str(PIPER_VENV)], check=False)
+        if create.returncode != 0:
+            return int(create.returncode)
+    venv_python = PIPER_VENV / "bin" / "python"
+    install_steps = [
+        [str(venv_python), "-m", "pip", "install", "--upgrade", "pip"],
+        [str(venv_python), "-m", "pip", "install", "piper-tts"],
+    ]
+    for command in install_steps:
+        proc = subprocess.run(command, check=False)
+        if proc.returncode != 0:
+            return int(proc.returncode)
+    if not shutil.which("curl"):
+        print("curl is required for Piper voice download.", file=sys.stderr)
+        return 3
+    downloads = [
+        (PIPER_MODEL, PIPER_MODEL_URL),
+        (PIPER_CONFIG, PIPER_CONFIG_URL),
+    ]
+    for path, url in downloads:
+        if path.exists() and path.stat().st_size > 0:
+            continue
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        tmp_path.unlink(missing_ok=True)
+        proc = subprocess.run(["curl", "-fL", "--retry", "3", "-o", str(tmp_path), url], check=False)
+        if proc.returncode != 0:
+            tmp_path.unlink(missing_ok=True)
+            return int(proc.returncode)
+        tmp_path.replace(path)
+    payload = voice_probe()["tts"]  # type: ignore[index]
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0 if piper_ready() else 4
+
+
+def cmd_tts_test(args: argparse.Namespace) -> int:
+    phrases = args.text or [
+        "Bonjour. Je suis CTOS. Test de voix locale.",
+        "Etat du systeme pret.",
+        "J'attends votre prochaine instruction.",
+    ]
+    rc = 0
+    for phrase in phrases:
+        print(f"[{args.engine}] {phrase}")
+        current = speak(phrase, quiet=args.no_speak, engine=args.engine)
+        if current != 0:
+            rc = current
+            break
+    return rc
+
+
+def cmd_ask(args: argparse.Namespace) -> int:
+    prompt = " ".join(args.prompt).strip()
+    if not prompt:
+        print("prompt is required", file=sys.stderr)
+        return 2
+    rc, response = ask_ctos(prompt, args.model, args.max_tokens)
+    print(response)
+    if rc == 0:
+        speak(response, quiet=args.no_speak)
+    return rc
+
+
+def cmd_command(args: argparse.Namespace) -> int:
+    return run_readonly_command(" ".join(args.phrase), args.no_speak)
+
+
+def cmd_route(args: argparse.Namespace) -> int:
+    return route_transcript(
+        " ".join(args.phrase),
+        no_speak=args.no_speak,
+        json_output=args.json,
+        execute_safe=args.execute_safe,
+        save_agenda=args.save_agenda,
+        threshold=args.threshold,
+    )
+
+
+def cmd_assistant(args: argparse.Namespace) -> int:
+    return assistant_turn(
+        " ".join(args.phrase),
+        no_speak=args.no_speak,
+        json_output=args.json,
+        model=args.model,
+        max_tokens=args.max_tokens,
+        threshold=args.threshold,
+        no_actions=args.no_actions,
+        save_agenda=args.save_agenda,
+    )
+
+
+def cmd_chat(args: argparse.Namespace) -> int:
+    command = [
+        str(SCRIPTS / "ctos-ai-chat"),
+        "--model",
+        args.model,
+        "--max-tokens",
+        str(args.max_tokens),
+    ]
+    if not args.no_speak:
+        command.append("--speak")
+    if args.prompt:
+        command.extend(args.prompt)
+    proc = subprocess.run(command, check=False)
+    return int(proc.returncode)
+
+
+def cmd_listen_once(args: argparse.Namespace) -> int:
+    payload = voice_probe()
+    if not payload["voice_input_ready"]:
+        print("No verified local speech-to-text backend is available yet.")
+        print("Run `ctos-voice setup-vosk --yes`, then retry `ctos-voice listen-once`.")
+        return 3
+    keep_path: Path | None = None
+    if args.from_wav:
+        audio_path = Path(args.from_wav).expanduser()
+        keep_path = audio_path
+    elif args.keep_wav:
+        keep_path = Path(args.keep_wav).expanduser()
+        audio_path = keep_path
+    else:
+        handle = tempfile.NamedTemporaryFile(prefix="ctos-voice-", suffix=".wav", delete=False, dir="/tmp")
+        handle.close()
+        audio_path = Path(handle.name)
+    try:
+        if not args.from_wav:
+            rc, detail = record_audio(args.seconds, audio_path)
+            if rc != 0:
+                print(detail, file=sys.stderr)
+                return rc
+        rc, transcript = transcribe_wav(audio_path)
+        if rc != 0:
+            print(transcript, file=sys.stderr)
+            return rc
+        if not transcript:
+            message = "Je n'ai pas compris. Retente avec une phrase courte."
+            print("transcript:")
+            print(message)
+            speak(message, quiet=args.no_speak)
+            return 4
+        print(f"transcript: {transcript}")
+        rc, response = ask_ctos(transcript, args.model, args.max_tokens)
+        print(response)
+        if rc == 0:
+            speak(response, quiet=args.no_speak)
+        return rc
+    finally:
+        if keep_path is None:
+            audio_path.unlink(missing_ok=True)
+
+
+def cmd_voice_command(args: argparse.Namespace) -> int:
+    payload = voice_probe()
+    if not payload["voice_input_ready"]:
+        print("No verified local speech-to-text backend is available yet.")
+        print("Run `ctos-voice setup-vosk --yes`, then retry `ctos-voice voice-command`.")
+        return 3
+    if args.from_wav:
+        audio_path = Path(args.from_wav).expanduser()
+        delete_after = False
+    else:
+        handle = tempfile.NamedTemporaryFile(prefix="ctos-voice-command-", suffix=".wav", delete=False, dir="/tmp")
+        handle.close()
+        audio_path = Path(handle.name)
+        delete_after = True
+    try:
+        if not args.from_wav:
+            rc, detail = record_audio(args.seconds, audio_path)
+            if rc != 0:
+                print(detail, file=sys.stderr)
+                return rc
+        rc, transcript = transcribe_wav(audio_path)
+        if rc != 0:
+            print(transcript, file=sys.stderr)
+            return rc
+        print(f"transcript: {transcript}")
+        return run_readonly_command(transcript, args.no_speak)
+    finally:
+        if delete_after:
+            audio_path.unlink(missing_ok=True)
+
+
+def cmd_route_once(args: argparse.Namespace) -> int:
+    payload = voice_probe()
+    if not args.from_wav and not payload["voice_input_ready"]:
+        print("No verified local speech-to-text backend is available yet.")
+        print("Run `ctos-voice setup-vosk --yes`, then retry `ctos-voice route-once`.")
+        return 3
+    if args.from_wav:
+        audio_path = Path(args.from_wav).expanduser()
+        delete_after = False
+    else:
+        handle = tempfile.NamedTemporaryFile(prefix="ctos-voice-route-", suffix=".wav", delete=False, dir="/tmp")
+        handle.close()
+        audio_path = Path(handle.name)
+        delete_after = True
+    try:
+        if not args.from_wav:
+            rc, detail = record_audio(args.seconds, audio_path)
+            if rc != 0:
+                print(detail, file=sys.stderr)
+                return rc
+        rc, transcript = transcribe_wav(audio_path)
+        if rc != 0:
+            print(transcript, file=sys.stderr)
+            return rc
+        if not args.json:
+            print(f"transcript: {transcript}")
+        return route_transcript(
+            transcript,
+            no_speak=args.no_speak,
+            json_output=args.json,
+            execute_safe=args.execute_safe,
+            save_agenda=args.save_agenda,
+            threshold=args.threshold,
+        )
+    finally:
+        if delete_after:
+            audio_path.unlink(missing_ok=True)
+
+
+def cmd_assistant_once(args: argparse.Namespace) -> int:
+    payload = voice_probe()
+    if not args.from_wav and not payload["voice_input_ready"]:
+        print("No verified local speech-to-text backend is available yet.")
+        print("Run `ctos-voice setup-vosk --yes`, then retry `ctos-voice assistant-once`.")
+        return 3
+    if args.from_wav:
+        audio_path = Path(args.from_wav).expanduser()
+        delete_after = False
+    else:
+        handle = tempfile.NamedTemporaryFile(prefix="ctos-voice-assistant-", suffix=".wav", delete=False, dir="/tmp")
+        handle.close()
+        audio_path = Path(handle.name)
+        delete_after = True
+    try:
+        if not args.from_wav:
+            rc, detail = record_audio(args.seconds, audio_path)
+            if rc != 0:
+                print(detail, file=sys.stderr)
+                return rc
+        rc, transcript = transcribe_wav(audio_path)
+        if rc != 0:
+            print(transcript, file=sys.stderr)
+            return rc
+        return assistant_turn(
+            transcript,
+            no_speak=args.no_speak,
+            json_output=args.json,
+            model=args.model,
+            max_tokens=args.max_tokens,
+            threshold=args.threshold,
+            no_actions=args.no_actions,
+            save_agenda=args.save_agenda,
+        )
+    finally:
+        if delete_after:
+            audio_path.unlink(missing_ok=True)
+
+
+def cmd_record_once(args: argparse.Namespace) -> int:
+    out_path = Path(args.out).expanduser()
+    rc, detail = record_audio(args.seconds, out_path)
+    if args.json:
+        print(json.dumps({"ok": rc == 0, "path": str(out_path), "detail": detail}, ensure_ascii=False, indent=2))
+    elif rc == 0:
+        print(f"recorded {out_path}")
+    else:
+        print(detail, file=sys.stderr)
+    return rc
+
+
+def cmd_transcribe_file(args: argparse.Namespace) -> int:
+    rc, transcript = transcribe_wav(Path(args.file).expanduser())
+    if args.json:
+        print(json.dumps({"ok": rc == 0, "text": transcript}, ensure_ascii=False, indent=2))
+    else:
+        print(transcript)
+    return rc
+
+
+def cmd_setup_vosk(args: argparse.Namespace) -> int:
+    commands = [
+        "sudo pacman -S --needed python-vosk vosk-api",
+        f"python3 -m venv {VOSK_VENV}",
+        f"{VOSK_VENV}/bin/python -m pip install --upgrade pip",
+        f"{VOSK_VENV}/bin/python -m pip install vosk",
+        f"mkdir -p {STT_HOME}",
+        f"curl -fL --retry 3 -o /tmp/{VOSK_MODEL_NAME}.zip {VOSK_MODEL_URL}",
+        f"python3 -m zipfile -e /tmp/{VOSK_MODEL_NAME}.zip {STT_HOME}",
+        f"rm -f /tmp/{VOSK_MODEL_NAME}.zip",
+        "ctos-voice probe",
+    ]
+    if args.print_commands:
+        if args.model_only:
+            print("\n".join(commands[4:8] + [commands[-1]]))
+        elif args.venv:
+            print("\n".join(commands[1:]))
+        else:
+            print("\n".join([commands[0]] + commands[4:]))
+        return 0
+    if not args.yes:
+        if args.model_only:
+            print("This downloads the Vosk French small model outside the repo.")
+        else:
+            print("This installs Arch packages and downloads the Vosk French small model outside the repo.")
+        print("Re-run with `ctos-voice setup-vosk --yes` or inspect with `--print-commands`.")
+        return 2
+    if args.venv and not module_available("vosk"):
+        VOSK_VENV.parent.mkdir(parents=True, exist_ok=True)
+        create = subprocess.run([sys.executable, "-m", "venv", str(VOSK_VENV)], check=False)
+        if create.returncode != 0:
+            return create.returncode
+        venv_python = VOSK_VENV / "bin" / "python"
+        upgrade = subprocess.run([str(venv_python), "-m", "pip", "install", "--upgrade", "pip"], check=False)
+        if upgrade.returncode != 0:
+            return upgrade.returncode
+        install = subprocess.run([str(venv_python), "-m", "pip", "install", "vosk"], check=False)
+        if install.returncode != 0:
+            return install.returncode
+        add_vosk_venv_to_path()
+    if not args.model_only and not args.venv and not module_available("vosk"):
+        if not shutil.which("sudo") or not shutil.which("pacman"):
+            print("setup-vosk expects sudo and pacman on EndeavourOS/Arch when python-vosk is missing.", file=sys.stderr)
+            return 3
+        install = subprocess.run(["sudo", "pacman", "-S", "--needed", "python-vosk", "vosk-api"], check=False)
+        if install.returncode != 0:
+            return install.returncode
+    if not vosk_model_ready():
+        if not shutil.which("curl"):
+            print("curl is required for the model download.", file=sys.stderr)
+            return 3
+        STT_HOME.mkdir(parents=True, exist_ok=True)
+        zip_path = Path("/tmp") / f"{VOSK_MODEL_NAME}.zip"
+        download = subprocess.run(["curl", "-fL", "--retry", "3", "-o", str(zip_path), VOSK_MODEL_URL], check=False)
+        if download.returncode != 0:
+            zip_path.unlink(missing_ok=True)
+            return download.returncode
+        try:
+            with zipfile.ZipFile(zip_path) as archive:
+                archive.extractall(STT_HOME)
+        except zipfile.BadZipFile as exc:
+            zip_path.unlink(missing_ok=True)
+            print(f"invalid Vosk model zip: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            zip_path.unlink(missing_ok=True)
+    payload = voice_probe()
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    if args.model_only:
+        return 0 if payload["vosk"]["model_ready"] else 4  # type: ignore[index]
+    return 0 if payload["voice_input_ready"] else 4
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="CTOS voice V1: typed chat, spoken replies, and Vosk push-to-talk")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    probe = sub.add_parser("probe", help="show local voice input/output capabilities")
+    probe.add_argument("--json", action="store_true")
+    probe.set_defaults(func=cmd_probe)
+
+    say = sub.add_parser("say", help="speak text using the first available local TTS command")
+    say.add_argument("text", nargs="+")
+    say.add_argument("--engine", choices=["auto", "piper", "spd-say", "espeak-ng", "espeak"], default=os.environ.get("CTOS_VOICE_ENGINE", "auto"))
+    say.add_argument("--no-speak", action="store_true")
+    say.set_defaults(func=cmd_say)
+
+    render_wav = sub.add_parser("render-wav", help="render Piper speech to a WAV file without playback")
+    render_wav.add_argument("--engine", choices=["piper"], default="piper")
+    render_wav.add_argument("--output", required=True)
+    render_wav.add_argument("--stdin", action="store_true", help="read bounded speech text from stdin")
+    render_wav.add_argument("text", nargs="*")
+    render_wav.set_defaults(func=cmd_render_wav)
+
+    tts_probe = sub.add_parser("tts-probe", help="show local TTS engine readiness")
+    tts_probe.add_argument("--json", action="store_true")
+    tts_probe.set_defaults(func=cmd_tts_probe)
+
+    setup_piper = sub.add_parser("setup-piper", help="install Piper TTS in a local venv and download the default French voice")
+    setup_piper.add_argument("--yes", action="store_true")
+    setup_piper.add_argument("--print-commands", action="store_true")
+    setup_piper.set_defaults(func=cmd_setup_piper)
+
+    tts_test = sub.add_parser("tts-test", help="run a short local TTS A/B test")
+    tts_test.add_argument("--engine", choices=["auto", "piper", "spd-say", "espeak-ng", "espeak"], default=os.environ.get("CTOS_VOICE_ENGINE", "auto"))
+    tts_test.add_argument("--no-speak", action="store_true")
+    tts_test.add_argument("text", nargs="*")
+    tts_test.set_defaults(func=cmd_tts_test)
+
+    ask = sub.add_parser("ask", help="ask CTOS Local and speak the response")
+    ask.add_argument("prompt", nargs="+")
+    ask.add_argument("--model", default="qwen2.5-coder:0.5b")
+    ask.add_argument("--max-tokens", type=int, default=120)
+    ask.add_argument("--no-speak", action="store_true")
+    ask.set_defaults(func=cmd_ask)
+
+    command = sub.add_parser("command", help="run a tiny read-only voice-command intent")
+    command.add_argument("phrase", nargs="+")
+    command.add_argument("--no-speak", action="store_true")
+    command.set_defaults(func=cmd_command)
+
+    route = sub.add_parser("route", help="route typed transcript text through the CTOS planner")
+    route.add_argument("phrase", nargs="+")
+    route.add_argument("--threshold", type=float, default=0.72)
+    route.add_argument("--execute-safe", action="store_true", help="execute only safe Tier 0/1 ctos-ai commands")
+    route.add_argument("--save-agenda", action="store_true", help="store a recognized agenda proposal without writing agenda state")
+    route.add_argument("--json", action="store_true")
+    route.add_argument("--no-speak", action="store_true")
+    route.set_defaults(func=cmd_route)
+
+    assistant = sub.add_parser("assistant", help="route typed transcript text, then fall back to bounded CTOS Local chat")
+    assistant.add_argument("phrase", nargs="+")
+    assistant.add_argument("--model", default="qwen2.5-coder:0.5b")
+    assistant.add_argument("--max-tokens", type=int, default=180)
+    assistant.add_argument("--threshold", type=float, default=0.72)
+    assistant.add_argument("--no-actions", action="store_true", help="do not execute even safe CTOS command intents")
+    assistant.add_argument("--save-agenda", action="store_true", help="store a recognized agenda proposal without writing agenda state")
+    assistant.add_argument("--json", action="store_true")
+    assistant.add_argument("--no-speak", action="store_true")
+    assistant.set_defaults(func=cmd_assistant)
+
+    chat = sub.add_parser("chat", help="typed local chat loop with spoken replies")
+    chat.add_argument("prompt", nargs="*", help="optional one-shot prompt; omit for REPL")
+    chat.add_argument("--model", default="qwen2.5-coder:0.5b")
+    chat.add_argument("--max-tokens", type=int, default=180)
+    chat.add_argument("--no-speak", action="store_true")
+    chat.set_defaults(func=cmd_chat)
+
+    listen_once = sub.add_parser("listen-once", help="record one phrase, transcribe it, and ask CTOS Local")
+    listen_once.add_argument("--seconds", type=float, default=4.0)
+    listen_once.add_argument("--model", default="qwen2.5-coder:0.5b")
+    listen_once.add_argument("--max-tokens", type=int, default=160)
+    listen_once.add_argument("--no-speak", action="store_true")
+    listen_once.add_argument("--keep-wav", help="keep the recorded WAV at this path for debugging")
+    listen_once.add_argument("--from-wav", help="debug: use an existing WAV instead of recording the microphone")
+    listen_once.set_defaults(func=cmd_listen_once)
+
+    voice_command = sub.add_parser("voice-command", help="push-to-talk read-only command intent")
+    voice_command.add_argument("--seconds", type=float, default=3.0)
+    voice_command.add_argument("--no-speak", action="store_true")
+    voice_command.add_argument("--from-wav", help="debug: use an existing WAV instead of recording the microphone")
+    voice_command.set_defaults(func=cmd_voice_command)
+
+    route_once = sub.add_parser("route-once", help="push-to-talk transcript routing without direct mutation")
+    route_once.add_argument("--seconds", type=float, default=4.0)
+    route_once.add_argument("--threshold", type=float, default=0.72)
+    route_once.add_argument("--execute-safe", action="store_true", help="execute only safe Tier 0/1 ctos-ai commands")
+    route_once.add_argument("--save-agenda", action="store_true", help="store a recognized agenda proposal without writing agenda state")
+    route_once.add_argument("--json", action="store_true")
+    route_once.add_argument("--no-speak", action="store_true")
+    route_once.add_argument("--from-wav", help="debug: use an existing WAV instead of recording the microphone")
+    route_once.set_defaults(func=cmd_route_once)
+
+    assistant_once = sub.add_parser("assistant-once", help="push-to-talk assistant: CTOS action first, bounded local chat fallback")
+    assistant_once.add_argument("--seconds", type=float, default=4.0)
+    assistant_once.add_argument("--model", default="qwen2.5-coder:0.5b")
+    assistant_once.add_argument("--max-tokens", type=int, default=180)
+    assistant_once.add_argument("--threshold", type=float, default=0.72)
+    assistant_once.add_argument("--no-actions", action="store_true", help="do not execute even safe CTOS command intents")
+    assistant_once.add_argument("--save-agenda", action="store_true", help="store a recognized agenda proposal without writing agenda state")
+    assistant_once.add_argument("--json", action="store_true")
+    assistant_once.add_argument("--no-speak", action="store_true")
+    assistant_once.add_argument("--from-wav", help="debug: use an existing WAV instead of recording the microphone")
+    assistant_once.set_defaults(func=cmd_assistant_once)
+
+    record_once = sub.add_parser("record-once", help="record a short mono WAV sample")
+    record_once.add_argument("--seconds", type=float, default=3.0)
+    record_once.add_argument("--out", default="/tmp/ctos-voice-once.wav")
+    record_once.add_argument("--json", action="store_true")
+    record_once.set_defaults(func=cmd_record_once)
+
+    transcribe_file = sub.add_parser("transcribe-file", help="transcribe a WAV file with the local Vosk model")
+    transcribe_file.add_argument("file")
+    transcribe_file.add_argument("--json", action="store_true")
+    transcribe_file.set_defaults(func=cmd_transcribe_file)
+
+    setup_vosk = sub.add_parser("setup-vosk", help="install python-vosk and download the small French Vosk model")
+    setup_vosk.add_argument("--yes", action="store_true")
+    setup_vosk.add_argument("--print-commands", action="store_true")
+    setup_vosk.add_argument("--model-only", action="store_true", help="download/extract only the Vosk model; do not run pacman")
+    setup_vosk.add_argument("--venv", action="store_true", help="install Python Vosk into a local user venv instead of pacman")
+    setup_vosk.set_defaults(func=cmd_setup_vosk)
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

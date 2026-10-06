@@ -1,0 +1,232 @@
+{
+  "schema_version": 1,
+  "updated": "2026-07-10",
+  "active_profile": null,
+  "selection_policy": {
+    "default": "none",
+    "reason": "CTOS has a deterministic tool and approval boundary. Ollama is installed, smoke-benchmarked, reachable through a bounded ask-local command, and exposed through a localhost-only T480 API tunnel, but no model runtime is selected as an autonomous assistant backend yet.",
+    "requirements_before_activation": [
+      "document the secrets and connector boundary for external APIs",
+      "decide the V1 interaction surface before selecting a default backend",
+      "choose a local model routing policy between 0.5B speed and 1.5B quality",
+      "keep Tier 2 CTOS tools behind the approval queue",
+      "keep Tier 3 operations manual",
+      "avoid broad shell, filesystem, or desktop authority for the model"
+    ]
+  },
+  "profiles": [
+    {
+      "id": "openai-responses-api",
+      "label": "OpenAI Responses API",
+      "kind": "external_frontier",
+      "target_node": "external",
+      "interface": "responses_api",
+      "status": "candidate",
+      "readiness": "blocked_by_secrets_policy",
+      "endpoint": "https://api.openai.com/v1/responses",
+      "secret_env": [
+        "OPENAI_API_KEY"
+      ],
+      "fit": [
+        "frontier coding and reasoning",
+        "tool-calling orchestration",
+        "low local hardware load"
+      ],
+      "constraints": [
+        "cloud/API dependency",
+        "cost and account limits",
+        "requires a privacy decision before personal memory or private context routing"
+      ],
+      "ctos_role": "future model-backed planner/operator behind the CTOS tool approval queue",
+      "next_probe": "add a dry-run adapter that validates config and env only; do not send personal context yet",
+      "sources": [
+        "https://platform.openai.com/docs/api-reference/responses"
+      ]
+    },
+    {
+      "id": "ollama-core-local",
+      "label": "Ollama on ctos-core",
+      "kind": "local_runtime",
+      "target_node": "ctos-core",
+      "interface": "ollama_api",
+      "status": "local_api_verified",
+      "readiness": "ready",
+      "endpoint": "http://127.0.0.1:11434",
+      "secret_env": [],
+      "fit": [
+        "private/offline local models",
+        "simple local HTTP API",
+        "OpenAI-compatible surface for some clients"
+      ],
+      "constraints": [
+        "model quality depends on hardware and quantization",
+        "model quality depends on selected model size",
+        "service is localhost-only on ctos-core and must stay tunneled or local"
+      ],
+      "ctos_role": "local assistant/worker runtime for bounded prompt calls, fast API calls, and future UI/voice layers",
+      "next_probe": "choose a speech-to-text backend and keep 0.5B as the fast default while 1.5B handles deliberate coding prompts",
+      "sources": [
+        "https://docs.ollama.com/api",
+        "https://docs.ollama.com/openai"
+      ]
+    },
+    {
+      "id": "llama-cpp-core-server",
+      "label": "llama.cpp server on ctos-core",
+      "kind": "local_runtime",
+      "target_node": "ctos-core",
+      "interface": "openai_compatible_local_server",
+      "status": "advanced_local_candidate",
+      "readiness": "deferred_until_model_storage",
+      "endpoint": "http://127.0.0.1:8080/v1",
+      "secret_env": [],
+      "fit": [
+        "GGUF and quantized models",
+        "fine-grained CPU/GPU/offload control",
+        "OpenAI-compatible local API"
+      ],
+      "constraints": [
+        "more operational tuning than Ollama",
+        "package or build path must be documented",
+        "needs model download and storage policy"
+      ],
+      "ctos_role": "future tuned local runtime for worker jobs where Ollama is too opaque",
+      "next_probe": "compare against Ollama only after core storage and GPU path are stable",
+      "sources": [
+        "https://github.com/ggml-org/llama.cpp/tree/master/tools/server"
+      ]
+    },
+    {
+      "id": "glm-5-2-external",
+      "label": "GLM-5.2 external/provider profile",
+      "kind": "external_frontier",
+      "target_node": "external",
+      "interface": "provider_api",
+      "status": "future_candidate",
+      "readiness": "not_local_target",
+      "endpoint": null,
+      "secret_env": [],
+      "fit": [
+        "frontier-scale reasoning and coding candidate",
+        "possible long-context planning backend"
+      ],
+      "constraints": [
+        "not a realistic local T480 or ctos-core runtime today",
+        "provider access, privacy, cost, and latency need a separate decision"
+      ],
+      "ctos_role": "future optional frontier backend behind the same CTOS approval queue",
+      "next_probe": "track provider access and pricing; do not install as a local runtime",
+      "sources": [
+        "https://github.com/zai-org/GLM-5"
+      ]
+    },
+    {
+      "id": "airllm-core-experiment",
+      "label": "AirLLM offload experiment",
+      "kind": "experimental_offload",
+      "target_node": "ctos-core",
+      "interface": "python_library",
+      "status": "lab_only",
+      "readiness": "not_interactive_runtime",
+      "endpoint": null,
+      "secret_env": [],
+      "fit": [
+        "layer-wise and disk-offload experiments under limited VRAM",
+        "offline batch inference experiments"
+      ],
+      "constraints": [
+        "not chosen for always-on Jarvis",
+        "requires an isolated venv and benchmark",
+        "may be slow or fragile for interactive work"
+      ],
+      "ctos_role": "future offline batch experiment, not the V1 assistant surface",
+      "next_probe": "only test in a venv under /srv/ctos after storage policy is done",
+      "sources": [
+        "https://github.com/lyogavin/airllm",
+        "https://pypi.org/project/airllm/"
+      ]
+    },
+    {
+      "id": "aider-cli-local",
+      "label": "Aider CLI cheap coding lane",
+      "kind": "coding_cli",
+      "target_node": "t480-local",
+      "interface": "cli_coding_assistant",
+      "status": "candidate_not_installed",
+      "readiness": "blocked_by_install_decision",
+      "endpoint": null,
+      "binary": "aider",
+      "secret_env": [],
+      "fit": [
+        "operator-invoked coding drafts and small edits",
+        "git-aware workflow with explicit file scope",
+        "can target local Ollama or an OpenAI-compatible proxy later"
+      ],
+      "constraints": [
+        "not a free frontier model by itself",
+        "must be installed in an isolated user environment, not globally",
+        "must start on small explicit file sets; no full-repo auto-context by default"
+      ],
+      "ctos_role": "optional local coding assistant client for cheap drafts, never an autonomous CTOS authority",
+      "next_probe": "test command generation and isolated install path before allowing it near private repo context",
+      "sources": [
+        "https://github.com/Aider-AI/aider",
+        "https://aider.chat/docs/"
+      ]
+    },
+    {
+      "id": "9router-local-proxy",
+      "label": "9Router local OpenAI-compatible proxy",
+      "kind": "external_router_proxy",
+      "target_node": "t480-local",
+      "interface": "openai_compatible_proxy",
+      "status": "candidate_not_installed",
+      "readiness": "blocked_by_privacy_secrets_policy",
+      "endpoint": "http://127.0.0.1:20128/v1",
+      "binary": "9router",
+      "secret_env": [],
+      "fit": [
+        "free/cheap provider routing behind OpenAI-compatible clients",
+        "token-saving and fallback experiments",
+        "possible backend for Aider or other coding clients"
+      ],
+      "constraints": [
+        "routes prompts to external providers",
+        "provider keys/accounts and privacy policy must be explicit",
+        "no secrets, browser state, or full private repo context until reviewed"
+      ],
+      "ctos_role": "optional cost router behind the CTOS cheap lane, not a trust or execution boundary",
+      "next_probe": "sandbox install and send only synthetic prompts before private CTOS context",
+      "sources": [
+        "https://github.com/decolua/9router"
+      ]
+    },
+    {
+      "id": "agent-reach-local-tools",
+      "label": "Agent-Reach read/search capability layer",
+      "kind": "research_toolkit",
+      "target_node": "t480-local",
+      "interface": "capability_toolkit",
+      "status": "candidate_not_installed",
+      "readiness": "blocked_by_cookie_privacy_policy",
+      "endpoint": null,
+      "binary": "agent-reach",
+      "secret_env": [],
+      "fit": [
+        "research and source gathering for agents",
+        "GitHub/web/RSS/YouTube read helpers",
+        "dry-run capability checks"
+      ],
+      "constraints": [
+        "not a coding model",
+        "some channels can depend on cookies or browser sessions",
+        "must stay read-only and scoped to public/approved sources first"
+      ],
+      "ctos_role": "optional read capability layer feeding summaries to CTOS, never shell authority",
+      "next_probe": "run doctor/dry-run only, without cookies, before any personal browser integration",
+      "sources": [
+        "https://github.com/Panniantong/Agent-Reach"
+      ]
+    }
+  ]
+}

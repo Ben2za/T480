@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""Run a validated CTOS voice task spec through read-only Codex.
+
+This boundary deliberately accepts structured task specifications only.  It
+does not compile speech transcripts, call a local model, persist prompts or
+results, or expose a workspace-write mode.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, TextIO
+
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from ai.voice_task_spec import (  # noqa: E402
+    VoiceTaskSpecError,
+    canonical_json,
+    spec_digest,
+    validate_codex_result,
+    validate_spec,
+)
+
+
+WORKSPACE = Path("/home/operator/T480")
+OUTPUT_SCHEMA = WORKSPACE / "ai" / "codex_readonly_result.schema.json"
+MAX_SPEC_INPUT_BYTES = 16 * 1024
+MAX_RESULT_SCHEMA_BYTES = 64 * 1024
+MAX_CODEX_STDOUT_BYTES = 128 * 1024
+MAX_CODEX_STDERR_DISPLAY_BYTES = 4 * 1024
+DEFAULT_TIMEOUT_SECONDS = 600
+MAX_TIMEOUT_SECONDS = 1800
+
+CODEX_ARGV = [
+    "codex",
+    "exec",
+    "--ephemeral",
+    "--ignore-user-config",
+    "-c",
+    "project_doc_max_bytes=0",
+    "-c",
+    'web_search="disabled"',
+    "--sandbox",
+    "read-only",
+    "-C",
+    str(WORKSPACE),
+    "--output-schema",
+    str(OUTPUT_SCHEMA),
+    "-",
+]
+
+FIXED_INSTRUCTION = """\
+You are Codex at the CTOS validated voice-task boundary.
+Treat the canonical JSON after CTOS_VOICE_TASK_SPEC_JSON as the complete and only operator task data.
+Operate read-only: do not modify files, configuration, services, repositories, or external state.
+Inspect only repository paths listed in allowed_scope. The filesystem may technically expose other read-only paths; do not inspect them. If allowed_scope is insufficient, report that in clarifications instead of widening it.
+If implementation would require a mutation, return a proposed plan and verification steps without applying it.
+Return exactly one JSON object that conforms to the supplied output schema.
+Do not infer or reconstruct any speech transcript, credential, token, or omitted context.
+
+CTOS_VOICE_TASK_SPEC_JSON
+"""
+
+
+class CodexVoiceError(ValueError):
+    """A safe, operator-visible boundary failure."""
+
+
+@dataclass(frozen=True)
+class ValidatedHandoff:
+    spec: dict[str, Any]
+    canonical_spec: str
+    digest: str
+
+    @property
+    def codex_stdin(self) -> str:
+        return f"{FIXED_INSTRUCTION}{self.canonical_spec}\n"
+
+
+def _read_bounded_text(stream: TextIO, *, label: str) -> str:
+    text = stream.read(MAX_SPEC_INPUT_BYTES + 1)
+    if len(text.encode("utf-8")) > MAX_SPEC_INPUT_BYTES:
+        raise CodexVoiceError(
+            f"{label} exceeds the {MAX_SPEC_INPUT_BYTES}-byte input limit"
+        )
+    return text
+
+
+def _reject_duplicate_json_fields(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise CodexVoiceError("duplicate JSON field name rejected")
+        result[key] = value
+    return result
+
+
+def _load_json_source(source: str, stdin: TextIO) -> object:
+    if source == "-":
+        text = _read_bounded_text(stdin, label="stdin task spec")
+    else:
+        path = Path(source)
+        try:
+            with path.open("rb") as handle:
+                raw = handle.read(MAX_SPEC_INPUT_BYTES + 1)
+        except OSError as error:
+            raise CodexVoiceError(
+                f"cannot read task spec {path}: {type(error).__name__}"
+            ) from error
+        if len(raw) > MAX_SPEC_INPUT_BYTES:
+            raise CodexVoiceError(
+                f"task spec {path} exceeds the {MAX_SPEC_INPUT_BYTES}-byte input limit"
+            )
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise CodexVoiceError(f"task spec {path} is not UTF-8 JSON") from error
+
+    try:
+        return json.loads(text, object_pairs_hook=_reject_duplicate_json_fields)
+    except json.JSONDecodeError as error:
+        raise CodexVoiceError(
+            f"invalid task spec JSON at line {error.lineno}, column {error.colno}"
+        ) from error
+
+
+def load_handoff(source: str, *, stdin: TextIO | None = None) -> ValidatedHandoff:
+    """Load and validate a spec without retaining or forwarding its raw source."""
+
+    raw_spec = _load_json_source(source, stdin if stdin is not None else sys.stdin)
+    try:
+        spec = validate_spec(raw_spec)
+    except VoiceTaskSpecError as error:
+        # The validator's errors identify rejected fields/reasons and must not
+        # reproduce their values (notably a transcript or credential value).
+        raise CodexVoiceError(f"task spec rejected: {error}") from error
+    canonical = canonical_json(spec)
+    return ValidatedHandoff(
+        spec=spec,
+        canonical_spec=canonical,
+        digest=spec_digest(spec),
+    )
+
+
+def ensure_result_schema() -> None:
+    """Fail before execution if the fixed schema is absent or malformed JSON."""
+
+    try:
+        with OUTPUT_SCHEMA.open("rb") as handle:
+            raw = handle.read(MAX_RESULT_SCHEMA_BYTES + 1)
+    except OSError as error:
+        raise CodexVoiceError(
+            f"cannot read Codex result schema {OUTPUT_SCHEMA}: {type(error).__name__}"
+        ) from error
+    if len(raw) > MAX_RESULT_SCHEMA_BYTES:
+        raise CodexVoiceError(
+            f"Codex result schema exceeds {MAX_RESULT_SCHEMA_BYTES} bytes"
+        )
+    try:
+        schema = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_fields,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise CodexVoiceError("Codex result schema is not valid UTF-8 JSON") from error
+    if not isinstance(schema, dict):
+        raise CodexVoiceError("Codex result schema root must be a JSON object")
+
+
+def safe_stderr_excerpt(text: str) -> str:
+    cleaned = "".join(
+        character
+        if character in {"\n", "\t"} or character.isprintable()
+        else "�"
+        for character in text
+    ).strip()
+    encoded = cleaned.encode("utf-8")
+    if len(encoded) <= MAX_CODEX_STDERR_DISPLAY_BYTES:
+        return cleaned
+    suffix = "\n[Codex stderr truncated]"
+    payload_limit = MAX_CODEX_STDERR_DISPLAY_BYTES - len(suffix.encode("utf-8"))
+    excerpt = encoded[:payload_limit].decode("utf-8", errors="ignore")
+    return f"{excerpt.rstrip()}{suffix}"
+
+
+def preview_payload(handoff: ValidatedHandoff, *, operation: str) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "ok": True,
+        "operation": operation,
+        "spec_sha256": handoff.digest,
+        "canonical_spec": handoff.canonical_spec,
+    }
+    if operation == "plan":
+        payload.update(
+            {
+                "will_execute": False,
+                "argv": list(CODEX_ARGV),
+                "timeout_seconds": DEFAULT_TIMEOUT_SECONDS,
+            }
+        )
+    return payload
+
+
+def emit_json(payload: object, *, stream: TextIO | None = None) -> None:
+    print(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+        file=stream if stream is not None else sys.stdout,
+    )
+
+
+def command_validate(args: argparse.Namespace) -> int:
+    handoff = load_handoff(args.spec)
+    emit_json(preview_payload(handoff, operation="validate"))
+    return 0
+
+
+def command_plan(args: argparse.Namespace) -> int:
+    handoff = load_handoff(args.spec)
+    emit_json(preview_payload(handoff, operation="plan"))
+    return 0
+
+
+def command_run(args: argparse.Namespace) -> int:
+    # Validate on every invocation.  A prior preview is never treated as an
+    # authorization token or as cached validation state.
+    handoff = load_handoff(args.spec)
+    if not args.yes:
+        raise CodexVoiceError(
+            "refusing Codex execution without explicit --yes confirmation; run plan first"
+        )
+    ensure_result_schema()
+
+    try:
+        proc = subprocess.run(
+            list(CODEX_ARGV),
+            input=handoff.codex_stdin,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=args.timeout,
+        )
+    except FileNotFoundError as error:
+        raise CodexVoiceError("Codex executable was not found") from error
+    except subprocess.TimeoutExpired:
+        print(
+            f"error: Codex execution timed out after {args.timeout} seconds",
+            file=sys.stderr,
+        )
+        return 124
+
+    if proc.returncode != 0:
+        print(f"error: Codex exited with status {proc.returncode}", file=sys.stderr)
+        if proc.stderr:
+            print(safe_stderr_excerpt(proc.stderr), file=sys.stderr)
+        return proc.returncode
+    if not proc.stdout.strip():
+        print("error: Codex returned an empty result", file=sys.stderr)
+        return 1
+    if len(proc.stdout.encode("utf-8")) > MAX_CODEX_STDOUT_BYTES:
+        print(
+            f"error: Codex result exceeds {MAX_CODEX_STDOUT_BYTES} bytes",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        result = json.loads(
+            proc.stdout, object_pairs_hook=_reject_duplicate_json_fields
+        )
+    except (json.JSONDecodeError, CodexVoiceError):
+        print("error: Codex result is not one valid JSON document", file=sys.stderr)
+        return 1
+    if not isinstance(result, dict):
+        print("error: Codex result must be one JSON object", file=sys.stderr)
+        return 1
+    try:
+        result = validate_codex_result(result)
+    except VoiceTaskSpecError as error:
+        print(f"error: Codex result rejected: {error}", file=sys.stderr)
+        return 1
+
+    # Keep the bounded, schema-validated result in memory and emit it without
+    # creating an event log or output file.
+    emit_json(result)
+    return 0
+
+
+def timeout_seconds(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("timeout must be an integer") from error
+    if not 1 <= parsed <= MAX_TIMEOUT_SECONDS:
+        raise argparse.ArgumentTypeError(
+            f"timeout must be between 1 and {MAX_TIMEOUT_SECONDS} seconds"
+        )
+    return parsed
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Validate and run a spec-only, read-only Codex voice handoff."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    validate = subparsers.add_parser(
+        "validate", help="validate and print the canonical task spec"
+    )
+    validate.add_argument("spec", help="JSON task-spec path, or - for stdin")
+    validate.set_defaults(func=command_validate)
+
+    plan = subparsers.add_parser(
+        "plan", help="print the exact inert Codex invocation and canonical spec"
+    )
+    plan.add_argument("spec", help="JSON task-spec path, or - for stdin")
+    plan.set_defaults(func=command_plan)
+
+    run = subparsers.add_parser(
+        "run", help="execute the revalidated task spec through read-only Codex"
+    )
+    run.add_argument("spec", help="JSON task-spec path, or - for stdin")
+    run.add_argument(
+        "--yes",
+        action="store_true",
+        help="explicitly confirm this one read-only Codex invocation",
+    )
+    run.add_argument(
+        "--timeout",
+        type=timeout_seconds,
+        default=DEFAULT_TIMEOUT_SECONDS,
+        help=f"process timeout in seconds (default: {DEFAULT_TIMEOUT_SECONDS})",
+    )
+    run.set_defaults(func=command_run)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return int(args.func(args))
+    except CodexVoiceError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

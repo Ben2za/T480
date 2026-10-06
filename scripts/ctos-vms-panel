@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DOMAIN="ctos-kali"
+URI="qemu:///system"
+
+domain_state() {
+	local output
+	if output="$(virsh -c "$URI" --readonly domstate "$DOMAIN" 2>&1 | tr -d '\r')"; then
+		printf '%s\n' "$output"
+	else
+		output="${output//$'\n'/; }"
+		printf 'unavailable: %s\n' "${output:-virsh failed}"
+	fi
+}
+
+domain_state_short() {
+	domain_state | sed -n '1p'
+}
+
+libvirt_hint() {
+	local state="$1"
+	case "$state" in
+		unavailable:*)
+			printf '\nlibvirt note:\n'
+			printf '  The VMS panel could not read %s through %s.\n' "$DOMAIN" "$URI"
+			printf '  Check libvirtd/virtqemud and local libvirt permissions before starting Kali.\n'
+			;;
+	esac
+}
+
+open_console() {
+	if ! command -v virt-manager >/dev/null 2>&1; then
+		printf 'virt-manager not found\n'
+		return 1
+	fi
+	if command -v hyprctl >/dev/null 2>&1; then
+		hyprctl dispatch exec "[workspace 4 silent] virt-manager -c ${URI} --show-domain-console ${DOMAIN}" >/dev/null
+	else
+		setsid -f virt-manager -c "$URI" --show-domain-console "$DOMAIN" >/dev/null 2>&1
+	fi
+}
+
+start_kali() {
+	local state
+	state="$(domain_state_short)"
+	case "$state" in
+		"running")
+			printf '%s already running\n' "$DOMAIN"
+			;;
+		"shut off"|"shutoff")
+			virsh -c "$URI" start "$DOMAIN"
+			;;
+		*)
+			printf 'refusing start: %s state is %s\n' "$DOMAIN" "$state"
+			return 1
+			;;
+	esac
+	open_console
+}
+
+shutdown_kali() {
+	local state
+	state="$(domain_state_short)"
+	case "$state" in
+		"running")
+			virsh -c "$URI" shutdown "$DOMAIN" --mode agent
+			;;
+		"shut off"|"shutoff")
+			printf '%s already shut off\n' "$DOMAIN"
+			;;
+		*)
+			printf 'refusing shutdown: %s state is %s\n' "$DOMAIN" "$state"
+			return 1
+			;;
+	esac
+}
+
+checkpoint_kali() {
+	local state label
+	state="$(domain_state)"
+	if [ "$state" != "shut off" ] && [ "$state" != "shutoff" ]; then
+		printf 'checkpoint requires shutoff state; current state is %s\n' "$state"
+		return 1
+	fi
+	label="manual-$(date +%Y%m%d-%H%M%S)"
+	"$ROOT/scripts/ctos-kali" snapshot-checkpoint "$label"
+}
+
+render() {
+	clear
+	printf 'CTOS VMS // KALI CONTROL\n'
+	printf '=========================\n'
+	printf 'time: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+	printf 'domain: %s\n' "$DOMAIN"
+	local state
+	state="$(domain_state_short)"
+	printf 'state: %s\n' "$state"
+	libvirt_hint "$state"
+	printf '\n'
+	"$ROOT/scripts/ctos-kali" status || true
+	printf '\n'
+	printf '[1] start + console\n'
+	printf '[2] console only\n'
+	printf '[3] graceful shutdown\n'
+	printf '[4] checkpoint while shut off\n'
+	printf '[r] refresh\n'
+	printf '[q] quit\n'
+	printf '\nchoice> '
+}
+
+while true; do
+	render
+	IFS= read -r -n 1 choice || exit 0
+	printf '\n\n'
+	case "$choice" in
+		1) start_kali || true ;;
+		2) open_console || true ;;
+		3) shutdown_kali || true ;;
+		4) checkpoint_kali || true ;;
+		r|R) ;;
+		q|Q) exit 0 ;;
+		*) printf 'unknown choice: %s\n' "$choice" ;;
+	esac
+	printf '\nPress Enter to continue...'
+	IFS= read -r _ || true
+done

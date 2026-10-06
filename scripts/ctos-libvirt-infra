@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+URI = "qemu:///system"
+
+
+@dataclass(frozen=True)
+class Resource:
+    kind: str
+    name: str
+    xml_path: Path
+    schema: str
+
+
+RESOURCES = [
+    Resource("network", "ctos-nat", ROOT / "libvirt/networks/ctos-nat.xml", "network"),
+    Resource("pool", "ctos-images", ROOT / "libvirt/pools/ctos-images.xml", "storagepool"),
+    Resource("pool", "ctos-snapshots", ROOT / "libvirt/pools/ctos-snapshots.xml", "storagepool"),
+    Resource("pool", "ctos-iso", ROOT / "libvirt/pools/ctos-iso.xml", "storagepool"),
+]
+
+
+@dataclass
+class CommandResult:
+    rc: int
+    stdout: str
+    stderr: str
+
+
+def run(args: list[str], timeout: float = 15.0) -> CommandResult:
+    try:
+        proc = subprocess.run(
+            args,
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=timeout,
+        )
+    except FileNotFoundError:
+        return CommandResult(127, "", f"{args[0]} not found")
+    except subprocess.TimeoutExpired:
+        return CommandResult(124, "", "command timed out")
+    return CommandResult(proc.returncode, proc.stdout.strip(), proc.stderr.strip())
+
+
+def virsh(args: list[str], readonly: bool = False, timeout: float = 15.0) -> CommandResult:
+    command = ["virsh", "-c", URI]
+    if readonly:
+        command.append("--readonly")
+    command.extend(args)
+    return run(command, timeout=timeout)
+
+
+def read_xml(path: Path) -> ET.Element:
+    return ET.fromstring(path.read_text(encoding="utf-8"))
+
+
+def text(root: ET.Element, path: str) -> str:
+    item = root.find(path)
+    if item is None or item.text is None:
+        return ""
+    return item.text.strip()
+
+
+def expected_signature(resource: Resource) -> dict[str, Any]:
+    root = read_xml(resource.xml_path)
+    if resource.kind == "network":
+        ip = root.find("ip")
+        dhcp_range = root.find("ip/dhcp/range")
+        forward = root.find("forward")
+        bridge = root.find("bridge")
+        if ip is None or dhcp_range is None or forward is None or bridge is None:
+            raise ValueError(f"{resource.xml_path} is missing required network elements")
+        return {
+            "kind": "network",
+            "name": text(root, "name"),
+            "forward_mode": forward.attrib.get("mode", ""),
+            "bridge": bridge.attrib.get("name", ""),
+            "ip": ip.attrib.get("address", ""),
+            "netmask": ip.attrib.get("netmask", ""),
+            "dhcp_start": dhcp_range.attrib.get("start", ""),
+            "dhcp_end": dhcp_range.attrib.get("end", ""),
+        }
+
+    target = root.find("target/path")
+    if target is None or target.text is None:
+        raise ValueError(f"{resource.xml_path} is missing target/path")
+    return {
+        "kind": "pool",
+        "type": root.attrib.get("type", ""),
+        "name": text(root, "name"),
+        "target_path": target.text.strip(),
+    }
+
+
+def live_signature(resource: Resource, xml: str) -> dict[str, Any]:
+    root = ET.fromstring(xml)
+    if resource.kind == "network":
+        ip = root.find("ip")
+        dhcp_range = root.find("ip/dhcp/range")
+        forward = root.find("forward")
+        bridge = root.find("bridge")
+        return {
+            "kind": "network",
+            "name": text(root, "name"),
+            "forward_mode": forward.attrib.get("mode", "") if forward is not None else "",
+            "bridge": bridge.attrib.get("name", "") if bridge is not None else "",
+            "ip": ip.attrib.get("address", "") if ip is not None else "",
+            "netmask": ip.attrib.get("netmask", "") if ip is not None else "",
+            "dhcp_start": dhcp_range.attrib.get("start", "") if dhcp_range is not None else "",
+            "dhcp_end": dhcp_range.attrib.get("end", "") if dhcp_range is not None else "",
+        }
+
+    target = root.find("target/path")
+    return {
+        "kind": "pool",
+        "type": root.attrib.get("type", ""),
+        "name": text(root, "name"),
+        "target_path": target.text.strip() if target is not None and target.text else "",
+    }
+
+
+def parse_info(stdout: str) -> dict[str, str]:
+    data = {}
+    for line in stdout.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        data[key.strip().lower().replace(" ", "_")] = value.strip()
+    return data
+
+
+def dump_resource(resource: Resource) -> CommandResult:
+    if resource.kind == "network":
+        return virsh(["net-dumpxml", resource.name], readonly=True)
+    return virsh(["pool-dumpxml", resource.name], readonly=True)
+
+
+def info_resource(resource: Resource) -> CommandResult:
+    if resource.kind == "network":
+        return virsh(["net-info", resource.name], readonly=True)
+    return virsh(["pool-info", resource.name], readonly=True)
+
+
+def validate_repo_xml() -> list[dict[str, Any]]:
+    checks = []
+    validator = shutil.which("virt-xml-validate")
+    for resource in RESOURCES:
+        if not resource.xml_path.exists():
+            checks.append(
+                {
+                    "name": resource.name,
+                    "ok": False,
+                    "message": f"missing XML: {resource.xml_path}",
+                }
+            )
+            continue
+        try:
+            expected_signature(resource)
+        except (ET.ParseError, ValueError) as error:
+            checks.append({"name": resource.name, "ok": False, "message": str(error)})
+            continue
+
+        if validator:
+            result = run([validator, str(resource.xml_path), resource.schema])
+            checks.append(
+                {
+                    "name": resource.name,
+                    "ok": result.rc == 0,
+                    "message": result.stdout or result.stderr,
+                }
+            )
+        else:
+            checks.append(
+                {
+                    "name": resource.name,
+                    "ok": False,
+                    "message": "virt-xml-validate not found",
+                }
+            )
+    return checks
+
+
+def resource_state(resource: Resource) -> dict[str, Any]:
+    expected = expected_signature(resource)
+    result = dump_resource(resource)
+    state: dict[str, Any] = {
+        "kind": resource.kind,
+        "name": resource.name,
+        "xml": str(resource.xml_path),
+        "expected": expected,
+        "exists": result.rc == 0,
+        "compatible": False,
+        "active": False,
+        "autostart": False,
+        "actions": [],
+        "errors": [],
+    }
+
+    if result.rc != 0:
+        state["actions"].append("define")
+        state["actions"].append("build" if resource.kind == "pool" else "start")
+        if resource.kind == "pool":
+            state["actions"].append("start")
+        state["actions"].append("autostart")
+        return state
+
+    try:
+        live = live_signature(resource, result.stdout)
+    except ET.ParseError as error:
+        state["errors"].append(f"live XML parse failed: {error}")
+        return state
+
+    state["live"] = live
+    state["compatible"] = live == expected
+    if not state["compatible"]:
+        state["errors"].append("live resource differs from repo XML signature")
+        return state
+
+    info = info_resource(resource)
+    if info.rc != 0:
+        state["errors"].append(info.stderr or "unable to read live resource info")
+        return state
+
+    info_data = parse_info(info.stdout)
+    state["info"] = info_data
+    state["active"] = info_data.get("active", info_data.get("state", "")).lower() in {
+        "yes",
+        "running",
+        "active",
+    }
+    state["autostart"] = info_data.get("autostart", "").lower() == "yes"
+
+    if not state["active"]:
+        state["actions"].append("start")
+    if not state["autostart"]:
+        state["actions"].append("autostart")
+    return state
+
+
+def infra_state() -> dict[str, Any]:
+    validation = validate_repo_xml()
+    states = [resource_state(resource) for resource in RESOURCES]
+    return {
+        "connection": URI,
+        "validation": validation,
+        "resources": states,
+        "ok": all(item["ok"] for item in validation)
+        and all(not item["errors"] for item in states),
+    }
+
+
+def apply_resource(resource: Resource, state: dict[str, Any]) -> list[str]:
+    messages = []
+    actions = state["actions"]
+    if "define" in actions:
+        command = "net-define" if resource.kind == "network" else "pool-define"
+        result = virsh([command, str(resource.xml_path)])
+        if result.rc != 0:
+            raise RuntimeError(f"{resource.name}: {command} failed: {result.stderr}")
+        messages.append(result.stdout or f"{resource.name}: defined")
+
+    if resource.kind == "pool" and "build" in actions:
+        result = virsh(["pool-build", resource.name])
+        if result.rc != 0:
+            raise RuntimeError(f"{resource.name}: pool-build failed: {result.stderr}")
+        messages.append(result.stdout or f"{resource.name}: built")
+
+    if "start" in actions:
+        command = "net-start" if resource.kind == "network" else "pool-start"
+        result = virsh([command, resource.name])
+        if result.rc != 0:
+            raise RuntimeError(f"{resource.name}: {command} failed: {result.stderr}")
+        messages.append(result.stdout or f"{resource.name}: started")
+
+    if "autostart" in actions:
+        command = "net-autostart" if resource.kind == "network" else "pool-autostart"
+        result = virsh([command, resource.name])
+        if result.rc != 0:
+            raise RuntimeError(f"{resource.name}: {command} failed: {result.stderr}")
+        messages.append(result.stdout or f"{resource.name}: autostart enabled")
+    return messages
+
+
+def print_state(state: dict[str, Any], mode: str) -> None:
+    print(f"CTOS libvirt infra {mode}")
+    print(f"connection: {state['connection']}")
+    print("\nvalidation:")
+    for item in state["validation"]:
+        marker = "ok" if item["ok"] else "blocked"
+        print(f"  {item['name']:<16} {marker:<8} {item['message']}")
+    print("\nresources:")
+    for item in state["resources"]:
+        if item["errors"]:
+            status = "conflict" if item["exists"] else "blocked"
+        elif item["actions"]:
+            status = "pending"
+        else:
+            status = "ready"
+        actions = ", ".join(item["actions"]) if item["actions"] else "none"
+        print(
+            f"  {item['name']:<16} {status:<9} "
+            f"exists={item['exists']} active={item['active']} "
+            f"autostart={item['autostart']} actions={actions}"
+        )
+        for error in item["errors"]:
+            print(f"    error: {error}")
+
+
+def command_status(args: argparse.Namespace) -> int:
+    state = infra_state()
+    if args.json:
+        print(json.dumps(state, indent=2, sort_keys=True))
+    else:
+        print_state(state, "status")
+    return 0 if state["ok"] else 1
+
+
+def command_plan(args: argparse.Namespace) -> int:
+    state = infra_state()
+    if args.json:
+        print(json.dumps(state, indent=2, sort_keys=True))
+    else:
+        print_state(state, "plan")
+    return 0 if state["ok"] else 1
+
+
+def command_apply(args: argparse.Namespace) -> int:
+    state = infra_state()
+    if not state["ok"]:
+        if args.json:
+            print(json.dumps(state, indent=2, sort_keys=True))
+        else:
+            print_state(state, "apply blocked")
+        return 1
+
+    by_name = {resource.name: resource for resource in RESOURCES}
+    messages = []
+    try:
+        for item in state["resources"]:
+            if item["actions"]:
+                messages.extend(apply_resource(by_name[item["name"]], item))
+    except RuntimeError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+
+    final_state = infra_state()
+    if args.json:
+        print(
+            json.dumps(
+                {"messages": messages, "state": final_state},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    else:
+        for message in messages or ["no changes needed"]:
+            print(message)
+        print()
+        print_state(final_state, "post-apply")
+    return 0 if final_state["ok"] and all(not item["actions"] for item in final_state["resources"]) else 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Idempotently apply CTOS libvirt network and storage pool infra."
+    )
+    parser.add_argument("--json", action="store_true", help="emit JSON")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("status", help="show live CTOS libvirt infra state")
+    subparsers.add_parser("plan", help="show actions needed to converge infra")
+    subparsers.add_parser("apply", help="define/start/autostart CTOS network and pools")
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    if args.command == "status":
+        return command_status(args)
+    if args.command == "plan":
+        return command_plan(args)
+    if args.command == "apply":
+        return command_apply(args)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if [ -z "${CTOS_VOICE_ENGINE:-}" ] && "$ROOT/scripts/ctos-voice" tts-probe --json 2>/dev/null | grep -q '"ready": true'; then
+	export CTOS_VOICE_ENGINE=piper
+fi
+
+if [ "$#" -eq 0 ]; then
+	set -- voice-command --seconds "${CTOS_VOICE_SECONDS:-4}"
+fi
+
+printf 'CTOS VOICE // PUSH TO TALK\n'
+printf '===========================\n'
+printf 'Parle maintenant. Commandes: sante, agenda, ouvre desk, ouvre vms, approbations, aide.\n\n'
+
+"$ROOT/scripts/ctos-voice" "$@"
+rc=$?
+
+printf '\nretour=%s; fermeture dans 4 secondes...\n' "$rc"
+sleep 4
+exit "$rc"

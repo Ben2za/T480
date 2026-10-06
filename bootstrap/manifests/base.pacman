@@ -1,0 +1,33 @@
+# CTOS base packages for EndeavourOS/Arch nodes.
+# Keep this list boring: recovery, inspection, archives, and shell comfort.
+base-devel
+git
+openssh
+rsync
+curl
+wget
+vim
+nano
+less
+man-db
+man-pages
+bash-completion
+tree
+unzip
+zip
+7zip
+jq
+fastfetch
+btop
+nvme-cli
+smartmontools
+usbutils
+pciutils
+lshw
+dmidecode
+efibootmgr
+gptfdisk
+parted
+btrfs-progs
+iputils
+bind

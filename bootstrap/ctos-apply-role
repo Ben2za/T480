@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MANIFEST_DIR="$ROOT/bootstrap/manifests"
+
+usage() {
+	cat >&2 <<'USAGE'
+usage:
+  bootstrap/ctos-apply-role ctos-core plan
+  sudo bootstrap/ctos-apply-role ctos-core apply [--yes]
+  sudo bootstrap/ctos-apply-role ctos-core cleanup-sudo
+
+Applies the first CTOS role after a normal EndeavourOS install.
+It does not partition disks and does not install AUR packages.
+USAGE
+}
+
+role="${1:-}"
+action="${2:-plan}"
+shift $(( $# >= 2 ? 2 : $# ))
+
+yes=0
+for arg in "$@"; do
+	case "$arg" in
+		--yes)
+			yes=1
+			;;
+		-h|--help)
+			usage
+			exit 0
+			;;
+		*)
+			printf 'unknown option: %s\n' "$arg" >&2
+			usage
+			exit 2
+			;;
+	esac
+done
+
+if [ "$role" != "ctos-core" ]; then
+	usage
+	exit 2
+fi
+
+manifests=(
+	base.pacman
+	desktop-xfce.pacman
+	dev.pacman
+	core.pacman
+)
+
+read_packages() {
+	local manifest
+	for manifest in "${manifests[@]}"; do
+		awk '
+			/^[[:space:]]*#/ { next }
+			/^[[:space:]]*$/ { next }
+			{
+				gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+				print
+			}
+		' "$MANIFEST_DIR/$manifest"
+	done | sort -u
+}
+
+print_plan() {
+	local count
+	count="$(read_packages | wc -l)"
+	cat <<EOF
+CTOS role plan: ctos-core
+
+Repo root:      $ROOT
+Manifests:      ${manifests[*]}
+Package count:  $count
+
+Will do on apply:
+- refresh archlinux/EndeavourOS keyring packages before the full upgrade
+- install pacman packages from the manifests with pacman -Syu --needed
+- set hostname to ctos-core
+- enable NetworkManager, sshd, and avahi-daemon when present
+- enable lightdm only if no display-manager is already configured
+- create group ctos
+- add the sudo user to group ctos when SUDO_USER is available
+- create /opt/ctos/repo and /srv/ctos/{cache,models,workers,snapshots,packages}
+- copy this CTOS kit/repo to /opt/ctos/repo with rsync
+
+Will not do:
+- partition or wipe disks
+- install AUR packages
+- distribute secrets or private keys
+- expose services beyond native SSH/Avahi service startup
+
+Packages:
+EOF
+	read_packages | sed 's/^/  - /'
+}
+
+require_root() {
+	if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+		printf 'apply must run as root; use sudo.\n' >&2
+		exit 1
+	fi
+}
+
+confirm_apply() {
+	if [ "$yes" -eq 1 ]; then
+		return 0
+	fi
+	printf 'Apply ctos-core role on this installed EndeavourOS/Arch system? Type ctos-core to continue: ' >&2
+	read -r reply
+	if [ "$reply" != "ctos-core" ]; then
+		printf 'aborted.\n' >&2
+		exit 1
+	fi
+}
+
+apply_role() {
+	require_root
+	confirm_apply
+
+	if ! command -v pacman >/dev/null 2>&1; then
+		printf 'pacman not found; this bootstrap expects EndeavourOS/Arch.\n' >&2
+		exit 1
+	fi
+
+	keyring_args=(-Sy --needed archlinux-keyring endeavouros-keyring)
+	if [ "$yes" -eq 1 ]; then
+		keyring_args+=(--noconfirm)
+	fi
+	pacman "${keyring_args[@]}"
+	if command -v pacman-key >/dev/null 2>&1; then
+		pacman-key --populate archlinux endeavouros || pacman-key --populate archlinux
+	fi
+
+	mapfile -t packages < <(read_packages)
+	pacman_args=(-Syu --needed)
+	if [ "$yes" -eq 1 ]; then
+		pacman_args+=(--noconfirm)
+	fi
+
+	pacman "${pacman_args[@]}" "${packages[@]}"
+
+	hostnamectl set-hostname ctos-core
+
+	groupadd -f ctos
+	if [ "${SUDO_USER:-}" != "" ] && [ "$SUDO_USER" != "root" ]; then
+		usermod -aG ctos "$SUDO_USER"
+	fi
+
+	install -d -m 0755 /opt/ctos
+	install -d -m 2775 -g ctos /srv/ctos /srv/ctos/cache /srv/ctos/models /srv/ctos/workers /srv/ctos/snapshots /srv/ctos/packages
+
+	rsync -a --delete \
+		--exclude '.git' \
+		--exclude '__pycache__' \
+		--exclude '*.qcow2' \
+		--exclude '*.iso' \
+		--exclude 'logs' \
+		"$ROOT/" /opt/ctos/repo/
+
+	if systemctl list-unit-files NetworkManager.service >/dev/null 2>&1; then
+		systemctl enable --now NetworkManager.service
+	fi
+	if systemctl list-unit-files sshd.service >/dev/null 2>&1; then
+		systemctl enable --now sshd.service
+	fi
+	if systemctl list-unit-files avahi-daemon.service >/dev/null 2>&1; then
+		systemctl enable --now avahi-daemon.service
+	fi
+	if systemctl list-unit-files lightdm.service >/dev/null 2>&1; then
+		if [ -e /etc/systemd/system/display-manager.service ]; then
+			printf 'display-manager.service already exists; leaving current greeter unchanged.\n'
+		else
+			systemctl enable lightdm.service
+		fi
+	fi
+
+	cat >/etc/ctos-role <<EOF
+role=ctos-core
+applied_at=$(date -Iseconds)
+repo_copy=/opt/ctos/repo
+service_root=/srv/ctos
+EOF
+
+	cat <<'EOF'
+ctos-core role applied.
+
+Next:
+- reboot once;
+- from the T480, test: ssh <user>@ctos-core.local or ssh <user>@<tower-ip>;
+- initialize the SATA service disk only after checking lsblk.
+EOF
+}
+
+cleanup_sudo() {
+	require_root
+
+	if [ -d /opt/ctos/repo ] && command -v rsync >/dev/null 2>&1; then
+		rsync -a --delete \
+			--exclude '.git' \
+			--exclude '__pycache__' \
+			--exclude '*.qcow2' \
+			--exclude '*.iso' \
+			--exclude 'logs' \
+			"$ROOT/" /opt/ctos/repo/
+	fi
+
+	rm -f /etc/sudoers.d/ctos-bootstrap
+	printf 'temporary CTOS bootstrap sudo rule removed.\n'
+}
+
+case "$action" in
+	plan)
+		print_plan
+		;;
+	apply)
+		apply_role
+		;;
+	cleanup-sudo)
+		cleanup_sudo
+		;;
+	-h|--help)
+		usage
+		;;
+	*)
+		printf 'unknown action: %s\n' "$action" >&2
+		usage
+		exit 2
+		;;
+esac
